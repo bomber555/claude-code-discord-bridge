@@ -191,20 +191,24 @@ def _load_cache(path: Path, max_age_seconds: int) -> dict[str, Any] | None:
 
 
 def _write_cache(path: Path, data: dict[str, Any]) -> None:
+    """Cache the payload owner-only — it carries the account's spend figures."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"fetched_at": time.time(), "data": data}), encoding="utf-8")
+        path.chmod(0o600)
     except OSError:
         logger.debug("Failed to write Claude usage cache", exc_info=True)
 
 
 def _fetch_sync(token: str, timeout: float) -> dict[str, Any] | None:
-    # Fixed https URL, no user input in the path — nothing to inject here.
-    request = Request(_USAGE_URL, method="GET")
+    # S310 (scheme audit) is answered by construction: _USAGE_URL is a module
+    # constant on https, and no caller-supplied value reaches the URL — so
+    # there is no file:/custom scheme to smuggle in.
+    request = Request(_USAGE_URL, method="GET")  # noqa: S310
     request.add_header("Authorization", f"Bearer {token}")
     request.add_header("anthropic-beta", _OAUTH_BETA)
     request.add_header("Content-Type", "application/json")
-    with urlopen(request, timeout=timeout) as response:
+    with urlopen(request, timeout=timeout) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
     return payload if isinstance(payload, dict) else None
 
