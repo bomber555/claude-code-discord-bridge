@@ -55,18 +55,28 @@ def test_builds_five_hour_and_weekly_lines() -> None:
     lines = build_claude_usage_lines(_PAYLOAD, now=_NOW)
     assert len(lines) == 3
     assert lines[0].startswith("⏱ 5h")
-    assert "47%" in lines[0]
+    assert "used 47%" in lines[0]
     assert "resets in 2h 40m" in lines[0]
     assert lines[1].startswith("\U0001f4c5 7d")
-    assert "53%" in lines[1]
+    assert "used 53%" in lines[1]
     # 26h+ away — rendered in days, not a three-digit hour count.
     assert "resets in 1d 2h" in lines[1]
 
 
-def test_progress_bar_reflects_percentage() -> None:
-    lines = build_claude_usage_lines(_PAYLOAD, now=_NOW)
-    # 47% of a 10-wide bar rounds to 5 filled cells.
-    assert "█" * 5 + "░" * 5 in lines[0]
+def test_renders_no_block_meter() -> None:
+    """Block-character bars read as glare in a dark client — text only."""
+    for line in build_claude_usage_lines(_PAYLOAD, now=_NOW):
+        assert "█" not in line
+        assert "░" not in line
+
+
+def test_percentage_is_consumption_not_headroom() -> None:
+    """0% must mean an untouched window, 100% an exhausted one."""
+    untouched = {"five_hour": {"utilization": 0, "resets_at": None}}
+    assert "used 0%" in build_claude_usage_lines(untouched, now=_NOW)[0]
+
+    exhausted = {"five_hour": {"utilization": 100, "resets_at": None}}
+    assert "used 100%" in build_claude_usage_lines(exhausted, now=_NOW)[0]
 
 
 def test_extra_credits_line_shows_money_and_state() -> None:
@@ -74,7 +84,7 @@ def test_extra_credits_line_shows_money_and_state() -> None:
     assert line.startswith("\U0001f4b3")
     assert "$157.20" in line
     assert "$200.00" in line
-    assert "78%" in line
+    assert "used 78%" in line
     assert "off" in line
     assert "out of credits" in line
 

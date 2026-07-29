@@ -11,8 +11,10 @@ costs no tokens, and is cached on disk so a burst of sessions ending together
 results in a single request. Every failure path returns ``None`` — the footer
 must never be lost because the endpoint is slow or the token has rotated.
 
-Mirrors :mod:`claude_discord.discord_ui.codex_usage` so both backends render
-their quota windows the same way.
+Rendering is deliberately text-only — no block-character meter. The bars read
+as glare in a dark Discord client, and a bare percentage is ambiguous about
+which direction it runs, so every figure is spelled out as ``used N%``:
+0% is an untouched window, 100% is an exhausted one.
 """
 
 from __future__ import annotations
@@ -51,11 +53,6 @@ def usage_footer_enabled(env: Mapping[str, str] | None = None) -> bool:
     return (source.get("CCDB_USAGE_FOOTER") or "").strip().lower() not in _FALSEY
 
 
-def _progress_bar(percent: int, width: int = 10) -> str:
-    filled = round((max(0, min(100, percent)) / 100) * width)
-    return "█" * filled + "░" * (width - filled)
-
-
 def _parse_resets_at(value: object) -> float | None:
     """Accept both the ISO-8601 string and the epoch seconds the CLI uses."""
     if isinstance(value, bool) or value is None:
@@ -89,6 +86,7 @@ def _format_countdown(resets_at: object, now: int | None = None) -> str:
 
 
 def _window_line(window: object, label: str, now: int | None) -> str | None:
+    """Render one quota window. ``utilization`` is consumption, not headroom."""
     if not isinstance(window, dict):
         return None
     utilization = window.get("utilization")
@@ -96,7 +94,7 @@ def _window_line(window: object, label: str, now: int | None) -> str | None:
         return None
     used = int(utilization)
     countdown = _format_countdown(window.get("resets_at"), now=now)
-    return f"{label}  {_progress_bar(used)}  {used}% — {countdown}"
+    return f"{label}  used {used}% — {countdown}"
 
 
 def _format_money(minor_units: float, decimal_places: int, currency: str) -> str:
@@ -137,7 +135,7 @@ def _extra_usage_line(extra: object) -> str | None:
         state = f"off ({str(reason).replace('_', ' ')})" if reason else "off"
 
     spend = f"{_format_money(used, places, currency)} / {_format_money(limit, places, currency)}"
-    return f"\U0001f4b3 credits  {_progress_bar(percent)}  {percent}%  {spend} — {state}"
+    return f"\U0001f4b3 credits  used {percent}%  {spend} — {state}"
 
 
 def build_claude_usage_lines(payload: Mapping[str, Any], now: int | None = None) -> list[str]:
