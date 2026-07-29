@@ -521,6 +521,7 @@ class EventProcessor:
                             cache_creation_tokens=event.cache_creation_tokens,
                             cache_read_tokens=event.cache_read_tokens,
                             api_label=self._config.runner.describe_api(),
+                            account_label=self._config.runner.describe_account(),
                         ),
                         name=f"statusline-{self._config.thread.id}",
                     )
@@ -795,17 +796,27 @@ async def _post_statusline_footer(
     cache_creation_tokens: int | None,
     cache_read_tokens: int | None,
     api_label: str | None = None,
+    account_label: str | None = None,
 ) -> None:
-    """Post the current API provider line and the configured statusLine.
+    """Post the current API provider line, quota usage, and the statusLine.
 
     ``api_label`` (e.g. ``"Anthropic API (direct)"``) is always shown when
     provided, so "which API am I using right now" stays visible after every
-    session — even when no ``statusLine`` is configured. The statusLine output
-    (read from ``~/.claude/settings.json``) is appended below it when present.
-    Posts nothing when neither is available.
+    session — even when no ``statusLine`` is configured. ``account_label``
+    (e.g. ``"Max subscription (you@example.com)"``) answers the follow-up
+    question the endpoint label can't: which account, and billed how.
+
+    Below that go the account's quota windows (5h / weekly / extra credits),
+    then the statusLine output (read from ``~/.claude/settings.json``) when
+    one is configured. Posts nothing when every part is unavailable.
     """
     import os
 
+    from ..discord_ui.claude_usage import (
+        build_claude_usage_lines,
+        fetch_claude_usage,
+        usage_footer_enabled,
+    )
     from ..discord_ui.statusline import (
         build_statusline_json,
         read_statusline_command,
@@ -831,9 +842,25 @@ async def _post_statusline_footer(
             if lines:
                 statusline_text = "\n".join(lines[:3])
 
+    # Quota usage. Never let a slow or unreachable endpoint cost the user the
+    # rest of the footer — any failure just drops these lines.
+    usage_lines: list[str] = []
+    if usage_footer_enabled():
+        try:
+            payload = await fetch_claude_usage()
+        except Exception:
+            logger.debug("Failed to fetch Claude usage for the footer", exc_info=True)
+            payload = None
+        if payload:
+            usage_lines = build_claude_usage_lines(payload)
+
     parts: list[str] = []
     if api_label:
-        parts.append(f"\U0001f517 API: {api_label}")
+        line = f"\U0001f517 API: {api_label}"
+        if account_label:
+            line = f"{line} · {account_label}"
+        parts.append(line)
+    parts.extend(usage_lines)
     if statusline_text:
         parts.append(statusline_text)
 

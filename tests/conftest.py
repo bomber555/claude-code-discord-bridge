@@ -65,6 +65,21 @@ def _patch_build_system_context(
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_claude_usage_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the statusline footer off the network by default.
+
+    ``_post_statusline_footer`` imports ``fetch_claude_usage`` at call time, so
+    patching the module attribute here neutralises it for every test that
+    exercises the footer. ``tests/test_claude_usage.py`` imports the real
+    function directly at module load, so its own coverage is unaffected.
+    """
+    monkeypatch.setattr(
+        "claude_discord.discord_ui.claude_usage.fetch_claude_usage",
+        AsyncMock(return_value=None),
+    )
+
+
 def make_async_gen(events: list[StreamEvent]):
     """Return an async generator factory that yields the given events.
 

@@ -25,6 +25,23 @@ def _is_enabled(env: Mapping[str, str], key: str) -> bool:
     return env.get(key, "").strip().lower() in _TRUTHY
 
 
+def uses_cloud_backend(env: Mapping[str, str]) -> bool:
+    """Return True when *env* routes the CLI through a cloud provider.
+
+    Bedrock, Vertex and Foundry authenticate with the cloud provider's own
+    credentials, so the Anthropic account on disk says nothing about how the
+    session is billed.
+    """
+    return any(
+        _is_enabled(env, key)
+        for key in (
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        )
+    )
+
+
 def detect_api_provider(env: Mapping[str, str]) -> str:
     """Return a short label for the Claude API endpoint *env* selects.
 
