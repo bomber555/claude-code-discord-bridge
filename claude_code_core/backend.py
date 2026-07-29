@@ -45,6 +45,8 @@ class SessionBackend(Protocol):
 
     def describe_api(self) -> str: ...
 
+    def describe_account(self) -> str | None: ...
+
 
 def create_backend(
     *,

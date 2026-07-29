@@ -20,6 +20,7 @@ import sys
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
+from .account_info import describe_auth, read_account_info
 from .api_provider import detect_api_provider
 from .parser import parse_line
 from .types import ImageData, MessageType, StreamEvent
@@ -374,6 +375,17 @@ class ClaudeRunner:
         (e.g. an Azure Foundry switch) are reflected accurately.
         """
         return detect_api_provider(self._build_env())
+
+    def describe_account(self) -> str | None:
+        """Return how this runner authenticates, e.g. ``"Max subscription (a@b.c)"``.
+
+        Complements :meth:`describe_api`, which only names the endpoint: the
+        same "Anthropic API (direct)" label covers both a subscription and a
+        metered API key. Returns ``None`` when the account is unreadable or the
+        question doesn't apply (Bedrock/Vertex/Foundry).
+        """
+        env = self._build_env()
+        return describe_auth(env, read_account_info())
 
     async def _read_stream(self) -> AsyncGenerator[StreamEvent, None]:
         """Read and parse stdout line by line."""
