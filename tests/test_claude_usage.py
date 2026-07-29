@@ -53,7 +53,8 @@ _PAYLOAD: dict[str, Any] = {
 
 def test_builds_five_hour_and_weekly_lines() -> None:
     lines = build_claude_usage_lines(_PAYLOAD, now=_NOW)
-    assert len(lines) == 3
+    # Extra usage is switched off in _PAYLOAD, so only the two windows show.
+    assert len(lines) == 2
     assert lines[0].startswith("⏱ 5h")
     assert "used 47%" in lines[0]
     assert "resets in 2h 40m" in lines[0]
@@ -79,14 +80,11 @@ def test_percentage_is_consumption_not_headroom() -> None:
     assert "used 100%" in build_claude_usage_lines(exhausted, now=_NOW)[0]
 
 
-def test_extra_credits_line_shows_money_and_state() -> None:
-    line = build_claude_usage_lines(_PAYLOAD, now=_NOW)[2]
-    assert line.startswith("\U0001f4b3")
-    assert "$157.20" in line
-    assert "$200.00" in line
-    assert "used 78%" in line
-    assert "off" in line
-    assert "out of credits" in line
+def test_hides_credits_when_extra_usage_is_off() -> None:
+    """Nothing can be spent through a disabled pool — the line is just noise."""
+    lines = build_claude_usage_lines(_PAYLOAD, now=_NOW)
+    assert not any(line.startswith("\U0001f4b3") for line in lines)
+    assert not any("157.20" in line for line in lines)
 
 
 def test_extra_credits_line_when_enabled() -> None:
@@ -95,17 +93,18 @@ def test_extra_credits_line_when_enabled() -> None:
         "extra_usage": {
             "is_enabled": True,
             "monthly_limit": 20000,
-            "used_credits": 500.0,
-            "utilization": 2.5,
+            "used_credits": 15720.0,
+            "utilization": 78.6,
             "currency": "USD",
             "decimal_places": 2,
             "disabled_reason": None,
         },
     }
     line = build_claude_usage_lines(payload, now=_NOW)[2]
-    assert "$5.00" in line
-    assert "on" in line
-    assert "off" not in line
+    assert line.startswith("\U0001f4b3")
+    assert "used 78%" in line
+    assert "$157.20" in line
+    assert "$200.00" in line
 
 
 def test_skips_windows_without_utilization() -> None:
@@ -120,6 +119,14 @@ def test_skips_extra_usage_never_used() -> None:
     }
     lines = build_claude_usage_lines(payload, now=_NOW)
     assert len(lines) == 1
+
+
+def test_skips_enabled_pool_with_unusable_figures() -> None:
+    payload = {
+        "five_hour": _PAYLOAD["five_hour"],
+        "extra_usage": {"is_enabled": True, "used_credits": None, "monthly_limit": None},
+    }
+    assert len(build_claude_usage_lines(payload, now=_NOW)) == 1
 
 
 def test_accepts_epoch_seconds_for_resets_at() -> None:

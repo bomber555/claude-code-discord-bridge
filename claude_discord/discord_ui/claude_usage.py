@@ -106,17 +106,16 @@ def _format_money(minor_units: float, decimal_places: int, currency: str) -> str
 def _extra_usage_line(extra: object) -> str | None:
     """Render the pay-as-you-go credit pool that backs the plan limits.
 
-    Only shown once the pool has actually been touched — an account that never
-    enabled extra usage gets no line.
+    Only while the pool is switched on. Switched off, nothing can be spent
+    through it, so the line is noise on every single session footer.
     """
     if not isinstance(extra, dict):
+        return None
+    if not extra.get("is_enabled"):
         return None
     used = extra.get("used_credits")
     limit = extra.get("monthly_limit")
     if not isinstance(used, (int, float)) or not isinstance(limit, (int, float)):
-        return None
-    enabled = bool(extra.get("is_enabled"))
-    if not enabled and not used:
         return None
 
     places = extra.get("decimal_places")
@@ -129,13 +128,8 @@ def _extra_usage_line(extra: object) -> str | None:
     else:
         percent = int(used / limit * 100) if limit else 0
 
-    state = "on"
-    if not enabled:
-        reason = extra.get("disabled_reason")
-        state = f"off ({str(reason).replace('_', ' ')})" if reason else "off"
-
     spend = f"{_format_money(used, places, currency)} / {_format_money(limit, places, currency)}"
-    return f"\U0001f4b3 credits  used {percent}%  {spend} — {state}"
+    return f"\U0001f4b3 credits  used {percent}%  {spend}"
 
 
 def build_claude_usage_lines(payload: Mapping[str, Any], now: int | None = None) -> list[str]:
