@@ -56,9 +56,7 @@ class TestCodexRunnerBuildArgs:
     def test_working_dir_flag_omitted_on_resume(self) -> None:
         """`codex exec resume` does not accept --cd; it must be omitted on resume."""
         runner = CodexRunner(command="codex", model="o4-mini", working_dir="/tmp/work")
-        args = runner._build_args(
-            "hello", session_id="0199a213-81c0-7800-8aa1-bbab2a035a53"
-        )
+        args = runner._build_args("hello", session_id="0199a213-81c0-7800-8aa1-bbab2a035a53")
         assert "--cd" not in args
         assert "-C" not in args
 
