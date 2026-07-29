@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import shlex
 import time
@@ -147,33 +148,53 @@ def _fmt_pct(snap: dict | None) -> str | None:
         return None
 
 
-def _window_label(window_duration_mins: object) -> str | None:
-    """Return a compact label derived from a rate-limit duration."""
-    if isinstance(window_duration_mins, bool) or not isinstance(window_duration_mins, (int, float)):
-        return None
-    if not float(window_duration_mins).is_integer():
-        return None
-
-    minutes = int(window_duration_mins)
-    if minutes <= 0:
-        return None
+def _window_label(snap: dict | None, fallback: str) -> str:
+    """Return a compact quota-window label from its reported duration."""
+    if not isinstance(snap, dict):
+        return fallback
+    duration = snap.get("windowDurationMins")
+    if not isinstance(duration, (int, float, str)):
+        return fallback
+    try:
+        minutes = round(float(duration))
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    if minutes == 300:
+        return "5h"
     if minutes == 10080:
-        return "週次"
-    if minutes % 1440 == 0:
+        return "7d"
+    if minutes > 0 and minutes % 1440 == 0:
         return f"{minutes // 1440}d"
-    if minutes % 60 == 0:
+    if minutes > 0 and minutes % 60 == 0:
         return f"{minutes // 60}h"
-    return f"{minutes}m"
+    if minutes > 0:
+        return f"{minutes}m"
+    return fallback
 
 
-def _window_segment(snap: dict | None, fallback_label: str) -> str | None:
-    """Format one rate-limit window, retaining a legacy positional fallback."""
-    pct = _fmt_pct(snap)
-    if pct is None:
+def _reset_countdown(snap: dict | None, now: float) -> str | None:
+    """Return a human-readable duration until the snapshot resets."""
+    if not isinstance(snap, dict):
         return None
-    duration = snap.get("windowDurationMins") if isinstance(snap, dict) else None
-    label = _window_label(duration) or fallback_label
-    return f"{label} {pct}"
+    resets_at = snap.get("resetsAt")
+    if not isinstance(resets_at, (int, float, str)):
+        return None
+    try:
+        seconds = max(0.0, float(resets_at) - now)
+        minutes = math.ceil(seconds / 60)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    days, remainder = divmod(minutes, 24 * 60)
+    hours, mins = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if mins or not parts:
+        parts.append(f"{mins}m")
+    return " ".join(parts)
 
 
 def _account_label(data: dict) -> str | None:
@@ -191,14 +212,47 @@ def _account_label(data: dict) -> str | None:
     return None
 
 
+def _plan_label(data: dict, rate_limits: dict) -> str | None:
+    """Return a normalized subscription plan label from either response."""
+    account = data.get("account")
+    candidates = [rate_limits.get("planType")]
+    if isinstance(account, dict):
+        candidates.append(account.get("planType"))
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        label = " ".join(value.split())
+        if label:
+            return label[:40]
+    return None
+
+
+def _usage_line(snap: dict | None, fallback_label: str, now: float) -> str | None:
+    """Format one rate-limit window as a Discord status row."""
+    pct = _fmt_pct(snap)
+    if pct is None:
+        return None
+    line = f"{_window_label(snap, fallback_label)}  used {pct}"
+    countdown = _reset_countdown(snap, now)
+    if countdown is not None:
+        line += f" — resets in {countdown}"
+    return line
+
+
 def format_codex_status_line(
     data: dict | None,
     *,
     show_account: bool = False,
+    now: float | None = None,
 ) -> str | None:
-    """Format a ``account/rateLimits/read`` result into one Discord line.
+    """Format an ``account/rateLimits/read`` result into Discord status rows.
 
-    Example: ``🤖 Codex (user@example.com): 5h 1% · 週次 8% · クレジット 0``.
+    Example::
+
+        Codex · prolite subscription (user@example.com)
+        5h  used 84% — resets in 28m
+        7d  used 58% — resets in 23h 58m
+
     Returns ``None`` when there is nothing meaningful to show.
     """
     if not isinstance(data, dict):
@@ -207,31 +261,28 @@ def format_codex_status_line(
     if not isinstance(snap, dict):
         return None
 
-    segments: list[str] = []
-    primary = _window_segment(snap.get("primary"), "5h")
-    if primary is not None:
-        segments.append(primary)
-    secondary = _window_segment(snap.get("secondary"), "週次")
-    if secondary is not None:
-        segments.append(secondary)
-
-    credit_info = snap.get("credits")
-    if isinstance(credit_info, dict):
-        if credit_info.get("unlimited"):
-            segments.append("クレジット 無制限")
-        elif credit_info.get("balance") is not None:
-            segments.append(f"クレジット {credit_info.get('balance')}")
-
-    if not segments:
+    current_time = time.time() if now is None else now
+    rows = [
+        row
+        for row in (
+            _usage_line(snap.get("primary"), "5h", current_time),
+            _usage_line(snap.get("secondary"), "7d", current_time),
+        )
+        if row is not None
+    ]
+    if not rows:
         return None
 
-    plan = snap.get("planType")
-    suffix = f" ({plan})" if plan else ""
-    reached = snap.get("rateLimitReachedType")
-    warn = " ⚠ 上限到達" if reached else ""
+    plan = _plan_label(data, snap)
+    header = "Codex"
+    if plan:
+        header += f" · {plan} subscription"
     account = _account_label(data) if show_account else None
-    account_suffix = f" ({account})" if account else ""
-    return f"\U0001f916 Codex{account_suffix}: {' · '.join(segments)}{suffix}{warn}"
+    if account:
+        header += f" ({account})"
+    if snap.get("rateLimitReachedType"):
+        header += " ⚠ limit reached"
+    return "\n".join([header, *rows])
 
 
 class CodexStatusProvider:
