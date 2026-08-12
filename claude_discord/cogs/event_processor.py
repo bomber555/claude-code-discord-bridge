@@ -989,7 +989,7 @@ async def _post_engine_status_footer(
     if show_codex:
         codex_line = await get_codex_status_line(codex_command)
         if codex_line is None and mode == "on":
-            codex_line = "\U0001f916 Codex: 残量取得失敗（codex login 済みか確認）"
+            codex_line = "\U0001f916 Codex: failed to fetch usage (check `codex login`)"
 
     # Render Claude status only for Claude turns.
     render_claude_sl = backend == "claude"
