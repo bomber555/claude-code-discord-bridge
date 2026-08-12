@@ -28,15 +28,15 @@ class TestFormat:
         assert line is not None
         assert "Codex" in line
         assert "5h 1%" in line
-        assert "週次 8%" in line
-        assert "クレジット 0" in line
+        assert "weekly 8%" in line
+        assert "credits 0" in line
         assert "(prolite)" in line
 
     def test_unlimited_credits(self) -> None:
         data = {"rateLimits": {"primary": {"usedPercent": 5}, "credits": {"unlimited": True}}}
         line = format_codex_status_line(data)
         assert line is not None
-        assert "クレジット 無制限" in line
+        assert "credits unlimited" in line
 
     def test_rounds_fractional_percent(self) -> None:
         data = {"rateLimits": {"primary": {"usedPercent": 12.6}}}
@@ -57,7 +57,7 @@ class TestFormat:
         line = format_codex_status_line(data)
 
         assert line is not None
-        assert "週次 3%" in line
+        assert "weekly 3%" in line
         assert "5h 3%" not in line
 
     def test_unknown_window_uses_duration_instead_of_slot_name(self) -> None:
@@ -73,7 +73,7 @@ class TestFormat:
         line = format_codex_status_line(data)
 
         assert line is not None
-        assert "1日 7%" in line
+        assert "1d 7%" in line
 
     def test_rate_limit_reached_warning(self) -> None:
         data = {
@@ -84,7 +84,7 @@ class TestFormat:
         }
         line = format_codex_status_line(data)
         assert line is not None
-        assert "上限到達" in line
+        assert "limit reached" in line
 
     @pytest.mark.parametrize("bad", [None, {}, {"rateLimits": None}, {"rateLimits": {}}, "x"])
     def test_returns_none_for_unusable(self, bad: object) -> None:
