@@ -122,6 +122,9 @@ class AnonymizingBackend:
     def describe_api(self) -> str:
         return self.inner.describe_api()
 
+    def describe_account(self) -> str | None:
+        return self.inner.describe_account()
+
     def clone(self, **kwargs: object) -> AnonymizingBackend:
         """Clone the inner backend and re-wrap it — the guard must survive."""
         gateway: PrivacyGateway = object.__getattribute__(self, "_gateway")

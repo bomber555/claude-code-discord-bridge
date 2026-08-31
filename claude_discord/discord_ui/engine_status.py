@@ -135,16 +135,18 @@ async def fetch_codex_rate_limits(
             await asyncio.wait_for(proc.wait(), timeout=3)
 
 
-def _fmt_pct(snap: dict | None) -> str | None:
-    """Return ``"N%"`` from a primary/secondary snapshot, or ``None``."""
+def _remaining_pct(snap: dict | None) -> str | None:
+    """Return the remaining capacity as ``"N%"``, or ``None``."""
     if not isinstance(snap, dict):
         return None
     pct = snap.get("usedPercent")
     if pct is None:
         return None
     try:
-        return f"{round(float(pct))}%"
-    except (TypeError, ValueError):
+        used = round(float(pct))
+        remaining = max(0, min(100, 100 - used))
+        return f"{remaining}%"
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -229,10 +231,10 @@ def _plan_label(data: dict, rate_limits: dict) -> str | None:
 
 def _usage_line(snap: dict | None, fallback_label: str, now: float) -> str | None:
     """Format one rate-limit window as a Discord status row."""
-    pct = _fmt_pct(snap)
+    pct = _remaining_pct(snap)
     if pct is None:
         return None
-    line = f"{_window_label(snap, fallback_label)}  used {pct}"
+    line = f"{_window_label(snap, fallback_label)}  remaining {pct}"
     countdown = _reset_countdown(snap, now)
     if countdown is not None:
         line += f" — resets in {countdown}"
@@ -250,8 +252,8 @@ def format_codex_status_line(
     Example::
 
         Codex · prolite subscription (user@example.com)
-        5h  used 84% — resets in 28m
-        7d  used 58% — resets in 23h 58m
+        5h  remaining 16% — resets in 28m
+        7d  remaining 42% — resets in 23h 58m
 
     Returns ``None`` when there is nothing meaningful to show.
     """

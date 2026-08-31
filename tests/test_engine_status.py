@@ -55,8 +55,8 @@ class TestFormat:
 
         assert line == (
             "Codex · prolite subscription\n"
-            "5h  used 1% — resets in 28m\n"
-            "7d  used 8% — resets in 23h 58m"
+            "5h  remaining 99% — resets in 28m\n"
+            "7d  remaining 92% — resets in 23h 58m"
         )
         assert "user@example.com" not in line
         assert "credit" not in line.lower()
@@ -64,8 +64,8 @@ class TestFormat:
     def test_weekly_primary_uses_duration_instead_of_position(self) -> None:
         line = format_codex_status_line(WEEKLY_PRIMARY_SAMPLE)
         assert line is not None
-        assert "7d  used 15%" in line
-        assert "5h  used 15%" not in line
+        assert "7d  remaining 85%" in line
+        assert "5h  remaining 85%" not in line
 
     @pytest.mark.parametrize(
         ("duration_mins", "expected_label"),
@@ -91,7 +91,7 @@ class TestFormat:
         }
         line = format_codex_status_line(data)
         assert line is not None
-        assert f"{expected_label}  used 10%" in line
+        assert f"{expected_label}  remaining 90%" in line
 
     def test_missing_durations_keep_positional_fallbacks(self) -> None:
         data = {
@@ -102,16 +102,16 @@ class TestFormat:
         }
         line = format_codex_status_line(data)
         assert line is not None
-        assert "5h  used 5%" in line
-        assert "7d  used 9%" in line
+        assert "5h  remaining 95%" in line
+        assert "7d  remaining 91%" in line
 
     def test_account_email_is_opt_in(self) -> None:
         line = format_codex_status_line(SAMPLE, show_account=True, now=NOW)
 
         assert line == (
             "Codex · prolite subscription (user@example.com)\n"
-            "5h  used 1% — resets in 28m\n"
-            "7d  used 8% — resets in 23h 58m"
+            "5h  remaining 99% — resets in 28m\n"
+            "7d  remaining 92% — resets in 23h 58m"
         )
 
     def test_prefers_account_name_over_email(self) -> None:
@@ -134,7 +134,7 @@ class TestFormat:
 
         line = format_codex_status_line(data, show_account=True)
 
-        assert line == "Codex\n5h  used 5%"
+        assert line == "Codex\n5h  remaining 95%"
 
     def test_account_display_env_is_opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CCDB_CODEX_STATUS_ACCOUNT", raising=False)
@@ -153,7 +153,7 @@ class TestFormat:
         data = {"rateLimits": {"primary": {"usedPercent": 12.6}}}
         line = format_codex_status_line(data)
         assert line is not None
-        assert "5h  used 13%" in line
+        assert "5h  remaining 87%" in line
 
     def test_window_label_comes_from_duration_not_slot(self) -> None:
         data = {
@@ -168,14 +168,14 @@ class TestFormat:
 
         line = format_codex_status_line(data, now=NOW)
 
-        assert line == "Codex\n7d  used 3% — resets in 1m"
+        assert line == "Codex\n7d  remaining 97% — resets in 1m"
 
     def test_unknown_window_uses_reported_duration(self) -> None:
         data = {"rateLimits": {"primary": {"usedPercent": 7, "windowDurationMins": 1440}}}
 
         line = format_codex_status_line(data)
 
-        assert line == "Codex\n1d  used 7%"
+        assert line == "Codex\n1d  remaining 93%"
 
     def test_reset_countdown_supports_days(self) -> None:
         data = {
@@ -190,7 +190,7 @@ class TestFormat:
 
         line = format_codex_status_line(data, now=NOW)
 
-        assert line == "Codex\n7d  used 42% — resets in 2d 3h 4m"
+        assert line == "Codex\n7d  remaining 58% — resets in 2d 3h 4m"
 
     def test_rate_limit_reached_warning(self) -> None:
         data = {
