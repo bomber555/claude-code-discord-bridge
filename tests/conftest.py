@@ -14,6 +14,22 @@ import pytest
 from claude_discord.claude.types import MessageType, StreamEvent
 
 
+@pytest.fixture(autouse=True)
+def _isolate_operator_statusline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must not execute commands from the operator's real settings file.
+
+    Explicit paths and per-test patches still exercise statusline behavior.
+    """
+    from claude_discord.discord_ui import statusline
+
+    original = statusline.read_statusline_command
+    monkeypatch.setattr(
+        statusline,
+        "read_statusline_command",
+        lambda settings_path=None: original(settings_path) if settings_path else None,
+    )
+
+
 @pytest.fixture
 def thread() -> MagicMock:
     """A MagicMock discord.Thread with send and id set."""
@@ -61,6 +77,21 @@ def _patch_build_system_context(
         return
     monkeypatch.setattr(
         "claude_discord.cogs._run_helper._build_system_context",
+        AsyncMock(return_value=None),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_claude_usage_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the statusline footer off the network by default.
+
+    ``_post_statusline_footer`` imports ``fetch_claude_usage`` at call time, so
+    patching the module attribute here neutralises it for every test that
+    exercises the footer. ``tests/test_claude_usage.py`` imports the real
+    function directly at module load, so its own coverage is unaffected.
+    """
+    monkeypatch.setattr(
+        "claude_discord.discord_ui.claude_usage.fetch_claude_usage",
         AsyncMock(return_value=None),
     )
 

@@ -17,15 +17,21 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import aiohttp
 import discord
 from discord.ext import commands
 
 from ..cogs._run_helper import run_claude_with_config
+from ..cogs.headless_backend import build_headless_runner
 from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
+from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
 
 if TYPE_CHECKING:
     from claude_code_core.backend import SessionBackend
+
+    from ..backend_factory import BackendFactory
+    from ..backend_settings import BackendSettings
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +80,8 @@ class WebhookTriggerCog(commands.Cog):
         allowed_webhook_ids: set[int] | None = None,
         channel_ids: set[int] | None = None,
         registry: SessionRegistry | None = None,
+        backend_factory: BackendFactory | None = None,
+        backend_settings: BackendSettings | None = None,
     ) -> None:
         self.bot = bot
         self.runner = runner
@@ -81,6 +89,8 @@ class WebhookTriggerCog(commands.Cog):
         self.allowed_webhook_ids = allowed_webhook_ids
         self.channel_ids = channel_ids
         self._registry = registry or getattr(bot, "session_registry", None)
+        self._backend_factory = backend_factory
+        self._backend_settings = backend_settings
         self._locks: dict[str, asyncio.Lock] = {prefix: asyncio.Lock() for prefix in triggers}
         self._active_count: int = 0
 
@@ -138,17 +148,22 @@ class WebhookTriggerCog(commands.Cog):
         trigger: WebhookTrigger,
     ) -> None:
         """Execute a matched trigger via Claude Code."""
-        thread = await message.create_thread(name=prefix[:100])
+        thread = await message.create_thread(
+            name=prefix[:100],
+            auto_archive_duration=THREAD_AUTO_ARCHIVE_MINUTES,
+        )
 
-        runner = self.runner.clone()
-        runner.dangerously_skip_permissions = trigger.dangerously_skip_permissions
-        if trigger.permission_mode is not None:
-            runner.permission_mode = trigger.permission_mode
-        runner.timeout_seconds = trigger.timeout
-        if trigger.working_dir:
-            runner.working_dir = trigger.working_dir
-        if trigger.allowed_tools is not None:
-            runner.allowed_tools = trigger.allowed_tools
+        runner = await build_headless_runner(
+            self.runner,
+            factory=self._backend_factory,
+            settings=self._backend_settings,
+            thread_id=thread.id,
+            working_dir=trigger.working_dir,
+            timeout_seconds=trigger.timeout,
+            allowed_tools=trigger.allowed_tools,
+            permission_mode=trigger.permission_mode,
+            dangerously_skip_permissions=trigger.dangerously_skip_permissions,
+        )
 
         self._active_count += 1
         try:
@@ -161,12 +176,18 @@ class WebhookTriggerCog(commands.Cog):
                     session_id=None,
                     status=None,
                     registry=self._registry,
+                    backend_settings=self._backend_settings,
                 )
             )
 
-            if session_id:
-                await message.add_reaction("✅")
-            else:
-                await message.add_reaction("❌")
+            reaction = "✅" if session_id else "❌"
+            try:
+                await message.add_reaction(reaction)
+            except (discord.HTTPException, aiohttp.ClientError):
+                logger.debug("Discord client closed before completion reaction", exc_info=True)
+            except RuntimeError as exc:
+                if str(exc) != "Session is closed":
+                    raise
+                logger.debug("Discord session closed before completion reaction", exc_info=True)
         finally:
             self._active_count -= 1

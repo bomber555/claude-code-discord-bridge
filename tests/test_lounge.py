@@ -20,7 +20,12 @@ from claude_discord.database.lounge_repo import LoungeMessage, LoungeRepository
 from claude_discord.database.models import init_db
 from claude_discord.database.notification_repo import NotificationRepository
 from claude_discord.ext.api_server import ApiServer
-from claude_discord.lounge import _NO_MESSAGES, build_lounge_prompt
+from claude_discord.lounge import (
+    _NO_MESSAGES,
+    MAX_RECOMMENDED_MESSAGE_CHARS,
+    build_lounge_prompt,
+    length_hint,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -233,6 +238,25 @@ class TestBuildLoungePrompt:
         assert "thread_id" in result
         assert "DISCORD_THREAD_ID" in result
 
+    def test_prompt_draws_the_line_between_lounge_and_apis(self) -> None:
+        """The prompt tells sessions to use the APIs for discovery/locking, not the lounge."""
+        result = build_lounge_prompt([])
+        assert "/api/sessions" in result
+        assert "/api/claims" in result
+        # And it names the lounge's own remaining job (broadcast / intent).
+        assert "BROADCAST" in result
+
+    def test_prompt_states_the_length_limit(self) -> None:
+        """The prompt gives a number, not just 'keep it short'.
+
+        Sessions demonstrably talked past the soft wording and posted
+        multi-paragraph retrospectives, so the limit is now explicit and
+        covers the closing note as well as the opening one.
+        """
+        result = build_lounge_prompt([])
+        assert str(MAX_RECOMMENDED_MESSAGE_CHARS) in result
+        assert "closing note" in result
+
     def test_this_thread_marker_for_matching_thread(self) -> None:
         """Messages from current thread are annotated with [this thread]."""
         messages = [
@@ -423,6 +447,55 @@ class TestLoungeApiEndpoints:
         assert "Claude" in call_args
         assert "Hello Discord!" in call_args
 
+    async def test_post_lounge_stores_but_does_not_mirror_when_channel_unset(
+        self,
+        notif_repo: NotificationRepository,
+        lounge_repo: LoungeRepository,
+        bot: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mirror OFF: the message is stored (AI layer intact) with no Discord send."""
+        # lounge_channel_id=None falls back to COORDINATION_CHANNEL_ID; clear it so
+        # "off" really means off even when the test process has the env var set.
+        monkeypatch.delenv("COORDINATION_CHANNEL_ID", raising=False)
+        api = ApiServer(
+            repo=notif_repo,
+            bot=bot,
+            default_channel_id=12345,
+            host="127.0.0.1",
+            port=0,
+            lounge_repo=lounge_repo,
+            lounge_channel_id=None,  # mirror off
+        )
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post("/api/lounge", json={"message": "db only", "label": "x"})
+            assert resp.status == 201
+            assert (await lounge_repo.get_recent(limit=1))[0].message == "db only"
+            bot.get_channel.return_value.send.assert_not_called()
+        finally:
+            await client.close()
+
+    async def test_deleted_mirror_channel_disables_itself(
+        self, api_client_with_lounge: TestClient, bot: MagicMock
+    ) -> None:
+        """A deleted channel disables the mirror instead of warning on every post."""
+        import discord
+
+        bot.get_channel.return_value = None
+        bot.fetch_channel = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Unknown Channel")
+        )
+
+        first = await api_client_with_lounge.post("/api/lounge", json={"message": "one"})
+        second = await api_client_with_lounge.post("/api/lounge", json={"message": "two"})
+
+        assert first.status == 201 and second.status == 201  # posts still succeed (DB saved)
+        # The mirror gave up after the first NotFound rather than retrying.
+        assert bot.fetch_channel.await_count == 1
+
     async def test_lounge_503_when_not_configured(self, api_client_no_lounge: TestClient) -> None:
         """GET and POST return 503 when lounge_repo is not wired."""
         get_resp = await api_client_no_lounge.get("/api/lounge")
@@ -539,3 +612,23 @@ class TestRunHelperLoungeInjection:
         if runner.clone.called:
             system_prompt = runner.clone.call_args[1].get("append_system_prompt", "")
             assert "AI Lounge" not in system_prompt
+
+
+# ---------------------------------------------------------------------------
+# length_hint tests
+# ---------------------------------------------------------------------------
+
+
+class TestLengthHint:
+    def test_short_message_gets_no_hint(self) -> None:
+        assert length_hint("Fixing a flaky test in ccdb.") is None
+
+    def test_message_at_the_limit_gets_no_hint(self) -> None:
+        assert length_hint("x" * MAX_RECOMMENDED_MESSAGE_CHARS) is None
+
+    def test_long_message_gets_a_hint_naming_both_numbers(self) -> None:
+        message = "x" * (MAX_RECOMMENDED_MESSAGE_CHARS + 50)
+        hint = length_hint(message)
+        assert hint is not None
+        assert str(MAX_RECOMMENDED_MESSAGE_CHARS) in hint
+        assert str(len(message)) in hint

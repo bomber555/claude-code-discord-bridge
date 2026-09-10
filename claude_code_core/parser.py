@@ -64,6 +64,8 @@ def parse_line(line: str) -> StreamEvent | None:
         _parse_progress(data, event)
     elif msg_type == MessageType.RATE_LIMIT_EVENT:
         _parse_rate_limit_event(data, event)
+    elif msg_type == MessageType.STREAM_EVENT:
+        _parse_stream_event(data, event)
 
     return event
 
@@ -270,9 +272,19 @@ def _parse_result(data: dict[str, Any], event: StreamEvent) -> None:
     #   {"type":"result","subtype":"error","error":"..."} — explicit error subtype
     #   {"type":"result","subtype":"success","is_error":true,"result":"API Error: ..."} — API-level
     #     error reported as a "successful" result with is_error flag (e.g. 400 from Anthropic API)
+    #   {"type":"result","subtype":"error_during_execution","is_error":true,
+    #    "result":"","errors":["No conversation found with session ID: ..."]} — the CLI
+    #     failed before producing any text (e.g. --resume with a session ID that does
+    #     not exist).  There is no `result` text, so the errors[] array is the only
+    #     human-readable signal.  Without this branch the run ends silently and the
+    #     user sees no reply at all.
     subtype = data.get("subtype", "")
+    errors_list = [str(e) for e in data.get("errors", []) if e]
     if subtype == "error":
         event.error = data.get("error", "Unknown error")
+    elif subtype.startswith("error") and not result_text:
+        event.error = "\n".join(errors_list) if errors_list else f"CLI reported {subtype}"
+        event.text = ""
     elif data.get("is_error") and result_text:
         # API-level error (e.g. "API Error: 400 ...") surfaced via is_error flag.
         # Promote it to event.error so the handler shows an error display,
@@ -309,24 +321,68 @@ def _parse_rate_limit_event(data: dict[str, Any], event: StreamEvent) -> None:
     )
 
 
+def _parse_stream_event(data: dict[str, Any], event: StreamEvent) -> None:
+    """Parse a low-level ``stream_event`` wrapper.
+
+    Only ``message_delta`` carries usage, and it is the *final* usage for
+    that message — unlike the ``assistant`` message's own ``usage`` field,
+    which is a mid-generation snapshot (e.g. output_tokens=1 while the block
+    is still streaming). ``message_delta`` arrives immediately before
+    ``message_stop``, after all of that message's content blocks, so its
+    usage is what a caller tracking "this turn's real token count" wants —
+    see EventProcessor._last_turn_input_tokens.
+    """
+    inner = data.get("event", {})
+    if not isinstance(inner, dict) or inner.get("type") != "message_delta":
+        return
+    usage = inner.get("usage", {})
+    if not isinstance(usage, dict) or not usage:
+        return
+    event.input_tokens = usage.get("input_tokens")
+    event.output_tokens = usage.get("output_tokens")
+    event.cache_read_tokens = usage.get("cache_read_input_tokens")
+    event.cache_creation_tokens = usage.get("cache_creation_input_tokens")
+
+
 def _parse_ask_questions(tool_input: dict[str, Any]) -> list[AskQuestion]:
-    """Parse AskUserQuestion tool input into a list of AskQuestion objects."""
-    questions_raw = tool_input.get("questions", [])
+    """Parse AskUserQuestion input, including JSON-encoded nested values."""
+
+    def _as_list(value: Any) -> list[Any]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return []
+        return value if isinstance(value, list) else []
+
+    def _as_dict(value: Any) -> dict[str, Any] | None:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return None
+        return value if isinstance(value, dict) else None
+
     result: list[AskQuestion] = []
-    for q in questions_raw:
+    for raw_question in _as_list(tool_input.get("questions", [])):
+        question = _as_dict(raw_question)
+        if question is None:
+            continue
         options = [
             AskOption(
-                label=o.get("label", ""),
-                description=o.get("description", ""),
+                label=option.get("label", ""),
+                description=option.get("description", ""),
             )
-            for o in q.get("options", [])
-            if o.get("label")
+            for option in (
+                _as_dict(raw_option) for raw_option in _as_list(question.get("options", []))
+            )
+            if option is not None and option.get("label")
         ]
         result.append(
             AskQuestion(
-                question=q.get("question", ""),
-                header=q.get("header", ""),
-                multi_select=bool(q.get("multiSelect", False)),
+                question=question.get("question", ""),
+                header=question.get("header", ""),
+                multi_select=bool(question.get("multiSelect", False)),
                 options=options,
             )
         )

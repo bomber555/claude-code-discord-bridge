@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import discord
 import pytest
 from discord.ext import commands
@@ -112,6 +113,41 @@ class TestWebhookFiltering:
             await cog.on_message(msg)
             mock_run.assert_not_called()
 
+
+class TestWebhookBackendResolution:
+    @pytest.mark.asyncio
+    async def test_execute_trigger_uses_current_backend_from_settings(
+        self,
+        bot: MagicMock,
+        runner: MagicMock,
+    ) -> None:
+        """Webhook-triggered automation should follow the runtime backend setting."""
+        codex_runner = MagicMock()
+        factory = MagicMock()
+        factory.build.return_value = codex_runner
+        settings = MagicMock()
+        settings.current_backend = AsyncMock(return_value="codex")
+        settings.current_model = AsyncMock(return_value=None)
+        settings.current_effort = AsyncMock(return_value=None)
+        cog = WebhookTriggerCog(
+            bot=bot,
+            runner=runner,
+            triggers={"🔄 docs-sync": WebhookTrigger(prompt="Sync docs")},
+            backend_factory=factory,
+            backend_settings=settings,
+        )
+        msg = _make_message()
+        msg.create_thread.return_value.id = 2468
+
+        with patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run:
+            await cog._execute_trigger(msg, "🔄 docs-sync", cog.triggers["🔄 docs-sync"])
+
+        runner.clone.assert_not_called()
+        factory.build.assert_called_once_with(backend="codex", model=None, thread_id=2468)
+        run_config = mock_run.call_args[0][0]
+        assert run_config.runner is codex_runner
+        assert run_config.backend_settings is settings
+
     @pytest.mark.asyncio
     async def test_accepts_authorized_webhook(
         self,
@@ -219,6 +255,48 @@ class TestTriggerExecution:
             mock_run.return_value = None
             await cog.on_message(msg)
             msg.add_reaction.assert_called_with("❌")
+
+    @pytest.mark.asyncio
+    async def test_completion_reaction_ignores_shutdown_client_error(
+        self,
+        cog: WebhookTriggerCog,
+    ) -> None:
+        """A closing Discord HTTP client must not hide a completed trigger."""
+        msg = _make_message(content="🔄 docs-sync")
+        msg.add_reaction.side_effect = aiohttp.ClientError("transport closing")
+
+        with patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = "session-abc"
+            await cog.on_message(msg)
+
+    @pytest.mark.asyncio
+    async def test_completion_reaction_ignores_closed_session_runtime_error(
+        self,
+        cog: WebhookTriggerCog,
+    ) -> None:
+        """discord.py can report its closing client as a RuntimeError."""
+        msg = _make_message(content="🔄 docs-sync")
+        msg.add_reaction.side_effect = RuntimeError("Session is closed")
+
+        with patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = "session-abc"
+            await cog.on_message(msg)
+
+    @pytest.mark.asyncio
+    async def test_completion_reaction_propagates_unexpected_runtime_error(
+        self,
+        cog: WebhookTriggerCog,
+    ) -> None:
+        """Only the known shutdown RuntimeError is best-effort cleanup."""
+        msg = _make_message(content="🔄 docs-sync")
+        msg.add_reaction.side_effect = RuntimeError("unexpected bug")
+
+        with (
+            patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run,
+            pytest.raises(RuntimeError, match="unexpected bug"),
+        ):
+            mock_run.return_value = "session-abc"
+            await cog.on_message(msg)
 
     @pytest.mark.asyncio
     async def test_runner_clone_overrides(
