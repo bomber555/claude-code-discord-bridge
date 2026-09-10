@@ -74,12 +74,15 @@ def main():
     if config.exists():
         if config.read_text() != content or config.stat().st_mode & 0o077:
             raise SystemExit("Existing runtime configuration differs or is not private")
+        if not args.check_only:
+            (runtime / "data").mkdir(mode=0o700, exist_ok=True)
         print("Existing private runtime configuration matches")
         return
     if args.check_only:
         return
     os.umask(0o077)
     runtime.mkdir(mode=0o700, exist_ok=True)
+    (runtime / "data").mkdir(mode=0o700, exist_ok=True)
     with (runtime / ".env").open("x") as output:
         output.write(content)
     print(f"Prepared {runtime}/.env (private); backend={args.backend}")

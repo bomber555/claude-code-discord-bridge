@@ -50,9 +50,30 @@ to verify a complete response. API health alone does not prove Discord or the
 agent backend is responding. After success, remove the temporary token file;
 the runtime `.env` is mode 600.
 
-## Preparation status (2026-09-10)
+## Verified deployment (2026-09-10)
 
 Bot token, Message Content Intent, guild membership and access to the user-specified
 channel verified. Runtime configuration uses Codex and the existing CLI default
-model. Systemd registration and live checks await terminal sudo authentication.
-No new service has been started.
+model. Service is enabled and active; API health is `ok`. Discord login and the
+configured channel were confirmed at 18:10:14 JST, with 26 slash commands synced.
+
+The first startup failed because the new runtime lacked its `data` directory.
+Creating `/home/bomber/ccdb-lab/data` with mode 700 allowed the systemd retry to
+succeed. `prepare.py` now creates this directory for both new and reused runtime
+configuration.
+
+## Windows / WSL automatic startup
+
+Lab follows the existing services' startup chain:
+
+1. Windows task `Strix3-BootRecovery` is enabled, with an interactive logon trigger
+   and a one-minute delay for the existing Windows account `bombe`.
+2. Its existing `C:\strix3\nikkei225-trade-analysis\scripts\ops\daily-startup.ps1`
+   invokes WSL. The default distribution is `Ubuntu-24.04`.
+3. `/etc/wsl.conf` enables systemd. `ccdb-lab.service` is enabled under
+   `multi-user.target`, just like `ccdb-factory` and `ccdb-operation`.
+
+This is startup after Windows login, not unattended startup before login. No
+Windows task changes were needed. Configuration and live service health were
+checked without rebooting Windows or WSL. A full bot/agent conversational response
+has not been tested by this deployment session.
