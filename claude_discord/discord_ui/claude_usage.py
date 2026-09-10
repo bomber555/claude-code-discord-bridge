@@ -11,10 +11,9 @@ costs no tokens, and is cached on disk so a burst of sessions ending together
 results in a single request. Every failure path returns ``None`` — the footer
 must never be lost because the endpoint is slow or the token has rotated.
 
-Rendering is deliberately text-only — no block-character meter. The bars read
-as glare in a dark Discord client, and a bare percentage is ambiguous about
-which direction it runs, so every figure is spelled out as ``used N%``:
-0% is an untouched window, 100% is an exhausted one.
+Rendering is deliberately text-only — no block-character meter. Percentages
+show remaining capacity, using the same Japanese labels as the Codex completion
+card so switching backends does not reverse the meaning of the number.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -44,7 +44,7 @@ _CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _FALSEY = frozenset({"0", "false", "no", "off"})
 
 # Quota windows worth a line, in display order.
-_WINDOWS = (("five_hour", "⏱ 5h"), ("seven_day", "\U0001f4c5 7d"))
+_WINDOWS = (("five_hour", "5時間"), ("seven_day", "週間"))
 
 
 def usage_footer_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -67,34 +67,38 @@ def _parse_resets_at(value: object) -> float | None:
     return None
 
 
-def _format_countdown(resets_at: object, now: int | None = None) -> str:
+def _format_countdown(resets_at: object, now: int | None = None) -> str | None:
     epoch = _parse_resets_at(resets_at)
     if epoch is None:
-        return "reset unknown"
+        return None
     current = time.time() if now is None else now
-    remaining = int(epoch - current)
-    if remaining <= 0:
-        return "resetting now"
-    days, rest = divmod(remaining, 86400)
-    hours, rest = divmod(rest, 3600)
-    minutes = rest // 60
-    if days > 0:
-        return f"resets in {days}d {hours}h"
-    if hours > 0:
-        return f"resets in {hours}h {minutes}m"
-    return f"resets in {minutes}m"
+    minutes = math.ceil(max(0.0, epoch - current) / 60)
+    days, remainder = divmod(minutes, 24 * 60)
+    hours, mins = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}日")
+    if hours:
+        parts.append(f"{hours}時間")
+    if mins or not parts:
+        parts.append(f"{mins}分")
+    return "".join(parts)
 
 
 def _window_line(window: object, label: str, now: int | None) -> str | None:
-    """Render one quota window. ``utilization`` is consumption, not headroom."""
+    """Render one quota window as remaining capacity."""
     if not isinstance(window, dict):
         return None
     utilization = window.get("utilization")
     if not isinstance(utilization, (int, float)) or isinstance(utilization, bool):
         return None
-    used = int(utilization)
+    used = round(float(utilization))
+    remaining = max(0, min(100, 100 - used))
     countdown = _format_countdown(window.get("resets_at"), now=now)
-    return f"{label}  used {used}% — {countdown}"
+    line = f"{label}残量：{remaining}%"
+    if countdown is not None:
+        line += f"（リセットまで{countdown}）"
+    return line
 
 
 def _format_money(minor_units: float, decimal_places: int, currency: str) -> str:
@@ -129,7 +133,7 @@ def _extra_usage_line(extra: object) -> str | None:
         percent = int(used / limit * 100) if limit else 0
 
     spend = f"{_format_money(used, places, currency)} / {_format_money(limit, places, currency)}"
-    return f"\U0001f4b3 credits  used {percent}%  {spend}"
+    return f"追加利用：{percent}%使用（{spend}）"
 
 
 def build_claude_usage_lines(payload: Mapping[str, Any], now: int | None = None) -> list[str]:

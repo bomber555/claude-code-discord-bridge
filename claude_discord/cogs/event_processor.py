@@ -63,6 +63,15 @@ def _backend_name_from_runner(runner: object) -> str:
     return "claude"
 
 
+def _uses_compact_cli_card(runner: object) -> bool:
+    """Use the shared Discord card for the two first-party CLI backends."""
+    if type(runner).__name__ == "AnonymizingBackend":
+        inner = getattr(runner, "inner", None)
+        if inner is not None and inner is not runner:
+            return _uses_compact_cli_card(inner)
+    return type(runner).__name__ in {"ClaudeRunner", "CodexRunner"}
+
+
 # Marker file prefix. The full name includes the thread ID to prevent
 # cross-contamination when multiple sessions share the same working_dir.
 _ATTACHMENT_MARKER_PREFIX = ".ccdb-attachments"
@@ -175,9 +184,7 @@ class EventProcessor:
 
     def __init__(self, config: RunConfig) -> None:
         self._config = config
-        self._compact_codex = (
-            config.thread is not None and _backend_name_from_runner(config.runner) == "codex"
-        )
+        self._compact_cli = config.thread is not None and _uses_compact_cli_card(config.runner)
         self._state = SessionState(
             session_id=config.session_id,
             thread_id=config.surface.thread_key,
@@ -425,7 +432,7 @@ class EventProcessor:
         # Skip in chat_only mode — no session start embed.
         if (
             not self._chat_only
-            and not self._compact_codex
+            and not self._compact_cli
             and not self._config.session_id
             and not self._session_start_sent
         ):
@@ -620,8 +627,8 @@ class EventProcessor:
             if self._chat_only:
                 await self._config.surface.set_status(StatusKind.DONE)
             else:
-                if self._compact_codex:
-                    await self._post_codex_completion(event)
+                if self._compact_cli:
+                    await self._post_compact_completion(event)
                 else:
                     fields = _completion_fields(event, self._config.runner)
                     await self._config.surface.send_notice(
@@ -742,16 +749,35 @@ class EventProcessor:
             self._assistant_text_sent = True
             await self._bump_stop()
 
-    async def _post_codex_completion(self, event: StreamEvent) -> None:
+    async def _post_compact_completion(self, event: StreamEvent) -> None:
         from claude_code_core.codex_runner import CodexRunner
 
         from ..backend_settings import BackendSettings
-        from ..discord_ui.codex_completion import post_completion
+        from ..discord_ui.codex_completion import post_claude_completion, post_completion
 
         await self._config.surface.set_status(StatusKind.DONE)
         runner = self._config.runner
         if type(runner).__name__ == "AnonymizingBackend":
             runner = getattr(runner, "inner", runner)
+        backend = _backend_name_from_runner(runner)
+        if backend == "claude":
+            assert self._config.thread is not None
+            asyncio.create_task(
+                post_claude_completion(
+                    self._config.thread,
+                    model=runner.model,
+                    session_id=self._state.session_id,
+                    input_tokens=event.input_tokens,
+                    output_tokens=event.output_tokens,
+                    duration_ms=event.duration_ms,
+                    cost_usd=event.cost_usd,
+                    api_label=runner.describe_api(),
+                    account_label=runner.describe_account(),
+                ),
+                name=f"completion-{self._config.surface.thread_key}",
+            )
+            return
+
         model = (
             await runner.get_session_model(self._state.session_id)
             if isinstance(runner, CodexRunner)
@@ -800,7 +826,7 @@ class EventProcessor:
         await self._config.surface.set_status(StatusKind.for_tool(event.tool_use.category))
 
         try:
-            if self._compact_codex and event.tool_use.category == ToolCategory.COMMAND:
+            if self._compact_cli and event.tool_use.category == ToolCategory.COMMAND:
                 from ..discord_ui.codex_completion import open_command_activity
 
                 assert self._config.thread is not None

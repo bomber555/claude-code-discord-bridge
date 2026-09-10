@@ -55,13 +55,8 @@ def test_builds_five_hour_and_weekly_lines() -> None:
     lines = build_claude_usage_lines(_PAYLOAD, now=_NOW)
     # Extra usage is switched off in _PAYLOAD, so only the two windows show.
     assert len(lines) == 2
-    assert lines[0].startswith("⏱ 5h")
-    assert "used 47%" in lines[0]
-    assert "resets in 2h 40m" in lines[0]
-    assert lines[1].startswith("\U0001f4c5 7d")
-    assert "used 53%" in lines[1]
-    # 26h+ away — rendered in days, not a three-digit hour count.
-    assert "resets in 1d 2h" in lines[1]
+    assert lines[0] == "5時間残量：53%（リセットまで2時間41分）"
+    assert lines[1] == "週間残量：47%（リセットまで1日2時間11分）"
 
 
 def test_renders_no_block_meter() -> None:
@@ -72,12 +67,12 @@ def test_renders_no_block_meter() -> None:
 
 
 def test_percentage_is_consumption_not_headroom() -> None:
-    """0% must mean an untouched window, 100% an exhausted one."""
+    """The card shows headroom, matching the Codex completion card."""
     untouched = {"five_hour": {"utilization": 0, "resets_at": None}}
-    assert "used 0%" in build_claude_usage_lines(untouched, now=_NOW)[0]
+    assert build_claude_usage_lines(untouched, now=_NOW)[0] == "5時間残量：100%"
 
     exhausted = {"five_hour": {"utilization": 100, "resets_at": None}}
-    assert "used 100%" in build_claude_usage_lines(exhausted, now=_NOW)[0]
+    assert build_claude_usage_lines(exhausted, now=_NOW)[0] == "5時間残量：0%"
 
 
 def test_hides_credits_when_extra_usage_is_off() -> None:
@@ -101,8 +96,7 @@ def test_extra_credits_line_when_enabled() -> None:
         },
     }
     line = build_claude_usage_lines(payload, now=_NOW)[2]
-    assert line.startswith("\U0001f4b3")
-    assert "used 78%" in line
+    assert line.startswith("追加利用：78%使用")
     assert "$157.20" in line
     assert "$200.00" in line
 
@@ -132,28 +126,28 @@ def test_skips_enabled_pool_with_unusable_figures() -> None:
 def test_accepts_epoch_seconds_for_resets_at() -> None:
     """The CLI seeds these windows from response headers, which use epoch seconds."""
     payload = {"five_hour": {"utilization": 10, "resets_at": _NOW + 3600}}
-    assert "resets in 1h 0m" in build_claude_usage_lines(payload, now=_NOW)[0]
+    assert "リセットまで1時間" in build_claude_usage_lines(payload, now=_NOW)[0]
 
 
 def test_handles_z_suffix_timestamps() -> None:
     payload = {"five_hour": {"utilization": 10, "resets_at": "2026-07-29T11:49:00Z"}}
-    assert "resets in 1h 0m" in build_claude_usage_lines(payload, now=_NOW)[0]
+    assert "リセットまで1時間" in build_claude_usage_lines(payload, now=_NOW)[0]
 
 
 def test_unknown_and_elapsed_resets() -> None:
     unknown = {"five_hour": {"utilization": 10, "resets_at": None}}
-    assert "reset unknown" in build_claude_usage_lines(unknown, now=_NOW)[0]
+    assert build_claude_usage_lines(unknown, now=_NOW)[0] == "5時間残量：90%"
 
     past = {"five_hour": {"utilization": 10, "resets_at": _NOW - 5}}
-    assert "resetting now" in build_claude_usage_lines(past, now=_NOW)[0]
+    assert "リセットまで0分" in build_claude_usage_lines(past, now=_NOW)[0]
 
     garbage = {"five_hour": {"utilization": 10, "resets_at": "not-a-date"}}
-    assert "reset unknown" in build_claude_usage_lines(garbage, now=_NOW)[0]
+    assert build_claude_usage_lines(garbage, now=_NOW)[0] == "5時間残量：90%"
 
 
 def test_minutes_only_countdown() -> None:
     payload = {"five_hour": {"utilization": 10, "resets_at": _NOW + 1800}}
-    assert "resets in 30m" in build_claude_usage_lines(payload, now=_NOW)[0]
+    assert "リセットまで30分" in build_claude_usage_lines(payload, now=_NOW)[0]
 
 
 def test_tolerates_garbage_payload() -> None:

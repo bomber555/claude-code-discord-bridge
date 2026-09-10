@@ -114,8 +114,8 @@ async def test_appends_usage_lines_below_api_line() -> None:
             api_label="Anthropic API (direct)",
         )
     body = thread.send.await_args.args[0]
-    assert "47%" in body
-    assert body.index("API:") < body.index("47%")
+    assert "5時間残量：53%" in body
+    assert body.index("API:") < body.index("53%")
 
 
 async def test_usage_failure_does_not_break_footer() -> None:
@@ -178,4 +178,4 @@ async def test_posts_usage_even_without_api_label() -> None:
             cache_read_tokens=None,
             api_label=None,
         )
-    assert "12%" in thread.send.await_args.args[0]
+    assert "5時間残量：88%" in thread.send.await_args.args[0]

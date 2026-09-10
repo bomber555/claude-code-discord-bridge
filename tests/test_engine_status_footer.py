@@ -84,8 +84,8 @@ class TestGating:
         )
         assert body is not None
         assert "Max subscription (owner@example.com)" in body
-        assert "5h  used 12%" in body
-        assert "7d  used 34%" in body
+        assert "5時間残量：88%" in body
+        assert "週間残量：66%" in body
         assert "Codex" not in body
 
     async def test_off_claude_turn_shows_only_claude(self) -> None:
