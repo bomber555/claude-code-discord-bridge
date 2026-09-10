@@ -1,0 +1,20 @@
+[Unit]
+Description=CCDB Strategy Lab (nk225-lab / strategy_lab)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bomber
+WorkingDirectory=/home/bomber/ccdb-lab
+Environment=PATH=/home/bomber/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CCDB_CODEX_STATUS_ACCOUNT=1
+ExecStart=/home/bomber/.local/bin/uvx --from git+https://github.com/bomber555/claude-code-discord-bridge.git@cf8ffa437ebc4c827f9c6c1297d071ffde8beb86 ccdb start
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ccdb-lab
+
+[Install]
+WantedBy=multi-user.target
