@@ -1,5 +1,5 @@
 [Unit]
-Description=CCDB Strategy Lab (nk225-lab / strategy_lab)
+Description=CCDB Strategy Lab (nk225-strategy-lab / strategy_lab)
 After=network-online.target
 Wants=network-online.target
 

@@ -20,8 +20,6 @@ def main():
     workspace = Path("/home/bomber/nk225future/strategy_lab")
     if not workspace.is_dir():
         raise SystemExit("Workspace is missing")
-    if (runtime / ".env").exists():
-        raise SystemExit("Runtime already configured; refusing to overwrite")
     if args.token_file.stat().st_mode & 0o077:
         raise SystemExit("Token file must be private: chmod 600 TOKEN_FILE")
     token = args.token_file.read_text().strip()
@@ -46,17 +44,13 @@ def main():
         raise SystemExit("A bot token is required")
     if channel.get("guild_id") != "1495053272375890001" or channel.get("type") != 0:
         raise SystemExit("Expected a text channel in the existing CCDB server")
-    if channel.get("name") != "nk225-lab":
-        raise SystemExit("Expected the dedicated nk225-lab channel")
+    if channel.get("id") != "1547533034583101511":
+        raise SystemExit("Expected the user-specified Strategy Lab channel")
     if not app.get("flags", 0) & ((1 << 18) | (1 << 19)):
         raise SystemExit("Enable Message Content Intent in the Developer Portal")
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 8088))
     print(f"Validated bot {bot['username']} ({bot['id']}), channel {channel['id']}")
-    if args.check_only:
-        return
-    os.umask(0o077)
-    runtime.mkdir(mode=0o700, exist_ok=True)
     values = {
         "DISCORD_BOT_TOKEN": token,
         "DISCORD_CHANNEL_ID": str(args.channel_id),
@@ -75,8 +69,19 @@ def main():
     }
     if args.backend == "claude":
         values["CCDB_MODEL"] = "opus"
+    content = "".join(f"{key}={value}\n" for key, value in values.items())
+    config = runtime / ".env"
+    if config.exists():
+        if config.read_text() != content or config.stat().st_mode & 0o077:
+            raise SystemExit("Existing runtime configuration differs or is not private")
+        print("Existing private runtime configuration matches")
+        return
+    if args.check_only:
+        return
+    os.umask(0o077)
+    runtime.mkdir(mode=0o700, exist_ok=True)
     with (runtime / ".env").open("x") as output:
-        output.write("".join(f"{key}={value}\n" for key, value in values.items()))
+        output.write(content)
     print(f"Prepared {runtime}/.env (private); backend={args.backend}")
 
 
