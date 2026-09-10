@@ -37,7 +37,7 @@ from claude_code_core.frontend import (
     NoticeLevel,
     StatusKind,
 )
-from claude_code_core.types import ElicitationRequest
+from claude_code_core.types import ElicitationRequest, ToolCategory
 
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent, ToolUseEvent
 from ..collision import extract_written_path
@@ -175,6 +175,9 @@ class EventProcessor:
 
     def __init__(self, config: RunConfig) -> None:
         self._config = config
+        self._compact_codex = (
+            config.thread is not None and _backend_name_from_runner(config.runner) == "codex"
+        )
         self._state = SessionState(
             session_id=config.session_id,
             thread_id=config.surface.thread_key,
@@ -420,7 +423,12 @@ class EventProcessor:
 
         # Guard: post session_start_embed only once (Claude can emit multiple SYSTEM events).
         # Skip in chat_only mode — no session start embed.
-        if not self._chat_only and not self._config.session_id and not self._session_start_sent:
+        if (
+            not self._chat_only
+            and not self._compact_codex
+            and not self._config.session_id
+            and not self._session_start_sent
+        ):
             backend = _backend_name_from_runner(self._config.runner)
             fields = tuple(
                 (name, value)
@@ -612,46 +620,49 @@ class EventProcessor:
             if self._chat_only:
                 await self._config.surface.set_status(StatusKind.DONE)
             else:
-                fields = _completion_fields(event, self._config.runner)
-                await self._config.surface.send_notice(
-                    Notice(level=NoticeLevel.SUCCESS, title="Done", fields=fields)
-                )
-                await self._config.surface.set_status(StatusKind.DONE)
-
-                # Post the per-turn engine status footer.
-                #
-                # - Claude statusLine (read from ~/.claude/settings.json)
-                #   surfaces Anthropic quota windows (5h, 7d).
-                # - Codex status line surfaces Codex usage via `codex
-                #   app-server` (account/rateLimits/read).
-                #
-                # Only the active backend's status is shown. The Codex probe
-                # runs only on Codex turns in interactive chat
-                # (backend_settings is wired); headless flows leave it None
-                # and incur no extra subprocess.
-                api_label_raw = self._config.runner.describe_api()
-                api_label = api_label_raw if isinstance(api_label_raw, str) else None
-                if self._config.thread is not None and (
-                    self._config.backend_settings is not None or api_label is not None
-                ):
-                    asyncio.create_task(
-                        _post_engine_status_footer(
-                            thread=self._config.thread,
-                            backend=_backend_name_from_runner(self._config.runner),
-                            working_dir=self._config.runner.working_dir,
-                            model=self._config.runner.model,
-                            context_window=event.context_window,
-                            input_tokens=event.input_tokens,
-                            cache_creation_tokens=event.cache_creation_tokens,
-                            cache_read_tokens=event.cache_read_tokens,
-                            api_label=api_label,
-                            account_label=self._config.runner.describe_account(),
-                            backend_settings=self._config.backend_settings,
-                            codex_command=self._config.codex_command,
-                            thread_id=self._config.surface.thread_key,
-                        ),
-                        name=f"statusline-{self._config.surface.thread_key}",
+                if self._compact_codex:
+                    await self._post_codex_completion(event)
+                else:
+                    fields = _completion_fields(event, self._config.runner)
+                    await self._config.surface.send_notice(
+                        Notice(level=NoticeLevel.SUCCESS, title="Done", fields=fields)
                     )
+                    await self._config.surface.set_status(StatusKind.DONE)
+
+                    # Post the per-turn engine status footer.
+                    #
+                    # - Claude statusLine (read from ~/.claude/settings.json)
+                    #   surfaces Anthropic quota windows (5h, 7d).
+                    # - Codex status line surfaces Codex usage via `codex
+                    #   app-server` (account/rateLimits/read).
+                    #
+                    # Only the active backend's status is shown. The Codex probe
+                    # runs only on Codex turns in interactive chat
+                    # (backend_settings is wired); headless flows leave it None
+                    # and incur no extra subprocess.
+                    api_label_raw = self._config.runner.describe_api()
+                    api_label = api_label_raw if isinstance(api_label_raw, str) else None
+                    if self._config.thread is not None and (
+                        self._config.backend_settings is not None or api_label is not None
+                    ):
+                        asyncio.create_task(
+                            _post_engine_status_footer(
+                                thread=self._config.thread,
+                                backend=_backend_name_from_runner(self._config.runner),
+                                working_dir=self._config.runner.working_dir,
+                                model=self._config.runner.model,
+                                context_window=event.context_window,
+                                input_tokens=event.input_tokens,
+                                cache_creation_tokens=event.cache_creation_tokens,
+                                cache_read_tokens=event.cache_read_tokens,
+                                api_label=api_label,
+                                account_label=self._config.runner.describe_account(),
+                                backend_settings=self._config.backend_settings,
+                                codex_command=self._config.codex_command,
+                                thread_id=self._config.surface.thread_key,
+                            ),
+                            name=f"statusline-{self._config.surface.thread_key}",
+                        )
 
                 # Schedule inbox classification as a background task (non-blocking).
                 # Only runs when inbox_repo is wired in (THREAD_INBOX_ENABLED=true).
@@ -731,6 +742,40 @@ class EventProcessor:
             self._assistant_text_sent = True
             await self._bump_stop()
 
+    async def _post_codex_completion(self, event: StreamEvent) -> None:
+        from claude_code_core.codex_runner import CodexRunner
+
+        from ..backend_settings import BackendSettings
+        from ..discord_ui.codex_completion import post_completion
+
+        await self._config.surface.set_status(StatusKind.DONE)
+        runner = self._config.runner
+        if type(runner).__name__ == "AnonymizingBackend":
+            runner = getattr(runner, "inner", runner)
+        model = (
+            await runner.get_session_model(self._state.session_id)
+            if isinstance(runner, CodexRunner)
+            else None
+        )
+        mode = "off"
+        if isinstance(self._config.backend_settings, BackendSettings):
+            mode = await self._config.backend_settings.codex_status_mode(
+                self._config.surface.thread_key
+            )
+        assert self._config.thread is not None
+        asyncio.create_task(
+            post_completion(
+                self._config.thread,
+                model=model,
+                session_id=self._state.session_id,
+                input_tokens=event.input_tokens,
+                output_tokens=event.output_tokens,
+                status_mode=mode,
+                codex_command=self._config.codex_command,
+            ),
+            name=f"completion-{self._config.surface.thread_key}",
+        )
+
     def _record_file_activity(self, tool_use: ToolUseEvent) -> None:
         """Note a file write for cross-session collision detection (no-op when unwired)."""
         tracker = self._config.file_activity
@@ -755,13 +800,20 @@ class EventProcessor:
         await self._config.surface.set_status(StatusKind.for_tool(event.tool_use.category))
 
         try:
-            activity = await self._config.surface.open_activity(
-                ActivitySpec(
-                    kind="tool",
-                    title=event.tool_use.display_name,
-                    category=event.tool_use.category,
+            if self._compact_codex and event.tool_use.category == ToolCategory.COMMAND:
+                from ..discord_ui.codex_completion import open_command_activity
+
+                assert self._config.thread is not None
+                command = str(event.tool_use.tool_input.get("command", event.tool_use.display_name))
+                activity = await open_command_activity(self._config.thread, command)
+            else:
+                activity = await self._config.surface.open_activity(
+                    ActivitySpec(
+                        kind="tool",
+                        title=event.tool_use.display_name,
+                        category=event.tool_use.category,
+                    )
                 )
-            )
         except Exception:
             logger.debug("Failed to open tool activity", exc_info=True)
             return

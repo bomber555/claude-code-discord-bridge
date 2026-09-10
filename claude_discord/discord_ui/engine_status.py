@@ -162,9 +162,9 @@ def _window_label(snap: dict | None, fallback: str) -> str:
     except (TypeError, ValueError, OverflowError):
         return fallback
     if minutes == 300:
-        return "5h"
+        return "5時間"
     if minutes == 10080:
-        return "7d"
+        return "週間"
     if minutes > 0 and minutes % 1440 == 0:
         return f"{minutes // 1440}d"
     if minutes > 0 and minutes % 60 == 0:
@@ -191,12 +191,12 @@ def _reset_countdown(snap: dict | None, now: float) -> str | None:
     hours, mins = divmod(remainder, 60)
     parts: list[str] = []
     if days:
-        parts.append(f"{days}d")
+        parts.append(f"{days}日")
     if hours:
-        parts.append(f"{hours}h")
+        parts.append(f"{hours}時間")
     if mins or not parts:
-        parts.append(f"{mins}m")
-    return " ".join(parts)
+        parts.append(f"{mins}分")
+    return "".join(parts)
 
 
 def _account_label(data: dict) -> str | None:
@@ -214,30 +214,15 @@ def _account_label(data: dict) -> str | None:
     return None
 
 
-def _plan_label(data: dict, rate_limits: dict) -> str | None:
-    """Return a normalized subscription plan label from either response."""
-    account = data.get("account")
-    candidates = [rate_limits.get("planType")]
-    if isinstance(account, dict):
-        candidates.append(account.get("planType"))
-    for value in candidates:
-        if not isinstance(value, str):
-            continue
-        label = " ".join(value.split())
-        if label:
-            return label[:40]
-    return None
-
-
 def _usage_line(snap: dict | None, fallback_label: str, now: float) -> str | None:
     """Format one rate-limit window as a Discord status row."""
     pct = _remaining_pct(snap)
     if pct is None:
         return None
-    line = f"{_window_label(snap, fallback_label)}  remaining {pct}"
+    line = f"{_window_label(snap, fallback_label)}残量：{pct}"
     countdown = _reset_countdown(snap, now)
     if countdown is not None:
-        line += f" — resets in {countdown}"
+        line += f"（リセットまで{countdown}）"
     return line
 
 
@@ -251,9 +236,9 @@ def format_codex_status_line(
 
     Example::
 
-        Codex · prolite subscription (user@example.com)
-        5h  remaining 16% — resets in 28m
-        7d  remaining 42% — resets in 23h 58m
+        アカウント：user@example.com
+        5時間残量：16%（リセットまで28分）
+        週間残量：42%（リセットまで23時間58分）
 
     Returns ``None`` when there is nothing meaningful to show.
     """
@@ -267,24 +252,20 @@ def format_codex_status_line(
     rows = [
         row
         for row in (
-            _usage_line(snap.get("primary"), "5h", current_time),
-            _usage_line(snap.get("secondary"), "7d", current_time),
+            _usage_line(snap.get("primary"), "5時間", current_time),
+            _usage_line(snap.get("secondary"), "週間", current_time),
         )
         if row is not None
     ]
     if not rows:
         return None
 
-    plan = _plan_label(data, snap)
-    header = "Codex"
-    if plan:
-        header += f" · {plan} subscription"
     account = _account_label(data) if show_account else None
-    if account:
-        header += f" ({account})"
+    if show_account:
+        rows.insert(0, f"アカウント：{account or '未取得'}")
     if snap.get("rateLimitReachedType"):
-        header += " ⚠ limit reached"
-    return "\n".join([header, *rows])
+        rows.append("⚠ 利用上限に到達")
+    return "\n".join(rows)
 
 
 class CodexStatusProvider:

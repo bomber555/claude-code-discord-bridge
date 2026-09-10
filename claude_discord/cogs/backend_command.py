@@ -19,6 +19,7 @@ from ..backend_settings import (
     CODEX_STATUS_MODES,
     BackendSettings,
 )
+from ..codex_config import CodexModelSelection, read_codex_model
 from ..model_catalog import claude_model_choices, codex_model_choices
 
 if TYPE_CHECKING:
@@ -226,7 +227,10 @@ class BackendCommandCog(commands.Cog):
 
     async def _backend_for_autocomplete(self, interaction: discord.Interaction) -> str:
         """Resolve the backend whose model suggestions should be displayed."""
-        thread_id = self._thread_id_or_none(interaction)
+        requested_scope = getattr(getattr(interaction, "namespace", None), "scope", None)
+        _, thread_id = self._resolve_scope(
+            interaction, requested_scope if isinstance(requested_scope, str) else None
+        )
         return await self._settings.current_backend(thread_id)
 
     async def _model_name_autocomplete(
@@ -256,30 +260,55 @@ class BackendCommandCog(commands.Cog):
         description="Show the current model selection",
     )
     async def model_show_command(self, interaction: discord.Interaction) -> None:
-        thread_id_now = self._thread_id_or_none(interaction)
-        backend_for_thread = (
-            await self._settings.current_backend(thread_id_now)
-            if thread_id_now is not None
-            else await self._settings.current_backend(None)
-        )
-        current_thread = (
-            await self._settings.current_model(backend_for_thread, thread_id_now)
-            if thread_id_now is not None
-            else None
-        )
-        backend_for_global = await self._settings.current_backend(None)
-        current_global = await self._settings.current_model(
-            backend_for_global, None
-        ) or self._factory.default_model_for(backend_for_global)
-        lines = [
-            f"🧠 **Global model**: {_model_label(current_global)} (for `{backend_for_global}`)",
-        ]
-        if thread_id_now is not None:
-            resolved_thread = current_thread or self._factory.default_model_for(backend_for_thread)
-            lines.append(
-                f"🧵 **This thread**: {_model_label(resolved_thread)} (for `{backend_for_thread}`)"
-            )
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        thread_id = self._thread_id_or_none(interaction)
+        # One command may show the same inherited config twice; probe it once.
+        cache: dict[str | None, CodexModelSelection | None] = {}
+        global_backend = await self._settings.current_backend(None)
+        global_model = await self._model_for_display(global_backend, None, cache)
+        lines = ["**次回応答のモデル（設定）**", f"全体：{global_model}〔{global_backend}〕"]
+        if thread_id is not None:
+            backend = await self._settings.current_backend(thread_id)
+            model = await self._model_for_display(backend, thread_id, cache)
+            lines.append(f"このスレッド：{model}〔{backend}〕")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    async def _model_for_display(
+        self,
+        backend: str,
+        thread_id: int | None,
+        cache: dict[str | None, CodexModelSelection | None],
+    ) -> str:
+        from ..backend_settings import MODEL_THREAD_PREFIX
+
+        if thread_id is not None:
+            own = await self._settings.repo.get(f"{MODEL_THREAD_PREFIX}{thread_id}.{backend}")
+            if own:
+                return f"{_model_label(own)}（このスレッドの指定）"
+        global_model = await self._settings.explicit_model(backend, None)
+        if global_model:
+            source = "全体設定を継承" if thread_id is not None else "CCDBの全体設定"
+            return f"{_model_label(global_model)}（{source}）"
+        configured = await self._settings.current_model(backend, None)
+        if configured:
+            return f"{_model_label(configured)}（起動時の設定）"
+        default = self._factory.default_model_for(backend)
+        if default:
+            return f"{_model_label(default)}（CCDBの既定値）"
+        if backend != "codex":
+            return "未指定"
+
+        cwd = self._factory.working_dir
+        if thread_id is not None:
+            record = await self._chat_cog.repo.get(thread_id)
+            if record is not None and isinstance(record.working_dir, str) and record.working_dir:
+                cwd = record.working_dir
+        if cwd not in cache:
+            cache[cwd] = await read_codex_model(self._factory.codex_command, cwd=cwd)
+        resolved = cache[cwd]
+        if resolved is None:
+            return "未取得（CLIへ委任・設定の取得に失敗）"
+        return f"{_model_label(resolved.model)}（{resolved.source}を継承）"
 
     @model_group.command(
         name="set",
