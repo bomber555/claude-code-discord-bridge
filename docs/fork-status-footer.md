@@ -7,7 +7,7 @@ An unset model is labelled `CLI default`; the bridge does not infer the resolved
 
 ## Enable
 
-- Codex quota: `/backend status codex:on` (or `auto`, the default). Thread settings
+- Codex quota: `/engine-status mode:on` (or `auto`, the default). Thread settings
   override the global setting; `off` suppresses the Codex footer.
 - Codex account: set `CCDB_CODEX_STATUS_ACCOUNT=1` in the bot environment and restart.
   Account display is opt-in because the footer can include the account email.
