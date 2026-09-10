@@ -59,3 +59,20 @@ account opt-in, weekly-primary limits, details-only token/command display, missi
 quota, and removal of stale running controls. The live esmart session's observed
 model was read successfully without issuing a model request or changing settings.
 Service deployment is separate from repository checks.
+
+## Model settings display
+
+`/model show` resolves the next response's model through the thread setting,
+CCDB global setting, startup environment, then the Codex CLI's effective
+configuration (`config/read`). If that config leaves the model unset, it asks
+`model/list` for the explicitly declared `isDefault` model, rather than guessing
+from the first picker entry. Each row names its source. Thread working directories
+are respected when resolving project configuration. The completion card separately
+reports the model observed in the completed session.
+
+These are read-only metadata calls: no `thread/start`, `turn/start`, prompt, or
+model inference is issued. Unavailable CLI metadata is shown as unknown. Model
+and effort autocomplete now use the selected `scope`, so a global change in a
+thread with a different backend offers models for the global target.
+
+Protocol reference: https://learn.chatgpt.com/docs/app-server

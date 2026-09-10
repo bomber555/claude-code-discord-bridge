@@ -253,3 +253,106 @@ class TestEffortAutocomplete:
         choices = await cog._effort_level_autocomplete(interaction, "min")
 
         assert [c.value for c in choices] == ["minimal"]
+
+
+class TestResolvedModelShow:
+    async def test_show_reads_cli_default_when_ccdb_is_unset(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from claude_discord.codex_config import CodexModelSelection
+
+        settings = await _settings()
+        await settings.set_backend("codex")
+        cog = _make_cog(settings)
+        interaction = _thread_interaction(42)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        cog._chat_cog.repo.get = AsyncMock(return_value=None)
+        read = AsyncMock(return_value=CodexModelSelection("gpt-6-astra", "Codex CLI既定値"))
+        monkeypatch.setattr("claude_discord.cogs.backend_command.read_codex_model", read)
+        await cog.model_show_command.callback(cog, interaction)
+        body = interaction.followup.send.await_args.args[0]
+        assert "gpt-6-astra" in body
+        assert "Codex CLI既定値" in body
+        assert "CLI default" not in body
+        read.assert_awaited_once()
+
+    async def test_thread_inherits_global_override_without_cli_probe(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        settings = await _settings()
+        await settings.set_backend("codex")
+        await settings.set_model("codex", "gpt-5.6-sol")
+        cog = _make_cog(settings)
+        interaction = _thread_interaction(42)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        read = AsyncMock()
+        monkeypatch.setattr("claude_discord.cogs.backend_command.read_codex_model", read)
+        await cog.model_show_command.callback(cog, interaction)
+        body = interaction.followup.send.await_args.args[0]
+        assert body.count("gpt-5.6-sol") == 2
+        assert "全体設定を継承" in body
+        read.assert_not_called()
+
+    async def test_thread_override_wins_over_global(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        settings = await _settings()
+        await settings.set_backend("codex")
+        await settings.set_model("codex", "global-model")
+        await settings.set_model("codex", "thread-model", thread_id=42)
+        cog = _make_cog(settings)
+        interaction = _thread_interaction(42)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        read = AsyncMock()
+        monkeypatch.setattr("claude_discord.cogs.backend_command.read_codex_model", read)
+        await cog.model_show_command.callback(cog, interaction)
+        body = interaction.followup.send.await_args.args[0]
+        assert "全体" in body and "global-model" in body
+        assert "このスレッド" in body and "thread-model" in body
+        read.assert_not_called()
+
+    async def test_global_scope_candidates_match_global_backend(self):
+        from types import SimpleNamespace
+
+        settings = await _settings()
+        await settings.set_backend("codex")
+        await settings.set_backend("claude", thread_id=42)
+        cog = _make_cog(settings)
+        interaction = _thread_interaction(42)
+        interaction.namespace = SimpleNamespace(scope="global")
+        choices = await cog._model_name_autocomplete(interaction, "")
+        assert choices and all(c.value.startswith("gpt-") for c in choices)
+
+    async def test_show_respects_thread_working_directory(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from claude_discord.codex_config import CodexModelSelection
+
+        settings = await _settings()
+        await settings.set_backend("codex")
+        cog = _make_cog(settings)
+        cog._factory.working_dir = "/tmp/global-project"
+        cog._chat_cog.repo.get = AsyncMock(
+            return_value=SimpleNamespace(working_dir="/tmp/thread-project")
+        )
+        interaction = _thread_interaction(42)
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        read = AsyncMock(
+            side_effect=[
+                CodexModelSelection("global-model", "Codex CLI設定"),
+                CodexModelSelection("project-model", "Codex CLI設定"),
+            ]
+        )
+        monkeypatch.setattr("claude_discord.cogs.backend_command.read_codex_model", read)
+        await cog.model_show_command.callback(cog, interaction)
+        assert [c.kwargs["cwd"] for c in read.await_args_list] == [
+            "/tmp/global-project",
+            "/tmp/thread-project",
+        ]
+        body = interaction.followup.send.await_args.args[0]
+        assert "global-model" in body and "project-model" in body
