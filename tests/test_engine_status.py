@@ -54,9 +54,7 @@ class TestFormat:
         line = format_codex_status_line(SAMPLE, now=NOW)
 
         assert line == (
-            "Codex · prolite subscription\n"
-            "5h  remaining 99% — resets in 28m\n"
-            "7d  remaining 92% — resets in 23h 58m"
+            "5時間残量：99%（リセットまで28分）\n週間残量：92%（リセットまで23時間58分）"
         )
         assert "user@example.com" not in line
         assert "credit" not in line.lower()
@@ -64,14 +62,14 @@ class TestFormat:
     def test_weekly_primary_uses_duration_instead_of_position(self) -> None:
         line = format_codex_status_line(WEEKLY_PRIMARY_SAMPLE)
         assert line is not None
-        assert "7d  remaining 85%" in line
-        assert "5h  remaining 85%" not in line
+        assert "週間残量：85%" in line
+        assert "5時間残量：85%" not in line
 
     @pytest.mark.parametrize(
         ("duration_mins", "expected_label"),
         [
-            (300, "5h"),
-            (10080, "7d"),
+            (300, "5時間"),
+            (10080, "週間"),
             (1440, "1d"),
             (2880, "2d"),
             (90, "90m"),
@@ -91,7 +89,7 @@ class TestFormat:
         }
         line = format_codex_status_line(data)
         assert line is not None
-        assert f"{expected_label}  remaining 90%" in line
+        assert f"{expected_label}残量：90%" in line
 
     def test_missing_durations_keep_positional_fallbacks(self) -> None:
         data = {
@@ -102,16 +100,16 @@ class TestFormat:
         }
         line = format_codex_status_line(data)
         assert line is not None
-        assert "5h  remaining 95%" in line
-        assert "7d  remaining 91%" in line
+        assert "5時間残量：95%" in line
+        assert "週間残量：91%" in line
 
     def test_account_email_is_opt_in(self) -> None:
         line = format_codex_status_line(SAMPLE, show_account=True, now=NOW)
 
         assert line == (
-            "Codex · prolite subscription (user@example.com)\n"
-            "5h  remaining 99% — resets in 28m\n"
-            "7d  remaining 92% — resets in 23h 58m"
+            "アカウント：user@example.com\n"
+            "5時間残量：99%（リセットまで28分）\n"
+            "週間残量：92%（リセットまで23時間58分）"
         )
 
     def test_prefers_account_name_over_email(self) -> None:
@@ -126,7 +124,7 @@ class TestFormat:
         line = format_codex_status_line(data, show_account=True)
 
         assert line is not None
-        assert "Codex (Example User)" in line
+        assert "アカウント：Example User" in line
         assert "user@example.com" not in line
 
     def test_missing_account_keeps_usage_line(self) -> None:
@@ -134,7 +132,7 @@ class TestFormat:
 
         line = format_codex_status_line(data, show_account=True)
 
-        assert line == "Codex\n5h  remaining 95%"
+        assert line == "アカウント：未取得\n5時間残量：95%"
 
     def test_account_display_env_is_opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CCDB_CODEX_STATUS_ACCOUNT", raising=False)
@@ -153,7 +151,7 @@ class TestFormat:
         data = {"rateLimits": {"primary": {"usedPercent": 12.6}}}
         line = format_codex_status_line(data)
         assert line is not None
-        assert "5h  remaining 87%" in line
+        assert "5時間残量：87%" in line
 
     def test_window_label_comes_from_duration_not_slot(self) -> None:
         data = {
@@ -168,14 +166,14 @@ class TestFormat:
 
         line = format_codex_status_line(data, now=NOW)
 
-        assert line == "Codex\n7d  remaining 97% — resets in 1m"
+        assert line == "週間残量：97%（リセットまで1分）"
 
     def test_unknown_window_uses_reported_duration(self) -> None:
         data = {"rateLimits": {"primary": {"usedPercent": 7, "windowDurationMins": 1440}}}
 
         line = format_codex_status_line(data)
 
-        assert line == "Codex\n1d  remaining 93%"
+        assert line == "1d残量：93%"
 
     def test_reset_countdown_supports_days(self) -> None:
         data = {
@@ -190,7 +188,7 @@ class TestFormat:
 
         line = format_codex_status_line(data, now=NOW)
 
-        assert line == "Codex\n7d  remaining 58% — resets in 2d 3h 4m"
+        assert line == "週間残量：58%（リセットまで2日3時間4分）"
 
     def test_rate_limit_reached_warning(self) -> None:
         data = {
@@ -201,7 +199,7 @@ class TestFormat:
         }
         line = format_codex_status_line(data)
         assert line is not None
-        assert "limit reached" in line
+        assert "利用上限に到達" in line
 
     @pytest.mark.parametrize("bad", [None, {}, {"rateLimits": None}, {"rateLimits": {}}, "x"])
     def test_returns_none_for_unusable(self, bad: object) -> None:

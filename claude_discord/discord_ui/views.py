@@ -28,7 +28,7 @@ class StopView(discord.ui.View):
     like pressing Escape in Claude Code) and posts a stopped_embed.
 
     After the session ends — either via the button or naturally — call
-    ``disable()`` to deactivate the button on the status message.
+    ``disable()`` to remove the stale running control.
 
     Call ``bump(thread)`` after each major Discord message to keep the Stop
     button at the bottom of the thread (most recently visible position).
@@ -88,16 +88,17 @@ class StopView(discord.ui.View):
         self.stop()
 
         with contextlib.suppress(discord.HTTPException):
-            await interaction.response.edit_message(view=self)
+            await interaction.response.edit_message(content="-# ⏹ 停止要求済み", view=self)
         await self._runner.interrupt()
 
         with contextlib.suppress(discord.HTTPException):
             await interaction.followup.send(embed=stopped_embed())
 
     async def disable(self, message: discord.Message | None = None) -> None:
-        """Disable the button after the session ends naturally.
+        """Remove the running control after the session ends naturally.
 
         Uses the stored message reference if ``message`` is not provided.
+        If deletion fails, replace the stale running text with a finished label.
         No-op if the stop button was already clicked.
         """
         if self._stopped:
@@ -111,8 +112,12 @@ class StopView(discord.ui.View):
         self.stop()
 
         if target:
-            with contextlib.suppress(discord.HTTPException, RuntimeError):
-                await target.edit(view=self)
+            try:
+                await target.delete()
+            except (discord.HTTPException, RuntimeError):
+                # A failed delete must not leave a misleading running label.
+                with contextlib.suppress(discord.HTTPException, RuntimeError):
+                    await target.edit(content="-# セッション終了", view=None)
 
 
 class ToolResultView(discord.ui.View):

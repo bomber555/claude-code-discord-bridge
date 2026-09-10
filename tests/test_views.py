@@ -135,7 +135,7 @@ class TestStopViewButtonClick:
 class TestStopViewDisable:
     @pytest.mark.asyncio
     async def test_disable_edits_message(self) -> None:
-        """disable() edits the status message to show the deactivated button."""
+        """disable() removes the status message after completion."""
         runner = _make_runner()
         view = StopView(runner)
 
@@ -145,14 +145,14 @@ class TestStopViewDisable:
 
     @pytest.mark.asyncio
     async def test_disable_edits_message_for_real(self) -> None:
-        """disable() calls message.edit to reflect the disabled button."""
+        """disable() removes the stale running message."""
         runner = _make_runner()
         view = StopView(runner)
         msg = _make_message()
 
         await view.disable(msg)
 
-        msg.edit.assert_called_once()
+        msg.delete.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_disable_after_click_is_noop(self) -> None:
@@ -172,7 +172,7 @@ class TestStopViewDisable:
         runner = _make_runner()
         view = StopView(runner)
         msg = _make_message()
-        msg.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "rate limited"))
+        msg.delete = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "rate limited"))
 
         await view.disable(msg)  # should not raise
 
@@ -182,7 +182,7 @@ class TestStopViewDisable:
         runner = _make_runner()
         view = StopView(runner)
         msg = _make_message()
-        msg.edit = AsyncMock(side_effect=RuntimeError("Session is closed"))
+        msg.delete = AsyncMock(side_effect=RuntimeError("Session is closed"))
 
         await view.disable(msg)  # should not raise
 
@@ -196,7 +196,7 @@ class TestStopViewDisable:
 
         await view.disable()
 
-        msg.edit.assert_called_once()
+        msg.delete.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_disable_no_message_no_crash(self) -> None:

@@ -229,6 +229,44 @@ def _find_rollout(session_id: str, env: dict[str, str]) -> Path | None:
     return next(sessions_dir.rglob(f"*-{session_id}.jsonl"), None)
 
 
+def _session_model(session_id: str, env: dict[str, str]) -> str | None:
+    """Read only the last turn's model metadata from this session's rollout.
+
+    A bounded tail avoids loading long conversations or image payloads. If the
+    latest context falls outside that tail, report unknown rather than guessing
+    from a global default or another session.
+    """
+    if not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", session_id):
+        return None
+    try:
+        rollout = _find_rollout(session_id, env)
+        if rollout is None:
+            return None
+        with rollout.open("rb") as stream:
+            size = stream.seek(0, 2)
+            start = max(0, size - 8 * 1024 * 1024)
+            stream.seek(start)
+            if start:
+                stream.readline()  # discard a potentially partial first record
+            lines = stream.read(8 * 1024 * 1024).splitlines()
+        for line in reversed(lines):
+            if b'"turn_context"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("type") != "turn_context":
+                continue
+            payload = record.get("payload")
+            model = payload.get("model") if isinstance(payload, dict) else None
+            # Do not fall back to an older turn when the latest has no model.
+            return model if isinstance(model, str) and 0 < len(model) <= 120 else None
+    except OSError:
+        logger.debug("Could not read Codex model metadata", exc_info=True)
+    return None
+
+
 def _text_transcript_from_rollout(session_id: str, env: dict[str, str]) -> str:
     """Extract bounded user/assistant text without loading image/tool payloads.
 
@@ -577,6 +615,12 @@ class CodexRunner:
         if self.thread_id is not None:
             env["DISCORD_THREAD_ID"] = str(self.thread_id)
         return env
+
+    async def get_session_model(self, session_id: str | None) -> str | None:
+        """Return observed model metadata without changing the selected model."""
+        if not session_id:
+            return None
+        return await asyncio.to_thread(_session_model, session_id, self._build_env())
 
     def describe_api(self) -> str:
         """Return a short label for the API endpoint this runner targets."""
