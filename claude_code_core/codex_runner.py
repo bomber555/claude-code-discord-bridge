@@ -587,6 +587,10 @@ class CodexRunner:
             return f"Custom endpoint ({host})"
         return "OpenAI API (direct)"
 
+    def describe_account(self) -> str | None:
+        """Codex exposes no local account file, so there is nothing to name."""
+        return None
+
     async def _read_stream(self) -> AsyncGenerator[StreamEvent, None]:
         """Read and parse stdout line by line."""
         if self._process is None or self._process.stdout is None:

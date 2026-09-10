@@ -145,9 +145,16 @@ class RelayReceiver:
         declared = request.content_length
         if declared is not None and declared > self._max_body_bytes:
             raise _TooLargeError
-        raw = await request.content.read(self._max_body_bytes + 1)
-        if len(raw) > self._max_body_bytes:
-            raise _TooLargeError
+        # StreamReader.read(n) may return just the currently available fragment.
+        # Accumulate through EOF, retaining at most the limit plus one byte.
+        raw = bytearray()
+        while True:
+            chunk = await request.content.read(self._max_body_bytes + 1 - len(raw))
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > self._max_body_bytes:
+                raise _TooLargeError
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:

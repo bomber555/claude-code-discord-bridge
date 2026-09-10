@@ -1,4 +1,4 @@
-"""Tests for _post_engine_status_footer (Claude statusLine + Codex line gating)."""
+"""Tests for _post_engine_status_footer active-backend usage gating."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from claude_discord.database.settings_repo import SettingsRepository
 
 _EP = "claude_discord.cogs.event_processor"
 _ES = "claude_discord.discord_ui.engine_status"
+_CU = "claude_discord.discord_ui.claude_usage"
 
 
 async def _settings(mode: str) -> BackendSettings:
@@ -31,18 +32,28 @@ async def _settings(mode: str) -> BackendSettings:
     return s
 
 
-async def _run(*, backend: str, mode: str, codex_line, statusline) -> str | None:
+async def _run(
+    *,
+    backend: str,
+    mode: str,
+    codex_line,
+    statusline,
+    account_label: str | None = None,
+    claude_payload: dict | None = None,
+    model: str = "sonnet",
+) -> str | None:
     thread = AsyncMock()
     settings = await _settings(mode)
     with (
         patch(f"{_ES}.get_codex_status_line", AsyncMock(return_value=codex_line)),
         patch(f"{_EP}._render_claude_statusline_text", AsyncMock(return_value=statusline)),
+        patch(f"{_CU}.fetch_claude_usage", AsyncMock(return_value=claude_payload)),
     ):
         await _post_engine_status_footer(
             thread,
             backend=backend,
             working_dir="/tmp",
-            model="sonnet",
+            model=model,
             context_window=200000,
             input_tokens=100,
             cache_creation_tokens=0,
@@ -51,6 +62,7 @@ async def _run(*, backend: str, mode: str, codex_line, statusline) -> str | None
             backend_settings=settings,
             codex_command="codex",
             thread_id=1,
+            account_label=account_label,
         )
     if thread.send.await_count == 0:
         return None
@@ -58,6 +70,24 @@ async def _run(*, backend: str, mode: str, codex_line, statusline) -> str | None
 
 
 class TestGating:
+    async def test_claude_turn_shows_account_and_quota_usage(self) -> None:
+        body = await _run(
+            backend="claude",
+            mode="auto",
+            codex_line="Codex\n5h  used 1%",
+            statusline=None,
+            account_label="Max subscription (owner@example.com)",
+            claude_payload={
+                "five_hour": {"utilization": 12, "resets_at": None},
+                "seven_day": {"utilization": 34, "resets_at": None},
+            },
+        )
+        assert body is not None
+        assert "Max subscription (owner@example.com)" in body
+        assert "5h  used 12%" in body
+        assert "7d  used 34%" in body
+        assert "Codex" not in body
+
     async def test_off_claude_turn_shows_only_claude(self) -> None:
         body = await _run(
             backend="claude", mode="off", codex_line="🤖 Codex: x", statusline="Ctx 4%"
@@ -67,12 +97,12 @@ class TestGating:
         assert "Ctx 4%" in body
         assert "API:" in body
 
-    async def test_auto_claude_turn_shows_both(self) -> None:
+    async def test_auto_claude_turn_shows_only_claude(self) -> None:
         body = await _run(
             backend="claude", mode="auto", codex_line="🤖 Codex: 5h 1%", statusline="Ctx 4%"
         )
         assert body is not None
-        assert "Codex: 5h 1%" in body
+        assert "Codex" not in body
         assert "Ctx 4%" in body
 
     async def test_auto_codex_turn_no_api_label_but_shows_codex(self) -> None:
@@ -83,6 +113,7 @@ class TestGating:
         assert "Codex: 5h 1%" in body
         # API label is Claude-specific; suppressed on codex turns.
         assert "API:" not in body
+        assert "Ctx 0%" not in body
 
     async def test_auto_codex_turn_fetch_fails_posts_nothing(self) -> None:
         body = await _run(backend="codex", mode="auto", codex_line=None, statusline=None)
@@ -115,3 +146,40 @@ class TestGating:
                 thread_id=1,
             )
         assert thread.send.await_count == 0
+
+
+class TestModelDisplay:
+    async def test_codex_footer_shows_selected_model(self) -> None:
+        body = await _run(
+            backend="codex",
+            mode="on",
+            model="gpt-6",
+            codex_line="Codex · pro subscription (owner@example.com)\n5h  remaining 80%",
+            statusline=None,
+        )
+        assert body is not None
+        assert "Model: gpt-6" in body
+        assert "owner@example.com" in body
+        assert "remaining 80%" in body
+
+    async def test_claude_footer_shows_selected_model_without_statusline(self) -> None:
+        body = await _run(
+            backend="claude",
+            mode="off",
+            model="opus",
+            codex_line=None,
+            statusline=None,
+        )
+        assert body is not None
+        assert "Model: opus" in body
+
+    async def test_default_model_is_not_presented_as_a_resolved_model(self) -> None:
+        body = await _run(
+            backend="codex",
+            mode="on",
+            model="",
+            codex_line="Codex",
+            statusline=None,
+        )
+        assert body is not None
+        assert "Model: CLI default" in body

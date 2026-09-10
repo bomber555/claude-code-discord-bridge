@@ -625,11 +625,10 @@ class EventProcessor:
                 # - Codex status line surfaces Codex usage via `codex
                 #   app-server` (account/rateLimits/read).
                 #
-                # When the 2-layer Codex toggle (status.codex) is enabled both
-                # are shown after every turn, so the user can compare usage and
-                # decide which engine to use. The Codex probe only runs for
-                # interactive chat (backend_settings is wired) — headless flows
-                # leave it None and incur no extra subprocess.
+                # Only the active backend's status is shown. The Codex probe
+                # runs only on Codex turns in interactive chat
+                # (backend_settings is wired); headless flows leave it None
+                # and incur no extra subprocess.
                 api_label_raw = self._config.runner.describe_api()
                 api_label = api_label_raw if isinstance(api_label_raw, str) else None
                 if self._config.thread is not None and (
@@ -646,6 +645,7 @@ class EventProcessor:
                             cache_creation_tokens=event.cache_creation_tokens,
                             cache_read_tokens=event.cache_read_tokens,
                             api_label=api_label,
+                            account_label=self._config.runner.describe_account(),
                             backend_settings=self._config.backend_settings,
                             codex_command=self._config.codex_command,
                             thread_id=self._config.surface.thread_key,
@@ -1056,14 +1056,19 @@ async def _post_statusline_footer(
     cache_creation_tokens: int | None,
     cache_read_tokens: int | None,
     api_label: str | None = None,
+    account_label: str | None = None,
 ) -> None:
-    """Post the current API provider line and the configured statusLine.
+    """Post the current API provider line, quota usage, and the statusLine.
 
     ``api_label`` (e.g. ``"Anthropic API (direct)"``) is always shown when
     provided, so "which API am I using right now" stays visible after every
-    session — even when no ``statusLine`` is configured. The statusLine output
-    (read from ``~/.claude/settings.json``) is appended below it when present.
-    Posts nothing when neither is available.
+    session — even when no ``statusLine`` is configured. ``account_label``
+    (e.g. ``"Max subscription (you@example.com)"``) answers the follow-up
+    question the endpoint label can't: which account, and billed how.
+
+    Below that go the account's quota windows (5h / weekly / extra credits),
+    then the statusLine output (read from ``~/.claude/settings.json``) when
+    one is configured. Posts nothing when every part is unavailable.
     """
     statusline_text = await _render_claude_statusline_text(
         working_dir,
@@ -1074,9 +1079,30 @@ async def _post_statusline_footer(
         cache_read_tokens,
     )
 
+    from ..discord_ui.claude_usage import (
+        build_claude_usage_lines,
+        fetch_claude_usage,
+        usage_footer_enabled,
+    )
+
+    # Quota usage. Never let a slow or unreachable endpoint cost the user the
+    # rest of the footer — any failure just drops these lines.
+    usage_lines: list[str] = []
+    if usage_footer_enabled():
+        try:
+            payload = await fetch_claude_usage()
+        except Exception:
+            logger.debug("Failed to fetch Claude usage for the footer", exc_info=True)
+            payload = None
+        if payload:
+            usage_lines = build_claude_usage_lines(payload)
     parts: list[str] = []
     if api_label:
-        parts.append(f"\U0001f517 API: {api_label}")
+        line = f"\U0001f517 API: {api_label}"
+        if account_label:
+            line = f"{line} · {account_label}"
+        parts.append(line)
+    parts.extend(usage_lines)
     if statusline_text:
         parts.append(statusline_text)
 
@@ -1102,26 +1128,32 @@ async def _post_engine_status_footer(
     backend_settings: object | None,
     codex_command: str,
     thread_id: int | None,
+    account_label: str | None = None,
 ) -> None:
-    """Post the per-turn engine status footer (Claude statusLine + Codex line).
+    """Post the active backend's per-turn engine status footer.
 
-    The Codex status line is gated by the 2-layer ``status.codex`` toggle:
+    On Codex turns, the status line is gated by the 2-layer ``status.codex`` toggle:
       - ``off``  → never shown
       - ``auto`` → shown only when it can be fetched (codex installed +
         logged in); silently hidden otherwise
       - ``on``   → always attempted; a short hint is shown when it fails
 
-    The Claude statusLine renders on Claude turns as before. It is *also*
-    rendered on Codex turns when the Codex status line is active, so the
-    Anthropic quota stays visible for side-by-side comparison.
+    The Claude statusLine and API label render only on Claude turns. Codex
+    account usage renders only on Codex turns, preventing another backend's
+    account-wide quota from being mistaken for the active session's quota.
     """
     from ..backend_settings import BackendSettings
+    from ..discord_ui.claude_usage import (
+        build_claude_usage_lines,
+        fetch_claude_usage,
+        usage_footer_enabled,
+    )
     from ..discord_ui.engine_status import get_codex_status_line
 
     # Resolve the Codex-status mode (off when no settings resolver is wired,
     # e.g. headless flows).
     mode = "off"
-    if isinstance(backend_settings, BackendSettings):
+    if backend == "codex" and isinstance(backend_settings, BackendSettings):
         mode = await backend_settings.codex_status_mode(thread_id)
     show_codex = mode in ("auto", "on")
 
@@ -1132,10 +1164,8 @@ async def _post_engine_status_footer(
         if codex_line is None and mode == "on":
             codex_line = "\U0001f916 Codex: 残量取得失敗（codex login 済みか確認）"
 
-    # Render the Claude statusLine on Claude turns, or whenever the Codex line
-    # is being shown (so both engines appear together). On non-Claude turns the
-    # session model id is not a Claude model, so suppress the model label.
-    render_claude_sl = backend == "claude" or codex_line is not None
+    # Render Claude status only for Claude turns.
+    render_claude_sl = backend == "claude"
     statusline_text: str | None = None
     if render_claude_sl:
         statusline_text = await _render_claude_statusline_text(
@@ -1147,9 +1177,25 @@ async def _post_engine_status_footer(
             cache_read_tokens,
         )
 
+    claude_usage_lines: list[str] = []
+    if backend == "claude" and usage_footer_enabled():
+        try:
+            payload = await fetch_claude_usage()
+        except Exception:
+            logger.debug("Failed to fetch Claude usage for the footer", exc_info=True)
+            payload = None
+        if payload:
+            claude_usage_lines = build_claude_usage_lines(payload)
+
     parts: list[str] = []
     if api_label and backend == "claude":
-        parts.append(f"\U0001f517 API: {api_label}")
+        line = f"\U0001f517 API: {api_label}"
+        if account_label:
+            line = f"{line} · {account_label}"
+        parts.append(line)
+    elif account_label and backend == "claude":
+        parts.append(f"\U0001f464 Account: {account_label}")
+    parts.extend(claude_usage_lines)
     if statusline_text:
         parts.append(statusline_text)
     if codex_line:
@@ -1158,6 +1204,9 @@ async def _post_engine_status_footer(
     if not parts:
         return
 
+    # Repeat the selected model on resumed turns as well as the start notice.
+    # An unset selection delegates to the CLI; do not guess its resolved model.
+    parts.insert(0, f"Model: {model or 'CLI default'}")
     body = "\n".join(parts)
     with contextlib.suppress(Exception):
         await thread.send(f"```\n{body}\n```")  # type: ignore[union-attr]

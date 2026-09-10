@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +54,7 @@ jobs:
   notify-failure:
     needs: [test]
     if: failure()
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - name: Post CI failure to Discord
         env:
@@ -84,7 +84,7 @@ jobs:
     needs: [test]
     # Only create issues for scheduled runs (not PR/push — those are dev feedback loops)
     if: failure() && github.event_name == 'schedule'
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 

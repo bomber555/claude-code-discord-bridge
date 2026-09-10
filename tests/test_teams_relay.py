@@ -10,7 +10,9 @@ whether it can be honoured.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
@@ -487,3 +489,17 @@ class TestStorageQueue:
         )
         with pytest.raises(RuntimeError, match="unparseable"):
             await StorageQueue(SAS_URL, FakeHttp([(200, bomb)])).pull()
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_receiver_reads_fragmented_body_with_a_size_bound(oversized: bool) -> None:
+    receiver = RelayReceiver(AcceptingVerifier(), MemoryQueue(), max_body_bytes=64)
+    request = MagicMock()
+    request.content_length = None
+    raw = json.dumps({"text": "x" * (100 if oversized else 20)}).encode()
+    request.content.read = AsyncMock(side_effect=[raw[:10], raw[10:30], raw[30:], b""])
+    if oversized:
+        response = await receiver.handle(request)
+        assert response.status == 413
+    else:
+        assert await receiver._read_body(request) == json.loads(raw)

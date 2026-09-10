@@ -506,6 +506,7 @@ class TestAgUiBackendHttp:
         )
         assert backend._build_env() == {}
         assert backend.describe_api() == "AG-UI"
+        assert backend.describe_account() is None
         with pytest.raises(RuntimeError, match="interrupt/resume"):
             await backend.inject_tool_result("request-1", {})
         await backend.kill()

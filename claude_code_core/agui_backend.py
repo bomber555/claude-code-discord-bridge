@@ -418,6 +418,10 @@ class AgUiBackend:
         """Return a safe display label without exposing the configured URL or token."""
         return "AG-UI"
 
+    def describe_account(self) -> str | None:
+        """AG-UI does not expose an upstream account identity."""
+        return None
+
 
 def _build_run_input(
     *,
