@@ -1,4 +1,4 @@
-"""A single Codex completion card, with operational details behind a button."""
+"""Compact CLI completion cards, with operational details behind a button."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import logging
 
 import discord
 
+from .claude_usage import build_claude_usage_lines, fetch_claude_usage, usage_footer_enabled
 from .embeds import COLOR_ERROR, COLOR_INFO, COLOR_SUCCESS
 from .engine_status import get_codex_status_line
 
@@ -16,9 +17,14 @@ def _plain(value: str) -> str:
     return discord.utils.escape_markdown(" ".join(value.split()))
 
 
-def completion_embed(model: str | None, status_line: str | None = None) -> discord.Embed:
+def completion_embed(
+    model: str | None,
+    status_line: str | None = None,
+    *,
+    backend: str = "Codex",
+) -> discord.Embed:
     """Keep the actual model separate from the execution environment and quota."""
-    rows = ["実行環境：Codex", f"モデル：{_plain(model) if model else '未取得'}"]
+    rows = [f"実行環境：{_plain(backend)}", f"モデル：{_plain(model) if model else '未取得'}"]
     if status_line:
         rows.append(discord.utils.escape_markdown(status_line))
     return discord.Embed(
@@ -82,6 +88,61 @@ async def post_completion(
             await message.edit(embed=completion_embed(model, status))
     except discord.HTTPException:
         logger.warning("Could not deliver Codex completion card", exc_info=True)
+
+
+async def post_claude_completion(
+    thread: discord.Thread | discord.TextChannel,
+    *,
+    model: str | None,
+    session_id: str | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    duration_ms: int | None,
+    cost_usd: float | None,
+    api_label: str | None,
+    account_label: str | None,
+    now: int | None = None,
+) -> None:
+    """Post one Claude card and enrich that same message with account quota."""
+    details = [f"セッションID：{session_id or '未取得'}"]
+    if duration_ms is not None:
+        details.append(f"実行時間：{duration_ms / 1000:.1f}秒")
+    if input_tokens is not None and output_tokens is not None:
+        details.append(f"今回のトークン使用量：入力 {input_tokens:,} / 出力 {output_tokens:,}")
+        details.append("利用枠の残量とは別の数値です。")
+    if cost_usd is not None:
+        details.append(f"推定費用：${cost_usd:.4f}")
+    if api_label:
+        details.append(f"接続先：{api_label}")
+
+    view = CompletionDetailsView("\n".join(details))
+    rows = [f"アカウント：{account_label}"] if account_label else []
+    try:
+        message = await thread.send(
+            embed=completion_embed(
+                model,
+                "\n".join(rows) or None,
+                backend="Claude",
+            ),
+            view=view,
+        )
+        if usage_footer_enabled():
+            try:
+                payload = await fetch_claude_usage()
+            except Exception:
+                logger.debug("Claude quota lookup failed", exc_info=True)
+                payload = None
+            if payload:
+                rows.extend(build_claude_usage_lines(payload, now=now))
+        await message.edit(
+            embed=completion_embed(
+                model,
+                "\n".join(rows) or None,
+                backend="Claude",
+            )
+        )
+    except discord.HTTPException:
+        logger.warning("Could not deliver Claude completion card", exc_info=True)
 
 
 class CommandActivity:
