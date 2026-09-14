@@ -28,7 +28,9 @@ async def _new_settings_repo() -> SettingsRepository:
 
 
 def _make_cog(
-    settings: BackendSettings, session_backend: str | None | object = _NO_RECORD
+    settings: BackendSettings,
+    session_backend: str | None | object = _NO_RECORD,
+    allowed_backends: frozenset[str] | None = None,
 ) -> BackendCommandCog:
     bot = MagicMock()
     factory = BackendFactory(
@@ -41,6 +43,7 @@ def _make_cog(
         allowed_tools=None,
         append_system_prompt=None,
         effort=None,
+        allowed_backends=allowed_backends,
     )
     chat_cog = MagicMock()
     chat_cog.runner = MagicMock()
@@ -96,6 +99,23 @@ class TestBackendCommandPreservesSourceSession:
 
         # The old session ID is the pointer to the file-backed handoff history.
         cog._chat_cog.repo.delete.assert_not_awaited()
+
+    async def test_deployment_allowlist_rejects_before_persisting(self) -> None:
+        repo = await _new_settings_repo()
+        settings = BackendSettings(
+            repo,
+            env_backend="codex",
+            env_model_for_claude="",
+            env_model_for_codex="",
+        )
+        cog = _make_cog(settings, allowed_backends=frozenset({"codex"}))
+        interaction = _make_thread_interaction(thread_id=42)
+
+        await cog.backend_command.callback(cog, interaction, name="local", scope="thread")
+
+        assert await settings.current_backend(42) == "codex"
+        interaction.response.send_message.assert_awaited_once()
+        assert "disabled" in interaction.response.send_message.await_args.args[0]
 
     async def test_no_clear_when_backend_is_same(self) -> None:
         repo = await _new_settings_repo()
