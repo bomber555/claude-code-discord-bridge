@@ -558,8 +558,8 @@ async def test_setup_bridge_warns_when_worktree_base_dir_is_unset(
 ) -> None:
     """An unset WORKTREE_BASE_DIR must warn, not pass silently.
 
-    Sessions are instructed to create ``wt-{thread_id}`` regardless of this setting,
-    so a disabled manager means worktrees accumulate forever. Only the *enabled*
+    Sessions making Git changes are instructed to create ``wt-{thread_id}``, so a
+    disabled manager means those worktrees accumulate forever. Only the *enabled*
     branch used to log, which made the leaking configuration the quiet one.
     """
     import logging

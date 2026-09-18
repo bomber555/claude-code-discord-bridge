@@ -127,6 +127,33 @@ class TestConcurrencyNotice:
         notice = registry.build_concurrency_notice(1001)
         assert "worktree" in notice.lower()
 
+    def test_notice_resolves_target_before_worktree(self) -> None:
+        """A coordination directory may not itself be the target repository."""
+        registry = SessionRegistry()
+        registry.register(1001, "my task")
+        notice = registry.build_concurrency_notice(1001).lower()
+        assert "exact target" in notice
+        assert "before" in notice
+
+    def test_notice_requires_worktree_only_for_git_changes(self) -> None:
+        """Read-only and non-Git work must not receive an impossible Git command."""
+        registry = SessionRegistry()
+        registry.register(1001, "my task")
+        notice = registry.build_concurrency_notice(1001).lower()
+        assert "git changes" in notice
+        assert "read-only" in notice
+        assert "non-git" in notice
+        assert "git worktree add ../wt-" not in notice
+
+    def test_notice_uses_repo_root_remote_default_and_absolute_worktree_path(self) -> None:
+        """Isolation must be derived from the selected repository, not the session cwd."""
+        registry = SessionRegistry()
+        registry.register(1001, "my task")
+        notice = registry.build_concurrency_notice(1001).lower()
+        assert "repository root" in notice
+        assert "remote default branch" in notice
+        assert "absolute worktree path" in notice
+
     def test_notice_mentions_shared_resources(self) -> None:
         """The notice should warn about non-git conflicts too."""
         registry = SessionRegistry()
