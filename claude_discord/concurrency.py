@@ -35,17 +35,24 @@ see your own lounge messages; do NOT treat them as another session's work. \
 Other sessions ARE active right now. \
 You MUST follow these rules to avoid destroying each other's work:
 
-1. **Git — USE A WORKTREE (REQUIRED)**: Run \
-`git worktree add ../wt-{thread_id} -b session/{thread_id}` BEFORE making \
-any changes. Work ONLY inside your worktree. NEVER modify the main working \
-directory directly. Always commit and push before finishing — uncommitted \
-changes WILL be lost.
-2. **Files**: Another session may be editing the same files RIGHT NOW. \
+1. **RESOLVE THE TARGET FIRST**: Identify the exact target before making changes \
+and classify it as a Git repository or a non-Git file, service, or runtime \
+configuration. The session's starting directory may be only a coordination \
+directory. Read-only inspection does not require a worktree.
+2. **Git changes — USE A WORKTREE (REQUIRED)**: From the selected repository \
+root, inspect status, the upstream, and the remote default branch. Create \
+`session/{thread_id}` from the current remote default branch at an absolute \
+worktree path. Work ONLY inside that worktree; never modify the shared checkout \
+directly. Commit and push before finishing — uncommitted changes WILL be lost.
+3. **Non-Git changes**: A worktree does not apply. Resolve the exact target, \
+check other sessions and recent modification times, keep the change narrowly \
+scoped, and do not claim that a commit or push exists.
+4. **Files**: Another session may be editing the same files RIGHT NOW. \
 Check `git status` and recent file modification times before overwriting.
-3. **Ports & processes**: Shared network ports or lock files may already be in use.
-4. **Resources**: Shared databases, APIs with rate limits, or singleton processes \
+5. **Ports & processes**: Shared network ports or lock files may already be in use.
+6. **Resources**: Shared databases, APIs with rate limits, or singleton processes \
 may be accessed concurrently.
-5. **Working directory does NOT persist between messages**: Each of your \
+7. **Working directory does NOT persist between messages**: Each of your \
 Discord replies runs in a FRESH process that starts in the base working \
 directory. A `cd` only lasts for the current message — it is gone by your next \
 reply, and the shell resets. So a relative-path script you set up in one \
