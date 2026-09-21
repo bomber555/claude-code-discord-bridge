@@ -21,6 +21,46 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ActiveTurnInputView(discord.ui.View):
+    """Choose whether a new message steers the live turn or waits for it."""
+
+    def __init__(self, author_id: int, *, timeout: float = 30) -> None:
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.choice: str | None = None
+        self.timed_out = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "Only the message author can choose how to deliver it.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="⚡ Steer now", style=discord.ButtonStyle.primary)
+    async def steer_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.choice = "steer"
+        await interaction.response.edit_message(content="-# ⚡ Steering current turn…", view=None)
+        self.stop()
+
+    @discord.ui.button(label="⏭ Queue", style=discord.ButtonStyle.secondary)
+    async def queue_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.choice = "queue"
+        await interaction.response.edit_message(content="-# ⏭ Queued for the next turn.", view=None)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        """A non-response is the non-destructive queue choice."""
+        self.choice = "queue"
+        self.timed_out = True
+        self.stop()
+
+
 class StopView(discord.ui.View):
     """A ⏹ Stop button attached to the session status message.
 

@@ -110,6 +110,20 @@ class AnonymizingBackend:
     async def interrupt(self) -> None:
         await self.inner.interrupt()
 
+    async def steer(
+        self,
+        prompt: str,
+        images: list[ImageData] | None = None,
+    ) -> bool:
+        """Apply the same outbound privacy guard to same-turn input."""
+        gateway: PrivacyGateway = object.__getattribute__(self, "_gateway")
+        context: dict[str, Any] = dict(object.__getattribute__(self, "_context"))
+        context.setdefault("backend", getattr(self.inner, "command", ""))
+        outcome = await gateway.guard(prompt, **context)
+        if not outcome.allowed:
+            return False
+        return await self.inner.steer(outcome.text, images)
+
     async def kill(self) -> None:
         await self.inner.kill()
 

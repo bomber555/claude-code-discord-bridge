@@ -7,7 +7,29 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.discord_ui.views import StopView
+from claude_discord.discord_ui.views import ActiveTurnInputView, StopView
+
+
+class TestActiveTurnInputView:
+    @pytest.mark.asyncio
+    async def test_timeout_defaults_to_queue(self) -> None:
+        view = ActiveTurnInputView(author_id=42)
+
+        await view.on_timeout()
+
+        assert view.choice == "queue"
+        assert view.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_different_user(self) -> None:
+        view = ActiveTurnInputView(author_id=42)
+        interaction = _make_interaction()
+        interaction.user = MagicMock()
+        interaction.user.id = 99
+        interaction.response.send_message = AsyncMock()
+
+        assert await view.interaction_check(interaction) is False
+        interaction.response.send_message.assert_awaited_once()
 
 
 def _make_runner() -> MagicMock:

@@ -11,6 +11,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Messages can now steer a running turn without stopping its process** — replying in an active
+  Discord thread offers `⚡ Steer now` and `⏭ Queue`. Steer writes to Claude Code's existing
+  stream-json stdin or calls the official Codex app-server `turn/steer` method, so it does not
+  SIGINT, restart, or discard in-flight work. Queue waits for completion and starts a normal next
+  turn; no selection safely defaults to Queue. `/stop` and the Stop button remain the explicit hard
+  interrupt controls.
+
+- **Spawn lineage: parent and child titles now match** (#700) — the `🤖` marker said a thread was
+  started by an agent but not by *which* agent, so several concurrent fan-outs read as one flat pile
+  of identical titles. `POST /api/spawn` takes `parent_thread_id`; both ends then carry the same
+  two-character family code (`🤖K2` on the child, `🌳K2` on the parent, `🤖K2 🌳P9` on a child that
+  spawns in turn). The code is *derived* from the parent's thread ID rather than allocated, so any
+  component holding the ID recomputes it — a lost database costs the lineage records, never the
+  lineage display. The link is recorded in a new `thread_lineage` table and surfaced in
+  `GET /api/sessions` as `parent_thread_id` / `family` / `children`, so a session managing a fan-out
+  reads its own tree instead of parsing titles, and both threads get a one-line cross-link. The
+  parent is renamed once, not per child: Discord allows two renames per ten minutes, and retagging
+  per spawn would fail partway through a fan-out. Renaming, cross-linking and recording are each
+  best-effort — none of them can fail a spawn that already succeeded. Omitting `parent_thread_id`
+  keeps the previous behaviour. `CCDB_SPAWN_PARENT_MARKER` mirrors `CCDB_SPAWN_THREAD_MARKER`.
+
+- **Agent-spawned threads are recognisable in the channel list** (#691) — a thread created through
+  `POST /api/spawn` (one session starting another) was indistinguishable from a thread a person
+  opened by posting in the channel, and Discord exposes no per-thread colour, badge or icon, so the
+  title is the only surface available. The name the spawning agent chose is now prefixed with a
+  marker (`🤖 Nightly Triage`) rather than replaced, applied where the final name is assembled
+  instead of asked of the caller — an agent that has to remember a convention will eventually
+  forget it, and the one thread that then looks human-authored is exactly the one worth noticing.
+  Marking is idempotent and survives the 100-character limit by trimming the tail, never the head.
+  `CCDB_SPAWN_THREAD_MARKER` changes the marker; an *empty* value disables it and is honoured as an
+  explicit opt-out rather than folded back into the default. `/fork` and session resume are
+  unmarked: they carry their own prefixes and a human asked for them.
+
 - **GPT-6 is selectable, and the Codex model list stops going stale** — `/model`'s Codex suggestions
   were a hardcoded quartet (`gpt-5.6-sol`, `gpt-5.5`, `gpt-5.5-codex`, `o4-mini`), two of which no
   longer exist, and the newest generation was not among them: picking GPT-6 meant knowing the slug

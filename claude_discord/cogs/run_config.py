@@ -111,6 +111,9 @@ class RunConfig:
     # internal compact/AskUserQuestion reruns via dataclasses.replace, and fires
     # exactly once at the true terminal return in run_claude_with_config.
     result_sink: Callable[[str | None, str | None], Awaitable[None]] | None = None
+    # Called after system-context cloning selects the runner that actually owns
+    # the transport. Interactive callers use it to expose live steer/interrupt.
+    runner_ready: Callable[[SessionBackend], None] | None = None
 
     # Backend/model settings resolver. When provided (interactive chat only),
     # the per-turn footer consults it for the 2-layer Codex-status toggle

@@ -286,6 +286,27 @@ curl -X POST "$CCDB_API_URL/api/spawn" \
 
 正の整数でない `user_id` は呼び出し側のバグなので 400 で拒否します。一方、Discord 側でのメンバー追加失敗は「見えにくい」だけの問題なので抑制されます。スレッドを作成して Claude をすでに起動できたスポーンを、失敗として報告することはありません。
 
+**エージェントが起動したスレッドを見分ける（`🤖`）** — スポーンされたスレッドは、人がチャンネルに投稿して開いたスレッドと見た目がまったく同じです。Discord にはスレッド単位の色もバッジもないため、残された手段はタイトルだけです。そこで ccdb は、呼び出し側が指定した名前の先頭にマーカーを付けます — `{"thread_name": "Nightly Triage"}` は **🤖 Nightly Triage** になります。エージェント自身が選んだ表現をそのまま残しつつ、チャンネル一覧で一目で区別できます。マーカーが二重に付くことはなく、100 文字制限を超える場合も末尾を削るので（先頭は削りません）マーカーは残ります。別のマーカーを使うには `CCDB_SPAWN_THREAD_MARKER` を設定し、空文字にすれば無効化できます。`/fork` とセッション再開はマーカーの対象外です — これらは独自のプレフィックス（`🔀`、`▶`）を持ち、かつ人間が明示的に指示したものだからです。
+
+**「誰の子か」を見分ける（`parent_thread_id`）** — スポーン元が 1 つならマーカー 1 種類で足ります。しかし複数のセッションが同時にファンアウトすると、チャンネル一覧は同じ `🤖` タイトルの山になり、木構造は失われます。呼び出し元のスレッドを渡すと、親子の両方に同じ 2 文字の**ファミリーコード**が付きます。コードはそのスレッド ID から導出されるので（採番ではないため、ID さえ分かれば誰でも再計算できます）:
+
+```bash
+curl -X POST "$CCDB_API_URL/api/spawn" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Triage the failing nightly build",
+    "thread_name": "Nightly Triage",
+    "parent_thread_id": '$DISCORD_THREAD_ID'
+  }'
+```
+
+- 子: **🤖K2 Nightly Triage**
+- 親（最初のスポーン時に一度だけリネーム）: **🌳K2 <元のタイトル>**
+- 自分も子をスポーンしたスレッドは両方を持ちます — **🤖K2 🌳P9 …** — K2 の子であり、P9 の根
+- 親子の双方に 1 行の相互リンクが投稿されるため、どちらからでもワンクリックで行き来できます
+
+この関係は記録もされるため、ファンアウトを管理するセッションはタイトルを解析せずに済みます: `GET /api/sessions` がスレッドごとに `parent_thread_id`・`family`・`children` を返します。リネーム・相互リンク・記録はいずれもベストエフォートです — 親がアーカイブ済みだったり、Discord の「10 分に 2 回」のリネーム制限に当たったりした場合に失われるのは装飾だけで、スポーン自体が失敗することはありません。`CCDB_SPAWN_PARENT_MARKER` で `🌳` を変更できます（空文字で無効化）。`CCDB_SPAWN_THREAD_MARKER` と同じ扱いです。
+
 Claude のサブプロセスには `DISCORD_THREAD_ID` 環境変数が渡されるため、実行中のセッションから子セッションを起動して作業を並列化できます。
 
 ### 認証済み外部インジェストと結果取得 (`/api/ingest`)
@@ -453,8 +474,8 @@ ccdb がバックエンド情報を記録する前に作成されたレコード
 - **Codex リジュームの自動復旧** — リジュームした Codex セッションで出力開始前に WebSocket 切断が繰り返された場合、ccdb は以前の会話からサイズを制限したテキストのみの会話履歴を引き継いで代替セッションを開始。画像やツールのデータは除外
 - **並行セッション** — 設定可能な上限での複数並行セッション
 - **削除せず停止** — `/stop` でセッションを保持したまま停止し、リジューム可能
-- **セッション割り込み** — アクティブなスレッドに新しいメッセージを送ると実行中のセッションに SIGINT を送り、新しい指示で即座に再開。手動での `/stop` 不要
-- **スレッド自動リネーム** — `THREAD_AUTO_RENAME=true` のとき、最初のメッセージをもとに Claude が生成した短いタイトルでスレッドを自動リネーム（バックグラウンドタスクのためセッション開始を遅延させない）
+- **実行中ターンへの Steer / Queue** — ターン実行中に返信すると `⚡ Steer now` と `⏭ Queue` を選択できます。Steer は同じプロセスへ無停止で追加入力（Claude は stream-json stdin、Codex は app-server の `turn/steer`）、Queue は完了後に次ターンとして実行します。未選択時は安全側の Queue。明示的なハード停止には従来どおり `/stop` を使います
+- **スレッド自動リネーム** — `THREAD_AUTO_RENAME=true` のとき、最初のメッセージをもとに Claude が生成した短いタイトルでスレッドを自動リネーム（バックグラウンドタスクのためセッション開始を遅延させない）。その後も作業内容が明らかに別の話題へ移ったらタイトルを付け直す（15分に1回まで、ccdb が作ったスレッドのみ）
 
 #### 📡 リアルタイムフィードバック
 - **リアルタイムステータス** — 絵文字リアクション: 🧠 思考中、🛠️ ファイル読み取り、💻 編集中、🌐 Web 検索
@@ -892,6 +913,7 @@ CHAT_ONLY_CHANNEL_IDS=444,555
 | `CCDB_COMMAND` | CLI バイナリのパスまたは名前（`CLAUDE_COMMAND` より優先）。`CCDB_BACKEND` で選択された初期ランナーに使用され、実行時に `/backend` で切り替えた際は以下の 2 つのバックエンド別変数が優先されます。 | _（自動: `claude` or `codex`）_ |
 | `CCDB_CLAUDE_COMMAND` | Claude CLI バイナリの明示的なパス。`/backend claude` がアクティブなとき `BackendFactory` が使用（`CCDB_BACKEND` の初期値に依存しない）。`CLAUDE_COMMAND`、次に `claude`（PATH）へのフォールバックあり。 | （オプション） |
 | `CCDB_CODEX_COMMAND` | OpenAI Codex CLI バイナリの明示的なパス。systemd 下で Bot を実行する場合に必須（デフォルトのサービス PATH に `~/.npm-global/bin` が含まれない）。`codex`（PATH）へのフォールバックあり。 | （オプション） |
+| `CCDB_CODEX_SANDBOX_OVERRIDE` | Codex の `--sandbox` をデプロイ全体で上書きする任意設定: `read-only`、`workspace-write`、`danger-full-access`。未設定なら Codex CLI のデフォルトを使用します。`danger-full-access` は、ホスト側の外側の隔離が信頼でき、かつ OS の namespace 制限によって Codex 自身の sandbox が起動できない場合にのみ使ってください。この設定はスレッド単位では意図的に公開していません。 | （オプション） |
 | `CCDB_AGUI_URL` | `/backend agui` で使用する正確な HTTP(S) run endpoint。redirect は拒否されます。 | （`agui` では必須） |
 | `CCDB_AGUI_TOKEN` | AG-UI endpoint 用の任意の bearer token。Claude/Codex subprocess の環境から除去されます。 | （オプション） |
 | `CCDB_CODEX_STATUS_ACCOUNT` | `1`にすると、Codex利用状況フッターへ現在のChatGPTアカウント名またはメールアドレスを表示します。共有Discordチャンネルでの情報露出を避けるため、デフォルトは無効です。 | `0` |
@@ -899,6 +921,7 @@ CHAT_ONLY_CHANNEL_IDS=444,555
 | `CCDB_MODEL` | 使用するモデル（`CLAUDE_MODEL` より優先） | `sonnet` |
 | `CCDB_MODEL_DISCOVERY` | `0` にすると、`/model` のオートコンプリートが Anthropic のモデル一覧エンドポイントへ「この認証情報から見えるモデル」を問い合わせるのをやめ（あわせて Codex CLI のローカルモデルカタログの読み取りもやめ）、常に静的な候補リストを使用する。この問い合わせは読み取り専用で、Claude Code CLI 自身の認証情報を再利用し、オフライン時・未認証時・Bedrock/Vertex/Foundry 利用時には自動的にフォールバックする | `1` |
 | `CCDB_PERMISSION_MODE` | CLI のパーミッションモード（`CLAUDE_PERMISSION_MODE` より優先） | `acceptEdits` |
+| `CCDB_STATUS_LANG` | Codex ステータス行のラベル（`週次` / `クレジット` / `上限到達`）の言語。`en` にすると UI の他の箇所で使われている英語に合わせて `7d` / `credits` / `limit reached` と表示されます。認識できない値は `ja` にフォールバックします。影響するのはこれらのラベルだけで、日本語のプロンプト文やフレーズ照合には影響しません。 | `ja` |
 | `CCDB_DANGEROUSLY_SKIP_PERMISSIONS` | 全パーミッションチェックをスキップ（`CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS` より優先） | `false` |
 | `CCDB_WORKING_DIR` | CLI の作業ディレクトリ（`CLAUDE_WORKING_DIR` より優先） | カレントディレクトリ |
 | `CCDB_ALLOWED_TOOLS` | 許可するツールのカンマ区切りリスト（`CLAUDE_ALLOWED_TOOLS` より優先） | （オプション） |
@@ -923,8 +946,10 @@ CHAT_ONLY_CHANNEL_IDS=444,555
 | `CUSTOM_COGS_DIR` | 起動時に読み込むカスタム Cog ファイルを含むディレクトリ（[カスタム Cog](#カスタム-cogフォーク不要で機能拡張) 参照） | （オプション） |
 | `CLAUDE_ALLOWED_TOOLS` | Claude CLI に許可するツールのカンマ区切りリスト（旧名 — `CCDB_ALLOWED_TOOLS` を推奨） | （オプション） |
 | `CLAUDE_CHANNEL_IDS` | マルチチャンネル設定用の追加チャンネル ID（旧名 — `CCDB_CHANNEL_IDS` を推奨） | （オプション） |
+| `CCDB_SPAWN_THREAD_MARKER` | `POST /api/spawn` で作成したスレッドのタイトル先頭に付けるマーカー。エージェントが起動したスレッドをチャンネル一覧で見分けるためのもの。空文字で無効化 | `🤖` |
+| `CCDB_SPAWN_PARENT_MARKER` | 子スレッドをスポーンしたスレッド自身のタイトル先頭に付けるマーカー。空文字で無効化 | `🌳` |
 | `THREAD_INBOX_ENABLED` | 永続スレッドインボックスを有効化（`claude -p` でセッションを `waiting`/`done`/`ambiguous` に分類し、スレッドダッシュボードに表示） | `false` |
-| `THREAD_AUTO_RENAME` | 新しいスレッドのタイトルを Claude AI で自動リネーム — 最初のユーザーメッセージをもとにバックグラウンドの `claude -p` 呼び出しで短く分かりやすいタイトルを生成（セッション開始を遅延させない） | `false` |
+| `THREAD_AUTO_RENAME` | 新しいスレッドのタイトルを Claude AI で自動リネーム — 最初のユーザーメッセージをもとにバックグラウンドの `claude -p` 呼び出しで短く分かりやすいタイトルを生成（セッション開始を遅延させない）。以降も話題が明確に変わったらタイトルを更新する（15分に1回まで・系譜タグは保持） | `false` |
 | `CCDB_CLI_ENV_FILE` | CLI サブプロセス起動時に毎回環境変数へマージする `KEY=VALUE` ファイルのパス。Bot を再起動せずに即座に反映される。一時的な API ルーティング（Azure Foundry への切り替えなど）に便利 | （オプション） |
 | `CCDB_LOG_FILE` | ログファイルのパス。設定するとデフォルトの stdout ハンドラに加えてローテーティングファイルハンドラ（10 MB × 5 バックアップ）が追加される。監視・アラートに便利 | （オプション） |
 | `API_HOST` | REST API バインドアドレス | `127.0.0.1` |

@@ -222,12 +222,7 @@ class TestInterruptOnNewMessage:
         return msg
 
     @pytest.mark.asyncio
-    async def test_handle_thread_reply_delegates_interrupt_to_run_claude(self) -> None:
-        """_handle_thread_reply must ask _run_claude to preempt the running turn.
-
-        Serialization + interrupt now live in _run_claude (the single run slot),
-        so the reply path only needs to pass interrupt_existing=True.
-        """
+    async def test_idle_thread_reply_starts_a_queued_turn(self) -> None:
         cog = _make_cog()
         thread_id = 42
         message = self._make_thread_message(thread_id)
@@ -238,7 +233,39 @@ class TestInterruptOnNewMessage:
 
         cog._run_claude.assert_called_once()
         _, kwargs = cog._run_claude.call_args
-        assert kwargs.get("interrupt_existing") is True
+        assert kwargs.get("interrupt_existing") is False
+
+    @pytest.mark.asyncio
+    async def test_active_reply_can_steer_without_starting_a_new_run(self) -> None:
+        cog = _make_cog()
+        message = self._make_thread_message(42)
+        runner = MagicMock()
+        runner.steer = AsyncMock(return_value=True)
+        cog._active_runners[42] = runner
+        cog._choose_active_turn_action = AsyncMock(return_value="steer")
+        cog._run_claude = AsyncMock()
+
+        await cog._handle_thread_reply(message)
+
+        runner.steer.assert_awaited_once()
+        assert runner.steer.await_args.args[0] == "new instruction"
+        cog._run_claude.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_active_reply_can_queue_without_interrupting(self) -> None:
+        cog = _make_cog()
+        message = self._make_thread_message(42)
+        runner = MagicMock()
+        runner.steer = AsyncMock(return_value=True)
+        cog._active_runners[42] = runner
+        cog._choose_active_turn_action = AsyncMock(return_value="queue")
+        cog._run_claude = AsyncMock()
+
+        await cog._handle_thread_reply(message)
+
+        runner.steer.assert_not_awaited()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs["interrupt_existing"] is False
 
     @pytest.mark.asyncio
     async def test_evict_active_run_interrupts_and_notifies(self) -> None:
@@ -305,8 +332,8 @@ class TestInterruptOnNewMessage:
         assert call_order == ["task_done", "evict_returned"]
 
     @pytest.mark.asyncio
-    async def test_run_claude_called_with_session_id_after_interrupt(self) -> None:
-        """After interrupt, _run_claude is called with the session_id from the DB."""
+    async def test_queued_run_uses_session_id_after_active_turn(self) -> None:
+        """A queued turn resumes the session ID from the database."""
         cog = _make_cog()
         thread_id = 42
         message = self._make_thread_message(thread_id)
@@ -319,6 +346,7 @@ class TestInterruptOnNewMessage:
         existing_runner = MagicMock()
         existing_runner.interrupt = AsyncMock()
         cog._active_runners[thread_id] = existing_runner
+        cog._choose_active_turn_action = AsyncMock(return_value="queue")
         cog._run_claude = AsyncMock()
 
         await cog._handle_thread_reply(message)
@@ -345,12 +373,12 @@ class TestInterruptOnNewMessage:
 
     @pytest.mark.asyncio
     async def test_concurrent_messages_both_reach_run_claude(self) -> None:
-        """Two near-simultaneous replies both delegate to _run_claude (interrupt=True).
+        """Two near-simultaneous idle replies both delegate in queue mode.
 
         The actual "never overlaps" guarantee is proven by
         test_real_run_claude_never_overlaps_same_thread, which exercises the
-        real _run_claude. Here we only confirm both replies are handled and each
-        asks to preempt the running turn.
+        real _run_claude. Here we only confirm both replies are handled without
+        requesting a destructive process interrupt.
         """
         cog = _make_cog()
         thread_id = 42
@@ -376,7 +404,7 @@ class TestInterruptOnNewMessage:
         await asyncio.gather(t1, t2, return_exceptions=True)
 
         assert call_count == 2
-        assert flags == [True, True]
+        assert flags == [False, False]
 
     @pytest.mark.asyncio
     async def test_real_run_claude_never_overlaps_same_thread(
@@ -412,6 +440,7 @@ class TestInterruptOnNewMessage:
         monkeypatch.setattr(chat_mod, "StatusManager", lambda *a, **k: _StubStatus())
         monkeypatch.setattr(chat_mod, "StopView", lambda *a, **k: _StubStopView())
         cog._get_dashboard = lambda: None  # type: ignore[method-assign]
+        cog._choose_active_turn_action = AsyncMock(return_value="queue")
 
         async def slow_build_runner(**kwargs: object) -> MagicMock:
             # The await here is the gap the race exploits: registration into
