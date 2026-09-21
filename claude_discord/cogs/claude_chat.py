@@ -1076,10 +1076,10 @@ class ClaudeChatCog(commands.Cog):
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
 
-        If Claude is already running in this thread, sends SIGINT to the active
-        session (graceful interrupt, like pressing Escape) and waits for it to
-        finish cleaning up before starting the new session.  This prevents two
-        Claude processes from running in parallel in the same thread.
+        When a turn is already running, the reply is first offered to the live
+        process as same-turn input (Claude Code stream-json stdin).  Backends
+        without a steering transport fall back to the previous behaviour: SIGINT
+        the active session and start a fresh one with the new instruction.
         """
         thread = message.channel
         assert isinstance(thread, discord.Thread)
@@ -1133,7 +1133,15 @@ class ClaudeChatCog(commands.Cog):
 
         # Determine chat_only from the parent channel of this thread.
         chat_only = (thread.parent_id or 0) in self._chat_only_channel_ids
-        # A human reply preempts whatever is running in this thread. _run_claude
+        # Steering keeps the in-flight process alive, so it is tried first.
+        active_runner = self._active_runners.get(thread.id)
+        if active_runner is not None and await active_runner.steer(prompt, images):
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send("-# ⚡ Added to the running turn.")
+            return
+
+        # No steering transport (Codex, AG-UI) or the process already exited:
+        # a human reply preempts whatever is running in this thread. _run_claude
         # is the single serialization point: it interrupts the in-flight run and
         # registers the replacement atomically under the per-thread lock, so two
         # fast replies can never spawn parallel CLI processes.
@@ -1399,6 +1407,14 @@ class ClaudeChatCog(commands.Cog):
                 working_dir_override=working_dir_override,
                 effort_override=effort_override,
             )
+            registered_runner = runner
+
+            def _runner_ready(live_runner: SessionBackend) -> None:
+                nonlocal registered_runner
+                if self._active_runners.get(thread.id) is registered_runner:
+                    self._active_runners[thread.id] = live_runner
+                registered_runner = live_runner
+
             # Register as the sole active run BEFORE releasing the lock. Track
             # the task too so a later eviction can await our cleanup.
             self._active_runners[thread.id] = runner
@@ -1438,6 +1454,7 @@ class ClaudeChatCog(commands.Cog):
                     chat_only=chat_only,
                     notify_user_id=user_message.author.id,
                     result_sink=result_sink,
+                    runner_ready=_runner_ready,
                     backend_settings=self._backend_settings,
                     codex_command=(
                         self._factory.codex_command if self._factory is not None else "codex"
@@ -1453,7 +1470,7 @@ class ClaudeChatCog(commands.Cog):
             # the lock must stay stable for the thread's lifetime, or a later
             # message could create a fresh Lock and run concurrently with one
             # still holding the old object.
-            if self._active_runners.get(thread.id) is runner:
+            if self._active_runners.get(thread.id) is registered_runner:
                 self._active_runners.pop(thread.id, None)
             if self._active_tasks.get(thread.id) is current_task:
                 self._active_tasks.pop(thread.id, None)

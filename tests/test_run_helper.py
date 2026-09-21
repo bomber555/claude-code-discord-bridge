@@ -782,6 +782,7 @@ class TestStopViewRunnerSync:
         stop_view.disable = AsyncMock()
 
         registry = SessionRegistry()
+        ready: list[object] = []
 
         config = RunConfig(
             thread=thread,
@@ -789,12 +790,14 @@ class TestStopViewRunnerSync:
             prompt="hello",
             stop_view=stop_view,
             registry=registry,
+            runner_ready=ready.append,
         )
 
         await run_claude_with_config(config)
 
         # stop_view must have been updated to point at the clone
         stop_view.update_runner.assert_called_once_with(cloned_runner)
+        assert ready == [cloned_runner]
 
     @pytest.mark.asyncio
     async def test_stop_view_not_updated_when_no_clone(self, thread: MagicMock) -> None:

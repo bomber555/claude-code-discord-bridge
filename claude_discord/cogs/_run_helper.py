@@ -392,6 +392,9 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         if config.stop_view is not None:
             config.stop_view.update_runner(runner)
 
+        if config.runner_ready is not None:
+            config.runner_ready(runner)
+
         # Update config.runner to point to the clone so that EventProcessor
         # calls interrupt() on the runner that actually owns the subprocess.
         # Without this, compact_boundary and AskUserQuestion interrupt the

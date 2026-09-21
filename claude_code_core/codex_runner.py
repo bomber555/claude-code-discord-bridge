@@ -502,6 +502,14 @@ class CodexRunner:
             except TimeoutError:
                 await self.kill()
 
+    async def steer(
+        self,
+        prompt: str,
+        images: list[ImageData] | None = None,
+    ) -> bool:
+        """``codex exec`` closes stdin after the prompt, so it cannot be steered."""
+        return False
+
     async def kill(self) -> None:
         """Terminate the subprocess."""
         if self._process and self._process.returncode is None:

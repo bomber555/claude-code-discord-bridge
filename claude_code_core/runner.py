@@ -19,6 +19,7 @@ import signal
 import sys
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import cast
 
 from .account_info import describe_auth, read_account_info
 from .api_provider import detect_api_provider
@@ -219,12 +220,17 @@ class ClaudeRunner:
         except Exception:
             logger.warning("inject_tool_result: failed to write to stdin", exc_info=True)
 
-    async def _send_stream_json_message(self, prompt: str) -> None:
-        """Write the initial user message to stdin in stream-json format."""
+    async def _send_stream_json_message(
+        self,
+        prompt: str,
+        images: list[ImageData] | None | object = _UNSET,
+    ) -> bool:
+        """Write a user message to stdin in stream-json format."""
         assert self._process is not None and self._process.stdin is not None
 
         content: list[dict] = []
-        for img in self.images or []:
+        message_images = self.images if images is _UNSET else cast("list[ImageData] | None", images)
+        for img in message_images or []:
             content.append(
                 {
                     "type": "image",
@@ -249,8 +255,25 @@ class ClaudeRunner:
             self._process.stdin.write(line.encode())
             await self._process.stdin.drain()
             logger.debug("Sent stream-json user message (%d image(s))", len(content) - 1)
+            return True
         except Exception:
             logger.warning("_send_stream_json_message: failed to write to stdin", exc_info=True)
+            return False
+
+    async def steer(
+        self,
+        prompt: str,
+        images: list[ImageData] | None = None,
+    ) -> bool:
+        """Append a user message to the live turn over the open stream-json stdin."""
+        if (
+            self._process is None
+            or self._process.returncode is not None
+            or self._process.stdin is None
+        ):
+            return False
+
+        return await self._send_stream_json_message(prompt, images)
 
     async def interrupt(self) -> None:
         """Interrupt the subprocess with SIGINT (graceful stop)."""
