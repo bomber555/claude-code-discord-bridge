@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal as signal_module
 from pathlib import Path
@@ -196,6 +197,32 @@ class TestBuildArgs:
         base = ClaudeRunner(working_dir="/global/dir")
         cloned = base.clone()
         assert cloned.working_dir == "/global/dir"
+
+
+class TestClaudeRunnerSteer:
+    @pytest.mark.asyncio
+    async def test_steer_writes_another_stream_json_user_message(self) -> None:
+        runner = ClaudeRunner()
+        stdin = MagicMock()
+        stdin.drain = AsyncMock()
+        process = MagicMock()
+        process.stdin = stdin
+        process.returncode = None
+        runner._process = process
+
+        accepted = await runner.steer("追加指示")
+
+        assert accepted is True
+        payload = json.loads(stdin.write.call_args.args[0])
+        assert payload["type"] == "user"
+        assert payload["message"]["content"][-1]["text"] == "追加指示"
+        stdin.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_steer_returns_false_without_live_process(self) -> None:
+        runner = ClaudeRunner()
+
+        assert await runner.steer("late") is False
 
 
 class TestBuildEnv:

@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Messages can now steer a running turn without stopping its process** — replying in an active
+  Discord thread offers `⚡ Steer now` and `⏭ Queue`. Steer writes to Claude Code's existing
+  stream-json stdin or calls the official Codex app-server `turn/steer` method, so it does not
+  SIGINT, restart, or discard in-flight work. Queue waits for completion and starts a normal next
+  turn; no selection safely defaults to Queue. `/stop` and the Stop button remain the explicit hard
+  interrupt controls.
+
 - **Spawn lineage: parent and child titles now match** (#700) — the `🤖` marker said a thread was
   started by an agent but not by *which* agent, so several concurrent fan-outs read as one flat pile
   of identical titles. `POST /api/spawn` takes `parent_thread_id`; both ends then carry the same

@@ -37,6 +37,12 @@ class SessionBackend(Protocol):
 
     async def interrupt(self) -> None: ...
 
+    async def steer(
+        self,
+        prompt: str,
+        images: list[ImageData] | None = None,
+    ) -> bool: ...
+
     async def kill(self) -> None: ...
 
     async def inject_tool_result(self, request_id: str, data: dict) -> None: ...
@@ -68,9 +74,9 @@ def create_backend(
 
         runner: SessionBackend = ClaudeRunner(model=model, **kwargs)  # type: ignore[arg-type]
     elif backend == "codex":
-        from .codex_runner import CodexRunner
+        from .codex_app_server import CodexAppServerRunner
 
-        runner = CodexRunner(model=model, **kwargs)  # type: ignore[arg-type]
+        runner = CodexAppServerRunner(model=model, **kwargs)  # type: ignore[arg-type]
     elif backend == "local":
         from .local_backend import LocalCodexRunner
 

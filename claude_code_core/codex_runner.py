@@ -511,6 +511,14 @@ class CodexRunner:
             except TimeoutError:
                 await self.kill()
 
+    async def steer(
+        self,
+        prompt: str,
+        images: list[ImageData] | None = None,
+    ) -> bool:
+        """``codex exec`` has no live steering transport."""
+        return False
+
     async def kill(self) -> None:
         """Terminate the subprocess."""
         if self._process and self._process.returncode is None:
