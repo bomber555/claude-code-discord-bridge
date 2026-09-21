@@ -281,6 +281,27 @@ curl -X POST "$CCDB_API_URL/api/spawn" \
 
 A `user_id` that is not a positive integer is a caller bug and is rejected with 400. A Discord-side failure to add the member is only a visibility miss and is suppressed — a spawn that already created the thread and started Claude is never reported as failed.
 
+**Telling agent-started threads apart (`🤖`)** — A spawned thread looks exactly like one a person opened by posting in the channel, and Discord offers no per-thread colour or badge, so the title is the only surface left. ccdb prepends a marker to the name the caller chose — `{"thread_name": "Nightly Triage"}` becomes **🤖 Nightly Triage** — which keeps the agent's own wording intact and still reads at a glance in the channel list. The marker is never applied twice, and it survives the 100-character limit (the tail is trimmed, not the head). Set `CCDB_SPAWN_THREAD_MARKER` to use a different marker, or to an empty string to turn it off. `/fork` and session resume are left alone: they carry their own prefixes (`🔀`, `▶`) and a human asked for them.
+
+**Telling *whose* child it is (`parent_thread_id`)** — one marker is enough for one spawner; with several sessions fanning out at once the channel list becomes a pile of identical `🤖` titles and the tree is gone. Pass the calling thread and both ends get the same two-character **family code**, derived from that thread's ID (never allocated, so anyone holding the ID can recompute it):
+
+```bash
+curl -X POST "$CCDB_API_URL/api/spawn" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Triage the failing nightly build",
+    "thread_name": "Nightly Triage",
+    "parent_thread_id": '$DISCORD_THREAD_ID'
+  }'
+```
+
+- child: **🤖K2 Nightly Triage**
+- parent, renamed once on its first spawn: **🌳K2 <its own title>**
+- a child that spawns in turn keeps both — **🤖K2 🌳P9 …** — child of K2, root of P9
+- both threads get a one-line cross-link, so the jump is one click either way
+
+The link is also recorded, so a session managing a fan-out can read it instead of parsing titles: `GET /api/sessions` reports `parent_thread_id`, `family` and `children` per thread. Renaming, cross-linking and recording are each best-effort — a parent that was archived or renamed past Discord's two-per-ten-minutes limit costs the decoration, never the spawn. `CCDB_SPAWN_PARENT_MARKER` changes `🌳` (empty disables it), mirroring `CCDB_SPAWN_THREAD_MARKER`.
+
 Claude subprocesses receive `DISCORD_THREAD_ID` as an environment variable, so a running session can spawn child sessions to parallelize work.
 
 ### Authenticated External Ingest with Result Retrieval (`/api/ingest`)
@@ -452,7 +473,7 @@ Behind the scenes:
 - **Concurrent sessions** — Multiple parallel sessions with configurable limit
 - **Stop without clearing** — `/stop` halts a session while preserving it for resume
 - **Session interrupt** — Sending a new message to an active thread sends SIGINT to the running session and starts fresh with the new instruction; no manual `/stop` needed
-- **Auto-rename threads** — When `THREAD_AUTO_RENAME=true`, each new thread is automatically renamed with a Claude-generated title derived from the first message (background task, never delays session start)
+- **Auto-rename threads** — When `THREAD_AUTO_RENAME=true`, each new thread is automatically renamed with a Claude-generated title derived from the first message (background task, never delays session start). The title is kept honest as the thread goes on: once the work has clearly moved to a different subject, it is re-titled — at most once every 15 minutes, and only for threads ccdb opened
 
 #### 📡 Real-time Feedback
 - **Real-time status** — Emoji reactions: 🧠 thinking, 🛠️ reading files, 💻 editing, 🌐 web search
@@ -899,6 +920,7 @@ for idle deadlines, attachment retries, credentials and startup rollback.
 | `CCDB_MODEL` | Model to use (overrides `CLAUDE_MODEL`) | `sonnet` |
 | `CCDB_MODEL_DISCOVERY` | Set to `0` to stop the `/model` autocomplete from asking the Anthropic models endpoint which models your credentials can see (and from reading the Codex CLI's local model catalog), and always use the static suggestion list instead. Discovery is read-only, reuses the Claude Code CLI's own auth, and already falls back on its own when offline, unauthenticated, or on Bedrock/Vertex/Foundry | `1` |
 | `CCDB_PERMISSION_MODE` | Permission mode for CLI (overrides `CLAUDE_PERMISSION_MODE`) | `acceptEdits` |
+| `CCDB_STATUS_LANG` | Language for the Codex status-line labels (`週次` / `クレジット` / `上限到達`). `en` renders them as `7d` / `credits` / `limit reached`, matching the English used elsewhere in the UI. Unrecognised values fall back to `ja`. Affects only those labels — Japanese prompt text and phrase matching are unaffected. | `ja` |
 | `CCDB_DANGEROUSLY_SKIP_PERMISSIONS` | Skip all permission checks — overrides `CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS` | `false` |
 | `CCDB_WORKING_DIR` | Working directory for CLI (overrides `CLAUDE_WORKING_DIR`) | current dir |
 | `CCDB_ALLOWED_TOOLS` | Comma-separated list of allowed tools (overrides `CLAUDE_ALLOWED_TOOLS`) | (optional) |
@@ -923,8 +945,10 @@ for idle deadlines, attachment retries, credentials and startup rollback.
 | `CUSTOM_COGS_DIR` | Directory containing custom Cog files to load at startup (see [Custom Cogs](#custom-cogs-extend-without-forking)) | (optional) |
 | `CLAUDE_ALLOWED_TOOLS` | Comma-separated list of allowed tools for Claude CLI (legacy — prefer `CCDB_ALLOWED_TOOLS`) | (optional) |
 | `CLAUDE_CHANNEL_IDS` | Additional channel IDs (comma-separated) for multi-channel setup (legacy — prefer `CCDB_CHANNEL_IDS`) | (optional) |
+| `CCDB_SPAWN_THREAD_MARKER` | Marker prepended to the title of a thread opened by `POST /api/spawn`, so agent-started threads are distinguishable in the channel list. Set to an empty string to disable | `🤖` |
+| `CCDB_SPAWN_PARENT_MARKER` | Marker prepended to the title of a thread that spawned children, in front of its own name. Set to an empty string to disable | `🌳` |
 | `THREAD_INBOX_ENABLED` | Enable the persistent thread inbox (classifies sessions as `waiting`/`done`/`ambiguous` via `claude -p`; shown in thread dashboard) | `false` |
-| `THREAD_AUTO_RENAME` | Auto-rename new thread titles using Claude AI — generates a short, descriptive title from the first user message via a background `claude -p` call (never delays session start) | `false` |
+| `THREAD_AUTO_RENAME` | Auto-rename new thread titles using Claude AI — generates a short, descriptive title from the first user message via a background `claude -p` call (never delays session start), and re-titles the thread later when its subject has clearly moved on (rate-limited to one rename per 15 minutes; lineage tags are preserved) | `false` |
 | `CCDB_CLI_ENV_FILE` | Path to a `KEY=VALUE` file whose variables are merged into the CLI subprocess environment on every invocation. Changes take effect immediately without restarting the bot. Useful for temporary API routing (e.g., Azure Foundry) | (optional) |
 | `CCDB_LOG_FILE` | Path to a log file. When set, a rotating file handler (10 MB × 5 backups) is added alongside the default stdout handler. Useful for monitoring and alerting. | (optional) |
 | `API_HOST` | REST API bind address | `127.0.0.1` |

@@ -40,6 +40,59 @@ _DEFAULT_TTL = 90.0
 # do not hammer a broken setup on every message, but still recover quickly.
 _FAIL_TTL = 30.0
 
+# Status-line labels. The bot's other surfaces are English, so deployments
+# outside Japan end up with one mixed-language line. `CCDB_STATUS_LANG=en`
+# switches just these labels; the default keeps the existing Japanese output so
+# no current deployment changes behaviour.
+#
+# "weekly" is a label, not a translation: `en` reports `7d`, which matches the
+# `5h` / `1d` / `30m` forms `_window_label()` already produces for every other
+# duration.
+_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "ja": {
+        "five_hour": "5時間",
+        "weekly": "週間",
+        "remaining": "残量：",
+        "reset_in": "リセットまで",
+        "day": "日",
+        "hour": "時間",
+        "minute": "分",
+        "account": "アカウント：",
+        "account_unavailable": "未取得",
+        "limit_reached": "利用上限に到達",
+        "usage_unavailable": "残量取得失敗（codex login 済みか確認）",
+    },
+    "en": {
+        "five_hour": "5h",
+        "weekly": "7d",
+        "remaining": " remaining: ",
+        "reset_in": "resets in ",
+        "day": "d ",
+        "hour": "h ",
+        "minute": "m",
+        "account": "Account: ",
+        "account_unavailable": "unavailable",
+        "limit_reached": "limit reached",
+        "usage_unavailable": "usage unavailable (check that codex is logged in)",
+    },
+}
+_DEFAULT_STATUS_LANG = "ja"
+
+
+def _labels() -> dict[str, str]:
+    """Return the status-line label set selected by ``CCDB_STATUS_LANG``.
+
+    An unset or unrecognised value falls back to the existing Japanese labels,
+    so a typo degrades to today's behaviour rather than to empty strings.
+    """
+    lang = os.getenv("CCDB_STATUS_LANG", _DEFAULT_STATUS_LANG).strip().lower()
+    return _STATUS_LABELS.get(lang, _STATUS_LABELS[_DEFAULT_STATUS_LANG])
+
+
+def codex_status_unavailable_line() -> str:
+    """The line shown when Codex usage cannot be read but the mode is ``on``."""
+    return f"\U0001f916 Codex: {_labels()['usage_unavailable']}"
+
 
 async def fetch_codex_rate_limits(
     codex_command: str = "codex",
@@ -162,9 +215,9 @@ def _window_label(snap: dict | None, fallback: str) -> str:
     except (TypeError, ValueError, OverflowError):
         return fallback
     if minutes == 300:
-        return "5時間"
+        return _labels()["five_hour"]
     if minutes == 10080:
-        return "週間"
+        return _labels()["weekly"]
     if minutes > 0 and minutes % 1440 == 0:
         return f"{minutes // 1440}d"
     if minutes > 0 and minutes % 60 == 0:
@@ -189,13 +242,14 @@ def _reset_countdown(snap: dict | None, now: float) -> str | None:
 
     days, remainder = divmod(minutes, 24 * 60)
     hours, mins = divmod(remainder, 60)
+    labels = _labels()
     parts: list[str] = []
     if days:
-        parts.append(f"{days}日")
+        parts.append(f"{days}{labels['day']}")
     if hours:
-        parts.append(f"{hours}時間")
+        parts.append(f"{hours}{labels['hour']}")
     if mins or not parts:
-        parts.append(f"{mins}分")
+        parts.append(f"{mins}{labels['minute']}")
     return "".join(parts)
 
 
@@ -219,10 +273,14 @@ def _usage_line(snap: dict | None, fallback_label: str, now: float) -> str | Non
     pct = _remaining_pct(snap)
     if pct is None:
         return None
-    line = f"{_window_label(snap, fallback_label)}残量：{pct}"
+    labels = _labels()
+    line = f"{_window_label(snap, fallback_label)}{labels['remaining']}{pct}"
     countdown = _reset_countdown(snap, now)
     if countdown is not None:
-        line += f"（リセットまで{countdown}）"
+        if os.getenv("CCDB_STATUS_LANG", _DEFAULT_STATUS_LANG).strip().lower() == "en":
+            line += f" ({labels['reset_in']}{countdown})"
+        else:
+            line += f"（{labels['reset_in']}{countdown}）"
     return line
 
 
@@ -252,8 +310,8 @@ def format_codex_status_line(
     rows = [
         row
         for row in (
-            _usage_line(snap.get("primary"), "5時間", current_time),
-            _usage_line(snap.get("secondary"), "週間", current_time),
+            _usage_line(snap.get("primary"), _labels()["five_hour"], current_time),
+            _usage_line(snap.get("secondary"), _labels()["weekly"], current_time),
         )
         if row is not None
     ]
@@ -262,9 +320,10 @@ def format_codex_status_line(
 
     account = _account_label(data) if show_account else None
     if show_account:
-        rows.insert(0, f"アカウント：{account or '未取得'}")
+        labels = _labels()
+        rows.insert(0, f"{labels['account']}{account or labels['account_unavailable']}")
     if snap.get("rateLimitReachedType"):
-        rows.append("⚠ 利用上限に到達")
+        rows.append(f"⚠ {_labels()['limit_reached']}")
     return "\n".join(rows)
 
 

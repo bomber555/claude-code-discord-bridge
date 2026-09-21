@@ -1226,7 +1226,10 @@ async def _post_engine_status_footer(
         fetch_claude_usage,
         usage_footer_enabled,
     )
-    from ..discord_ui.engine_status import get_codex_status_line
+    from ..discord_ui.engine_status import (
+        codex_status_unavailable_line,
+        get_codex_status_line,
+    )
 
     # Resolve the Codex-status mode (off when no settings resolver is wired,
     # e.g. headless flows).
@@ -1240,7 +1243,7 @@ async def _post_engine_status_footer(
     if show_codex:
         codex_line = await get_codex_status_line(codex_command)
         if codex_line is None and mode == "on":
-            codex_line = "\U0001f916 Codex: 残量取得失敗（codex login 済みか確認）"
+            codex_line = codex_status_unavailable_line()
 
     # Render Claude status only for Claude turns.
     render_claude_sl = backend == "claude"
