@@ -146,6 +146,7 @@ class _FakeBackend:
 
     def __init__(self) -> None:
         self.received: list[str] = []
+        self.steered: list[str] = []
         self.images = None
 
     async def run(self, prompt: str, session_id: str | None = None) -> AsyncGenerator:
@@ -156,6 +157,10 @@ class _FakeBackend:
             text=f"answer about {prompt}",
         )
         yield StreamEvent(raw={}, message_type=MessageType.RESULT, is_complete=True)
+
+    async def steer(self, prompt: str, images: object = None) -> bool:
+        self.steered.append(prompt)
+        return True
 
     def clone(self, **kwargs: object) -> _FakeBackend:
         return _FakeBackend()
@@ -171,6 +176,24 @@ class TestAnonymizingBackend:
 
         assert "Contoso" not in inner.received[0]
         assert "Contoso" in (events[0].text or "")
+
+    async def test_steered_input_is_anonymized_like_a_prompt(self):
+        gateway = make_gateway(InspectionPolicy.OFF, None)
+        inner = _FakeBackend()
+        backend = AnonymizingBackend(inner, gateway)
+
+        assert await backend.steer("Contoso も見て") is True
+        assert "Contoso" not in inner.steered[0]
+
+    async def test_blocked_input_is_never_steered_into_the_live_turn(self):
+        gateway = make_gateway(
+            InspectionPolicy.BLOCK, InspectionResult(suspects=(Suspect(value="Fabrikam"),))
+        )
+        inner = _FakeBackend()
+        backend = AnonymizingBackend(inner, gateway)
+
+        assert await backend.steer("Fabrikam の件") is False
+        assert inner.steered == []
 
     async def test_blocked_prompt_never_reaches_the_inner_backend(self):
         gateway = make_gateway(

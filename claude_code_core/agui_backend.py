@@ -399,6 +399,14 @@ class AgUiBackend:
         if self._response is not None:
             self._response.close()
 
+    async def steer(
+        self,
+        prompt: str,
+        images: list[ImageData] | None = None,
+    ) -> bool:
+        """AG-UI does not define same-run input injection."""
+        return False
+
     async def kill(self) -> None:
         """Terminate the active request (same transport action as interrupt)."""
         await self.interrupt()

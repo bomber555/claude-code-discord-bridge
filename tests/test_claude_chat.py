@@ -241,6 +241,40 @@ class TestInterruptOnNewMessage:
         assert kwargs.get("interrupt_existing") is True
 
     @pytest.mark.asyncio
+    async def test_active_reply_steers_the_live_turn_instead_of_restarting(self) -> None:
+        """A steerable backend absorbs the reply without touching the process."""
+        cog = _make_cog()
+        message = self._make_thread_message(42)
+        runner = MagicMock()
+        runner.steer = AsyncMock(return_value=True)
+        runner.interrupt = AsyncMock()
+        cog._active_runners[42] = runner
+        cog._run_claude = AsyncMock()
+
+        await cog._handle_thread_reply(message)
+
+        runner.steer.assert_awaited_once()
+        assert runner.steer.await_args.args[0] == "new instruction"
+        runner.interrupt.assert_not_awaited()
+        cog._run_claude.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_active_reply_falls_back_to_interrupt_when_steer_is_refused(self) -> None:
+        """Codex and AG-UI return False, so the previous behaviour must survive."""
+        cog = _make_cog()
+        message = self._make_thread_message(42)
+        runner = MagicMock()
+        runner.steer = AsyncMock(return_value=False)
+        cog._active_runners[42] = runner
+        cog._run_claude = AsyncMock()
+
+        await cog._handle_thread_reply(message)
+
+        runner.steer.assert_awaited_once()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs.get("interrupt_existing") is True
+
+    @pytest.mark.asyncio
     async def test_evict_active_run_interrupts_and_notifies(self) -> None:
         """_evict_active_run(interrupt=True) posts the notice and SIGINTs the runner."""
         cog = _make_cog()
@@ -318,6 +352,7 @@ class TestInterruptOnNewMessage:
 
         existing_runner = MagicMock()
         existing_runner.interrupt = AsyncMock()
+        existing_runner.steer = AsyncMock(return_value=False)
         cog._active_runners[thread_id] = existing_runner
         cog._run_claude = AsyncMock()
 
