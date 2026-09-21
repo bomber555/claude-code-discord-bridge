@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from pathlib import Path
@@ -19,6 +20,71 @@ if TYPE_CHECKING:
     from ..database.settings_repo import SettingsRepository
 
 logger = logging.getLogger(__name__)
+
+
+class RunDispositionView(discord.ui.View):
+    """Let the author queue a new message or interrupt the active turn.
+
+    ``False`` means queue and ``True`` means interrupt. A missing answer defaults
+    to queue so an unattended prompt never destroys in-flight work.
+    """
+
+    def __init__(self, requester_id: int, timeout_seconds: float = 300) -> None:
+        super().__init__(timeout=timeout_seconds)
+        self._requester_id = requester_id
+        self._timeout_seconds = timeout_seconds
+        self._future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Only the author of the new instruction may choose its disposition."""
+        if interaction.user.id == self._requester_id:
+            return True
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_message(
+                "Only the author of this instruction can choose Queue or Interrupt.",
+                ephemeral=True,
+            )
+        return False
+
+    @discord.ui.button(label="Queue", style=discord.ButtonStyle.primary)
+    async def queue_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Run the new instruction after the active turn completes."""
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        self._resolve(interrupt=False)
+
+    @discord.ui.button(label="Interrupt", style=discord.ButtonStyle.danger)
+    async def interrupt_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Stop the active turn and run the new instruction immediately."""
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        self._resolve(interrupt=True)
+
+    async def wait_for_choice(self) -> bool:
+        """Return True for interrupt; timeouts safely default to queue."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(self._future), timeout=self._timeout_seconds
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            self._resolve(interrupt=False)
+            return False
+
+    async def on_timeout(self) -> None:
+        """Resolve Discord's own timeout through the same safe default."""
+        self._resolve(interrupt=False)
+
+    def _resolve(self, *, interrupt: bool) -> None:
+        if not self._future.done():
+            self._future.set_result(interrupt)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        self.stop()
 
 
 class StopView(discord.ui.View):

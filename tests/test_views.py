@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.discord_ui.views import StopView
+from claude_discord.discord_ui.views import RunDispositionView, StopView
 
 
 def _make_runner() -> MagicMock:
@@ -21,8 +21,11 @@ def _make_interaction() -> MagicMock:
     interaction.response = MagicMock()
     interaction.response.edit_message = AsyncMock()
     interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
     interaction.followup = MagicMock()
     interaction.followup.send = AsyncMock()
+    interaction.user = MagicMock()
+    interaction.user.id = 123
     return interaction
 
 
@@ -130,6 +133,56 @@ class TestStopViewButtonClick:
 
         runner.interrupt.assert_not_called()
         interaction.response.defer.assert_called_once()
+
+
+async def _click_run_choice(
+    view: RunDispositionView, interaction: MagicMock, *, interrupt: bool
+) -> None:
+    button = view.interrupt_button if interrupt else view.queue_button
+    await button.callback.callback(view, interaction, button)
+
+
+class TestRunDispositionView:
+    @pytest.mark.asyncio
+    async def test_queue_button_resolves_false(self) -> None:
+        view = RunDispositionView(requester_id=123)
+
+        await _click_run_choice(view, _make_interaction(), interrupt=False)
+
+        assert await view.wait_for_choice() is False
+
+    @pytest.mark.asyncio
+    async def test_interrupt_button_resolves_true(self) -> None:
+        view = RunDispositionView(requester_id=123)
+
+        await _click_run_choice(view, _make_interaction(), interrupt=True)
+
+        assert await view.wait_for_choice() is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_defaults_to_queue(self) -> None:
+        view = RunDispositionView(requester_id=123, timeout_seconds=0.01)
+
+        assert await view.wait_for_choice() is False
+        assert all(child.disabled for child in view.children)
+
+    @pytest.mark.asyncio
+    async def test_only_requester_can_choose(self) -> None:
+        view = RunDispositionView(requester_id=123)
+        interaction = _make_interaction()
+        interaction.user.id = 999
+
+        allowed = await view.interaction_check(interaction)
+
+        assert allowed is False
+        interaction.response.send_message.assert_awaited_once()
+        assert interaction.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    @pytest.mark.asyncio
+    async def test_requester_is_allowed(self) -> None:
+        view = RunDispositionView(requester_id=123)
+
+        assert await view.interaction_check(_make_interaction()) is True
 
 
 class TestStopViewDisable:

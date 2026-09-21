@@ -1,4 +1,4 @@
-"""Tests for ClaudeChatCog: /stop command, attachment handling, and interrupt-on-new-message."""
+"""Tests for ClaudeChatCog: /stop, attachments, and active-run message choices."""
 
 from __future__ import annotations
 
@@ -204,8 +204,8 @@ class TestRegistryAutoDiscovery:
         assert cog._registry is None
 
 
-class TestInterruptOnNewMessage:
-    """New message in active thread should interrupt the running session."""
+class TestActiveRunMessageChoice:
+    """New messages in active threads let the user choose queue or interrupt."""
 
     def _make_thread_message(self, thread_id: int = 42) -> MagicMock:
         """Return a discord.Message inside a Thread."""
@@ -218,27 +218,87 @@ class TestInterruptOnNewMessage:
         msg.content = "new instruction"
         msg.attachments = []
         msg.author = MagicMock()
+        msg.author.id = 123
         msg.author.bot = False
         return msg
 
     @pytest.mark.asyncio
-    async def test_handle_thread_reply_delegates_interrupt_to_run_claude(self) -> None:
-        """_handle_thread_reply must ask _run_claude to preempt the running turn.
-
-        Serialization + interrupt now live in _run_claude (the single run slot),
-        so the reply path only needs to pass interrupt_existing=True.
-        """
+    async def test_active_reply_can_queue_without_interrupting(self) -> None:
+        """Choosing Queue waits behind the active turn without sending SIGINT."""
         cog = _make_cog()
         thread_id = 42
         message = self._make_thread_message(thread_id)
-
+        cog._active_runners[thread_id] = MagicMock()
+        cog._choose_active_run_disposition = AsyncMock(return_value=False)
         cog._run_claude = AsyncMock()
 
         await cog._handle_thread_reply(message)
 
         cog._run_claude.assert_called_once()
         _, kwargs = cog._run_claude.call_args
+        assert kwargs.get("interrupt_existing") is False
+
+    @pytest.mark.asyncio
+    async def test_active_reply_can_interrupt_running_turn(self) -> None:
+        """Choosing Interrupt asks _run_claude to preempt the active turn."""
+        cog = _make_cog()
+        thread_id = 42
+        message = self._make_thread_message(thread_id)
+        cog._active_runners[thread_id] = MagicMock()
+        cog._choose_active_run_disposition = AsyncMock(return_value=True)
+        cog._run_claude = AsyncMock()
+
+        await cog._handle_thread_reply(message)
+
+        _, kwargs = cog._run_claude.call_args
         assert kwargs.get("interrupt_existing") is True
+
+    @pytest.mark.asyncio
+    async def test_idle_reply_starts_without_choice_prompt(self) -> None:
+        """An idle session starts normally without showing Queue/Interrupt."""
+        cog = _make_cog()
+        message = self._make_thread_message(42)
+        cog._choose_active_run_disposition = AsyncMock()
+        cog._run_claude = AsyncMock()
+
+        await cog._handle_thread_reply(message)
+
+        cog._choose_active_run_disposition.assert_not_awaited()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs.get("interrupt_existing") is False
+
+    @pytest.mark.asyncio
+    async def test_disposition_prompt_returns_the_author_choice(self) -> None:
+        """The prompt result is returned and the chosen state replaces the buttons."""
+        cog = _make_cog()
+        message = self._make_thread_message(42)
+        prompt = MagicMock()
+        prompt.edit = AsyncMock()
+        message.channel.send = AsyncMock(return_value=prompt)
+        view = MagicMock()
+        view.wait_for_choice = AsyncMock(return_value=True)
+
+        with patch(
+            "claude_discord.cogs.claude_chat.RunDispositionView", return_value=view
+        ) as view_factory:
+            result = await cog._choose_active_run_disposition(message, message.channel)
+
+        assert result is True
+        view_factory.assert_called_once_with(requester_id=123)
+        assert message.channel.send.await_args.kwargs["view"] is view
+        prompt.edit.assert_awaited_once_with(content="-# ⚡ Interrupt selected", view=view)
+
+    @pytest.mark.asyncio
+    async def test_disposition_prompt_failure_safely_defaults_to_queue(self) -> None:
+        """A Discord send failure preserves the active work by choosing Queue."""
+        cog = _make_cog()
+        message = self._make_thread_message(42)
+        response = MagicMock(status=500, reason="Internal Server Error")
+        message.channel.send = AsyncMock(side_effect=discord.HTTPException(response, "boom"))
+
+        result = await cog._choose_active_run_disposition(message, message.channel)
+
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_evict_active_run_interrupts_and_notifies(self) -> None:
@@ -319,6 +379,7 @@ class TestInterruptOnNewMessage:
         existing_runner = MagicMock()
         existing_runner.interrupt = AsyncMock()
         cog._active_runners[thread_id] = existing_runner
+        cog._choose_active_run_disposition = AsyncMock(return_value=True)
         cog._run_claude = AsyncMock()
 
         await cog._handle_thread_reply(message)
@@ -345,12 +406,12 @@ class TestInterruptOnNewMessage:
 
     @pytest.mark.asyncio
     async def test_concurrent_messages_both_reach_run_claude(self) -> None:
-        """Two near-simultaneous replies both delegate to _run_claude (interrupt=True).
+        """Two near-simultaneous idle replies both delegate to _run_claude.
 
         The actual "never overlaps" guarantee is proven by
         test_real_run_claude_never_overlaps_same_thread, which exercises the
-        real _run_claude. Here we only confirm both replies are handled and each
-        asks to preempt the running turn.
+        real _run_claude. The spy here never registers an active runner, so both
+        messages take the ordinary non-interrupt path.
         """
         cog = _make_cog()
         thread_id = 42
@@ -376,7 +437,7 @@ class TestInterruptOnNewMessage:
         await asyncio.gather(t1, t2, return_exceptions=True)
 
         assert call_count == 2
-        assert flags == [True, True]
+        assert flags == [False, False]
 
     @pytest.mark.asyncio
     async def test_real_run_claude_never_overlaps_same_thread(
@@ -426,6 +487,7 @@ class TestInterruptOnNewMessage:
         cog._get_current_model = AsyncMock(return_value=None)
         cog._get_allowed_tools = AsyncMock(return_value=None)
         cog._get_current_effort = AsyncMock(return_value=None)
+        cog._choose_active_run_disposition = AsyncMock(return_value=False)
 
         msg1 = self._make_thread_message(thread_id)
         msg2 = self._make_thread_message(thread_id)
@@ -1834,6 +1896,22 @@ class TestHandleMention:
         assert cog._run_claude.await_args.kwargs["session_id"] == "sess-1"
 
     @pytest.mark.asyncio
+    async def test_active_mention_uses_queue_or_interrupt_choice(self) -> None:
+        cog = self._make_cog()
+        msg = self._channel_message()
+        cog._active_runners[msg.channel.id] = MagicMock()
+        cog._choose_active_run_disposition = AsyncMock(return_value=False)
+        with patch(
+            "claude_discord.cogs.claude_chat.build_recent_transcript",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            await cog._handle_mention(msg)
+
+        cog._choose_active_run_disposition.assert_awaited_once_with(msg, msg.channel)
+        assert cog._run_claude.await_args.kwargs["interrupt_existing"] is False
+
+    @pytest.mark.asyncio
     async def test_transcript_can_be_disabled(self) -> None:
         cog = self._make_cog()
         cog._thread_context_days = 0
@@ -2010,6 +2088,19 @@ class TestInlineReplyChannels:
         await cog._handle_new_conversation(self._make_channel_message(channel_id=222))
 
         assert cog._run_claude.call_args.kwargs["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_active_inline_channel_uses_queue_or_interrupt_choice(self) -> None:
+        cog = self._make_cog(channel_ids={111, 222}, inline_reply_channel_ids={222})
+        cog._run_claude = AsyncMock()
+        msg = self._make_channel_message(channel_id=222)
+        cog._active_runners[msg.channel.id] = MagicMock()
+        cog._choose_active_run_disposition = AsyncMock(return_value=True)
+
+        await cog._handle_new_conversation(msg)
+
+        cog._choose_active_run_disposition.assert_awaited_once_with(msg, msg.channel)
+        assert cog._run_claude.call_args.kwargs["interrupt_existing"] is True
 
     @pytest.mark.asyncio
     async def test_non_inline_channel_still_creates_thread(self) -> None:

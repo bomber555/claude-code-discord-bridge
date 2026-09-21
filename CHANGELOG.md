@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Active-thread replies now offer Queue or Interrupt instead of always preempting** — when a
+  human sends another message while the thread is still running, ccdb asks whether to wait for the
+  active turn or SIGINT it immediately. Only that message's author can choose, and an unanswered or
+  undeliverable prompt safely defaults to Queue after five minutes. The choice uses the existing
+  backend-neutral run serialization, so Claude and Codex behave the same way and never overlap two
+  CLI processes in one thread.
+
 - **GPT-6 is selectable, and the Codex model list stops going stale** — `/model`'s Codex suggestions
   were a hardcoded quartet (`gpt-5.6-sol`, `gpt-5.5`, `gpt-5.5-codex`, `o4-mini`), two of which no
   longer exist, and the newest generation was not among them: picking GPT-6 meant knowing the slug

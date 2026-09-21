@@ -451,7 +451,7 @@ Behind the scenes:
 - **Automatic Codex resume recovery** — If a resumed Codex session repeatedly loses its WebSocket before producing output, ccdb starts a replacement session with a bounded, text-only transcript of the prior conversation; image and tool payloads are excluded
 - **Concurrent sessions** — Multiple parallel sessions with configurable limit
 - **Stop without clearing** — `/stop` halts a session while preserving it for resume
-- **Session interrupt** — Sending a new message to an active thread sends SIGINT to the running session and starts fresh with the new instruction; no manual `/stop` needed
+- **Queue or interrupt** — Sending a new message to an active thread shows two buttons: Queue runs it after the current turn finishes, while Interrupt sends SIGINT and resumes immediately with the new instruction. Only the message author can choose; unanswered prompts safely default to Queue after five minutes
 - **Auto-rename threads** — When `THREAD_AUTO_RENAME=true`, each new thread is automatically renamed with a Claude-generated title derived from the first message (background task, never delays session start)
 
 #### 📡 Real-time Feedback

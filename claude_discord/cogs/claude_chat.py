@@ -42,7 +42,7 @@ from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_context import DEFAULT_DAYS, build_recent_transcript
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.thread_renamer import suggest_title
-from ..discord_ui.views import RewindSelectView, StopView
+from ..discord_ui.views import RewindSelectView, RunDispositionView, StopView
 from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
 from ._run_helper import run_claude_with_config
 from .prompt_builder import build_prompt_and_images, wants_file_attachment
@@ -727,6 +727,9 @@ class ClaudeChatCog(commands.Cog):
             session_id = await self._session_id_for_current_backend(channel, record)
 
         root_id = channel.parent_id if isinstance(channel, discord.Thread) else channel.id
+        interrupt_existing = False
+        if channel.id in self._active_runners:
+            interrupt_existing = await self._choose_active_run_disposition(message, channel)
         await self._run_claude(
             message,
             channel,
@@ -735,7 +738,7 @@ class ClaudeChatCog(commands.Cog):
             images=images,
             working_dir_override=record.working_dir if record else None,
             chat_only=(root_id or 0) in self._chat_only_channel_ids,
-            interrupt_existing=True,
+            interrupt_existing=interrupt_existing,
         )
 
     async def _handle_new_conversation(self, message: discord.Message) -> None:
@@ -752,6 +755,11 @@ class ClaudeChatCog(commands.Cog):
             # would restart cold on each message, which threads never do (see
             # _handle_thread_reply). The channel is the conversation; /clear ends it.
             record = await self.repo.get(message.channel.id)
+            interrupt_existing = False
+            if message.channel.id in self._active_runners:
+                interrupt_existing = await self._choose_active_run_disposition(
+                    message, message.channel
+                )
             await self._run_claude(
                 message,
                 message.channel,
@@ -759,6 +767,7 @@ class ClaudeChatCog(commands.Cog):
                 session_id=record.session_id if record else None,
                 images=images,
                 chat_only=chat_only,
+                interrupt_existing=interrupt_existing,
             )
         else:
             thread_name = message.content[:100] if message.content else "Claude Chat"
@@ -1076,10 +1085,9 @@ class ClaudeChatCog(commands.Cog):
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
 
-        If Claude is already running in this thread, sends SIGINT to the active
-        session (graceful interrupt, like pressing Escape) and waits for it to
-        finish cleaning up before starting the new session.  This prevents two
-        Claude processes from running in parallel in the same thread.
+        If Claude is already running, the message author chooses whether to
+        queue behind it or interrupt it. Either path still uses the single
+        per-thread run slot, so two CLI processes never overlap.
         """
         thread = message.channel
         assert isinstance(thread, discord.Thread)
@@ -1133,10 +1141,13 @@ class ClaudeChatCog(commands.Cog):
 
         # Determine chat_only from the parent channel of this thread.
         chat_only = (thread.parent_id or 0) in self._chat_only_channel_ids
-        # A human reply preempts whatever is running in this thread. _run_claude
-        # is the single serialization point: it interrupts the in-flight run and
-        # registers the replacement atomically under the per-thread lock, so two
-        # fast replies can never spawn parallel CLI processes.
+        interrupt_existing = False
+        if thread.id in self._active_runners:
+            interrupt_existing = await self._choose_active_run_disposition(message, thread)
+
+        # _run_claude is the single serialization point: Queue waits for the
+        # in-flight run; Interrupt stops it. Registration remains atomic under
+        # the per-thread lock, so fast replies cannot spawn parallel processes.
         await self._run_claude(
             message,
             thread,
@@ -1145,8 +1156,42 @@ class ClaudeChatCog(commands.Cog):
             images=images,
             working_dir_override=record.working_dir if record else None,
             chat_only=chat_only,
-            interrupt_existing=True,
+            interrupt_existing=interrupt_existing,
         )
+
+    async def _choose_active_run_disposition(
+        self,
+        message: discord.Message,
+        thread: discord.Thread | discord.TextChannel,
+    ) -> bool:
+        """Ask whether a new human message should queue or interrupt.
+
+        Returns True for Interrupt and False for Queue. If Discord cannot post
+        the prompt, or nobody answers within five minutes, Queue is the safe
+        fallback because it preserves the work already in flight.
+        """
+        view = RunDispositionView(requester_id=message.author.id)
+        try:
+            prompt_message = await thread.send(
+                f"<@{message.author.id}> A session is already running. "
+                "Choose **Queue** to run this message after it finishes, or "
+                "**Interrupt** to stop it and run this message now. "
+                "No choice within 5 minutes defaults to Queue.",
+                view=view,
+            )
+        except discord.HTTPException:
+            logger.warning(
+                "Failed to post Queue/Interrupt choice for thread %d; defaulting to Queue",
+                thread.id,
+                exc_info=True,
+            )
+            return False
+
+        interrupt = await view.wait_for_choice()
+        label = "⚡ Interrupt selected" if interrupt else "🕒 Queued after the active turn"
+        with contextlib.suppress(discord.HTTPException):
+            await prompt_message.edit(content=f"-# {label}", view=view)
+        return interrupt
 
     async def _session_id_for_current_backend(
         self, thread: discord.Thread | discord.TextChannel, record: SessionRecord
