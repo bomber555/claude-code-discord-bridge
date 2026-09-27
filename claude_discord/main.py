@@ -55,6 +55,7 @@ def load_config() -> dict[str, str]:
         "token": token,
         "channel_id": channel_id,
         "backend": backend,
+        "allowed_backends": os.getenv("CCDB_ALLOWED_BACKENDS", ""),
         "frontends": ",".join(frontends),
         "command": _env("CCDB_COMMAND", "CLAUDE_COMMAND", ""),
         # Per-backend explicit command paths. Used by BackendFactory when
@@ -110,6 +111,10 @@ async def main() -> None:
 
     # Create runner via backend factory (CCDB_BACKEND=claude|codex)
     backend_name = config["backend"]
+    allowed_backends = (
+        frozenset(name.strip() for name in config["allowed_backends"].split(",") if name.strip())
+        or None
+    )
     # BackendFactory is the runtime authority for building Claude/Codex
     # runners on demand (e.g. when the user switches via /backend).
     from .backend_factory import BackendFactory
@@ -132,6 +137,7 @@ async def main() -> None:
         agui_url=config["agui_url"] or None,
         agui_token=config["agui_token"] or None,
         api_secret=config["api_secret"] or None,
+        allowed_backends=allowed_backends,
     )
 
     runner = factory.build(backend=backend_name, model=config["model"] or None)

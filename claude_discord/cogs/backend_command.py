@@ -189,6 +189,13 @@ class BackendCommandCog(commands.Cog):
             )
             return
 
+        if not self._factory.is_backend_allowed(name):
+            await interaction.response.send_message(
+                f"Backend `{name}` is disabled by this deployment.",
+                ephemeral=True,
+            )
+            return
+
         resolved_scope, target_thread_id = self._resolve_scope(interaction, scope)
         if resolved_scope == SCOPE_THREAD and target_thread_id is None:
             await interaction.response.send_message(

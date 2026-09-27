@@ -888,6 +888,7 @@ for idle deadlines, attachment retries, credentials and startup rollback.
 | `DISCORD_BOT_TOKEN` | Your Discord bot token | (required) |
 | `DISCORD_CHANNEL_ID` | Channel ID for Claude chat | (required) |
 | `CCDB_BACKEND` | Backend to use: `claude`, `codex`, `local`, or `agui` | `claude` |
+| `CCDB_ALLOWED_BACKENDS` | Optional comma-separated deployment allowlist. Disallowed backends are rejected by `/backend` and by headless/session construction paths. Use this when only one backend satisfies the deployment's security boundary. | (all backends) |
 | `CCDB_COMMAND` | Path or name of the CLI binary (overrides `CLAUDE_COMMAND`). Used by the initial runner picked from `CCDB_BACKEND`; superseded by the two per-backend variables below when `/backend` switches at runtime. | _(auto: `claude` or `codex`)_ |
 | `CCDB_CLAUDE_COMMAND` | Explicit path to the Claude CLI binary. Used by `BackendFactory` whenever `/backend claude` is active, regardless of the initial `CCDB_BACKEND`. Falls back to `CLAUDE_COMMAND`, then `claude` (PATH). | (optional) |
 | `CCDB_CODEX_COMMAND` | Explicit path to the OpenAI Codex CLI binary. Required when running the bot under systemd (default service PATH does not include `~/.npm-global/bin`). Falls back to `codex` (PATH). | (optional) |

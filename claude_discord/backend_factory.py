@@ -54,6 +54,7 @@ class BackendFactory:
         api_secret: str | None = None,
         agui_url: str | None = None,
         agui_token: str | None = None,
+        allowed_backends: frozenset[str] | None = None,
     ) -> None:
         self.claude_command = claude_command or DEFAULT_COMMAND["claude"]
         self.codex_command = codex_command or DEFAULT_COMMAND["codex"]
@@ -68,6 +69,7 @@ class BackendFactory:
         self.api_secret = api_secret
         self.agui_url = agui_url
         self.agui_token = agui_token
+        self.allowed_backends = allowed_backends
 
     def command_for(self, backend: str) -> str:
         if backend == "claude":
@@ -88,6 +90,10 @@ class BackendFactory:
         """
         return DEFAULT_MODEL.get(backend, DEFAULT_MODEL["claude"])
 
+    def is_backend_allowed(self, backend: str) -> bool:
+        """Return whether this deployment permits constructing *backend*."""
+        return self.allowed_backends is None or backend in self.allowed_backends
+
     def build(
         self,
         *,
@@ -96,6 +102,8 @@ class BackendFactory:
         thread_id: int | None = None,
     ) -> SessionBackend:
         """Construct a fresh SessionBackend for the given backend/model."""
+        if not self.is_backend_allowed(backend):
+            raise ValueError(f"Backend {backend!r} is not allowed by this deployment")
         chosen_model = model or self.default_model_for(backend)
         command = self.command_for(backend)
         kwargs: dict[str, object] = {

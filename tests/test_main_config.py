@@ -74,6 +74,26 @@ class TestLoadConfig:
         assert config["timeout"] == "300"
         assert config["custom_cogs_dir"] == ""
         assert config["frontends"] == "discord"
+        assert config["allowed_backends"] == ""
+
+    def test_allowed_backends_is_read_from_environment(self) -> None:
+        from claude_discord.main import load_config
+
+        with (
+            patch("claude_discord.main.load_dotenv"),
+            patch.dict(
+                "os.environ",
+                {
+                    "DISCORD_BOT_TOKEN": "tok",
+                    "DISCORD_CHANNEL_ID": "111",
+                    "CCDB_ALLOWED_BACKENDS": "codex",
+                },
+                clear=True,
+            ),
+        ):
+            config = load_config()
+
+        assert config["allowed_backends"] == "codex"
 
     def test_discord_and_teams_frontends_are_loaded(self) -> None:
         from claude_discord.main import load_config

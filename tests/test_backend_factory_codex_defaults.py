@@ -7,6 +7,8 @@ not leak into Codex spawns (its valid levels differ).
 
 from __future__ import annotations
 
+import pytest
+
 from claude_code_core.codex_runner import CodexRunner
 from claude_code_core.runner import ClaudeRunner
 from claude_discord.backend_factory import DEFAULT_MODEL, BackendFactory
@@ -93,3 +95,16 @@ class TestAppendSystemPromptReachesEveryCliBackend:
     def test_absent_when_unset(self) -> None:
         args = _factory().build(backend="codex")._build_args("hi", session_id=None)
         assert not any(arg.startswith("developer_instructions=") for arg in args)
+
+
+class TestDeploymentBackendAllowlist:
+    def test_rejects_backends_outside_allowlist(self) -> None:
+        factory = _factory(allowed_backends=frozenset({"codex"}))
+
+        assert factory.is_backend_allowed("codex") is True
+        assert factory.is_backend_allowed("claude") is False
+        assert isinstance(factory.build(backend="codex"), CodexRunner)
+        with pytest.raises(ValueError, match="not allowed by this deployment"):
+            factory.build(backend="claude")
+        with pytest.raises(ValueError, match="not allowed by this deployment"):
+            factory.build(backend="local")
