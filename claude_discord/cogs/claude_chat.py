@@ -255,6 +255,11 @@ class ClaudeChatCog(commands.Cog):
         if self._allowed_user_ids is not None and message.author.id not in self._allowed_user_ids:
             return
 
+        # A message that @mentions another bot but not us is addressed to that
+        # bot (e.g. a PMO agent sharing the thread), not to this session.
+        if self._is_for_another_bot(message):
+            return
+
         # Inside a no-mention channel (or a thread under it) everything is for
         # Claude, and the session model applies: a channel message opens a
         # thread, a thread message continues that thread's session.
@@ -268,6 +273,13 @@ class ClaudeChatCog(commands.Cog):
         # Everywhere else: answer only when summoned, and answer *there*.
         if self._is_summoned(message):
             await self._handle_mention(message)
+
+    def _is_for_another_bot(self, message: discord.Message) -> bool:
+        """Return whether *message* @mentions some other bot and not this one."""
+        me = self.bot.user
+        if me is not None and me in message.mentions:
+            return False
+        return any(user.bot and user != me for user in message.mentions)
 
     def _is_no_mention_scope(self, channel: discord.abc.MessageableChannel) -> bool:
         """Return whether *channel* is one ccdb was invited to speak in freely.
