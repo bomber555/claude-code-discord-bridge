@@ -2383,3 +2383,72 @@ class TestGoalCommand:
 
         send_args = interaction.followup.send.call_args
         assert "◎" in send_args.args[0] or "goal" in send_args.args[0].lower()
+
+
+class TestOtherBotMentions:
+    """A message that @mentions only another bot is addressed to that bot, not to ccdb."""
+
+    def _make_cog(self) -> ClaudeChatCog:
+        bot = MagicMock()
+        bot.channel_id = 999
+        bot.user = MagicMock()
+        bot.user.id = 1111
+        bot.user.bot = True
+        repo = MagicMock()
+        repo.get = AsyncMock(return_value=None)
+        repo.save = AsyncMock()
+        runner = MagicMock()
+        runner.clone = MagicMock(return_value=MagicMock())
+        return ClaudeChatCog(bot=bot, repo=repo, runner=runner, channel_ids={111})
+
+    @staticmethod
+    def _user(user_id: int, *, bot: bool) -> MagicMock:
+        user = MagicMock()
+        user.id = user_id
+        user.bot = bot
+        return user
+
+    @staticmethod
+    def _thread_message(mentions: list) -> MagicMock:
+        msg = MagicMock(spec=discord.Message)
+        msg.author = MagicMock()
+        msg.author.bot = False
+        msg.author.id = 42
+        msg.type = discord.MessageType.default
+        msg.mentions = mentions
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 55555
+        thread.parent_id = 111
+        msg.channel = thread
+        msg.content = "@Hermes how is this going?"
+        msg.attachments = []
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_message_mentioning_only_another_bot_is_ignored(self) -> None:
+        cog = self._make_cog()
+        cog._handle_thread_reply = AsyncMock()
+
+        await cog.on_message(self._thread_message([self._user(2222, bot=True)]))
+
+        cog._handle_thread_reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_message_mentioning_another_bot_and_ccdb_is_handled(self) -> None:
+        cog = self._make_cog()
+        cog._handle_thread_reply = AsyncMock()
+
+        msg = self._thread_message([self._user(2222, bot=True), cog.bot.user])
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_awaited_once_with(msg)
+
+    @pytest.mark.asyncio
+    async def test_message_mentioning_a_human_is_handled(self) -> None:
+        cog = self._make_cog()
+        cog._handle_thread_reply = AsyncMock()
+
+        msg = self._thread_message([self._user(3333, bot=False)])
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_awaited_once_with(msg)
