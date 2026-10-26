@@ -42,6 +42,7 @@ from ..lounge import length_hint
 from ..relay import MODE_INTERRUPT, MODE_QUEUE, VALID_MODES, RelayGuard, build_relay_prompt
 from ..session_view import STATE_HISTORY, STATE_RUNNING, build_session_views
 from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
+from ..thread_title import ThreadTitler, normalize_title
 from . import ingest_manifest, teams_sync
 from .teams_store import TeamsVaultStore
 from .teams_sync import ThreadRef
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from ..database.notification_repo import NotificationRepository
     from ..database.repository import SessionRepository
     from ..database.resume_repo import PendingResumeRepository
+    from ..database.settings_repo import SettingsRepository
     from ..database.summary_repo import ThreadSummaryRepository
     from ..database.task_repo import TaskRepository
 
@@ -236,6 +238,7 @@ class ApiServer:
         ingest_repo: IngestResultRepository | None = None,
         summary_repo: ThreadSummaryRepository | None = None,
         claims_repo: ClaimRepository | None = None,
+        settings_repo: SettingsRepository | None = None,
         transcripts_path: str | None = None,
         ingest_require_complete: bool | None = None,
         teams_vault_root: str | None = None,
@@ -265,6 +268,9 @@ class ApiServer:
         self.ingest_repo = ingest_repo
         self.summary_repo = summary_repo
         self.claims_repo = claims_repo
+        # Session-requested thread titles. The titler reads settings_repo
+        # lazily, so wiring it after construction (setup_bridge) still works.
+        self.titler = ThreadTitler(settings_repo)
         # Where Claude Code transcripts live, for /api/search?body=1. Falls back
         # to the standard ~/.claude/projects location so body search is
         # Zero-Config wherever Claude Code has run.
@@ -340,6 +346,7 @@ class ApiServer:
         self.app.router.add_get("/api/search", self.search_sessions)
         self.app.router.add_get("/api/threads/{thread_id}/messages", self.get_thread_messages)
         self.app.router.add_post("/api/threads/{thread_id}/message", self.relay_thread_message)
+        self.app.router.add_post("/api/threads/{thread_id}/title", self.set_thread_title)
         # Session spawn route
         self.app.router.add_post("/api/spawn", self.spawn)
         # Authenticated external ingest route (browser extension / webhooks)
@@ -1445,6 +1452,54 @@ class ApiServer:
                 "messages": [_serialize_thread_message(m) for m in messages],
             }
         )
+
+    async def set_thread_title(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/title — a session renames its own thread.
+
+        Body (JSON):
+            title: The new one-line title (required; collapsed to one line,
+                cut to 100 characters).
+            override: Rename even though a human renamed the thread by hand
+                (optional, default ``false``). Send it only when the human
+                said so — it is how a human hands the title back.
+
+        Returns 200 ``renamed`` / ``unchanged``, 202 ``scheduled`` (Discord's
+        two-per-ten-minutes limit; the latest request is applied when the
+        window opens) or 409 ``locked`` (someone renamed the thread by hand).
+        """
+        try:
+            thread_id = int(request.match_info["thread_id"])
+        except (ValueError, KeyError):
+            return web.json_response({"error": "Invalid thread_id"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Body must be an object"}, status=400)
+        title = normalize_title(body.get("title"))
+        if not title:
+            return web.json_response({"error": "title is required"}, status=400)
+
+        channel: Any = self.bot.get_channel(thread_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(thread_id)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=404)
+        import discord as _discord
+
+        if not isinstance(channel, _discord.Thread):
+            return web.json_response({"error": "Only threads can be renamed"}, status=400)
+
+        try:
+            result = await self.titler.request(
+                channel, title, override=body.get("override") is True
+            )
+        except Exception as exc:  # forbidden, deleted thread, transient API error
+            return web.json_response({"error": str(exc)}, status=502)
+        status = {"scheduled": 202, "locked": 409}.get(result.status, 200)
+        return web.json_response(result.to_dict(), status=status)
 
     async def spawn(self, request: web.Request) -> web.Response:
         """POST /api/spawn — create a new Discord thread and optionally start Claude Code.
