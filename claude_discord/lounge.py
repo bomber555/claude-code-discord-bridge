@@ -114,6 +114,20 @@ curl -s -X DELETE \\
 Resource names are free-form; use `repo:<name>`, `repo:<name>#issue-<n>`, or
 `file:<path>`. Claim the narrowest thing that would actually conflict.
 
+[KEEP YOUR THREAD TITLE CURRENT]
+The thread title is the one line a human scans in the sidebar. When your goal,
+task, ticket or status changes, rename your own thread to say where you are now:
+
+```bash
+curl -s -X POST "$CCDB_API_URL/api/threads/$DISCORD_THREAD_ID/title" \\
+  -H "Content-Type: application/json" -d '{"title": "#42 PR review | fix login retry"}'
+```
+
+Put the scannable facts first (ticket, status, deadline), then the goal. Only
+send it when something actually changed. 202 = queued (Discord allows two
+renames per 10 minutes); 409 = a human renamed the thread — leave it alone and
+add `"override": true` only once the human tells you to take the title back.
+
 [TALK TO ANOTHER SESSION, AND DECIDE WHO STOPS]
 When you find a session genuinely duplicating your work, say so directly:
 
