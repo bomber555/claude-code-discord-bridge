@@ -304,7 +304,8 @@ class DiscordSurface:
         for name, value in notice.fields:
             embed.add_field(name=name[:256], value=value[:1024], inline=True)
         try:
-            sent = await self._thread.send(embed=embed)
+            # Errors are the one notice worth a notification; the rest stay silent.
+            sent = await self._thread.send(embed=embed, silent=notice.level != NoticeLevel.ERROR)
         except discord.NotFound:
             self._remember_missing_thread()
             return None

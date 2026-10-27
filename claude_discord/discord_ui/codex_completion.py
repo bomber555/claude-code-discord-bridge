@@ -74,7 +74,7 @@ async def post_completion(
         details.append("利用枠の残量とは別の数値です。")
     view = CompletionDetailsView("\n".join(details))
     try:
-        message = await thread.send(embed=completion_embed(model), view=view)
+        message = await thread.send(embed=completion_embed(model), view=view, silent=False)
         if status_mode not in {"auto", "on"}:
             return
         try:
@@ -125,6 +125,7 @@ async def post_claude_completion(
                 backend="Claude",
             ),
             view=view,
+            silent=False,
         )
         if usage_footer_enabled():
             try:

@@ -605,13 +605,13 @@ class ApiServer:
             thread = None
 
         if poll_obj:
-            await target.send(content=message, poll=poll_obj)  # type: ignore[union-attr]
+            await target.send(content=message, poll=poll_obj, silent=False)  # type: ignore[union-attr]
         elif fmt == "text":
-            await target.send(message)  # type: ignore[union-attr]
+            await target.send(message, silent=False)  # type: ignore[union-attr]
         else:
             title = data.get("title")
             embed = self._build_embed(message=message, title=title, color=data.get("color"))
-            await target.send(embed=embed)  # type: ignore[union-attr]
+            await target.send(embed=embed, silent=False)  # type: ignore[union-attr]
 
         result: dict[str, str] = {"status": "sent"}
         if thread is not None:

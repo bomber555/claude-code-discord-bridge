@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Running sessions stop buzzing your phone** — every bot message is now sent as Discord
+  `@silent` by default, so tool activity, interim text and the re-posted Stop button no longer
+  raise a push or an in-app banner. Completion cards, error notices, `/api/notify`, scheduled
+  notifications and any message that @mentions a user (questions, plan approval, permission
+  requests, the owner ping) still notify. Opt out with `CCDB_SILENT_BY_DEFAULT=false`.
+
 - **GPT-6 is selectable, and the Codex model list stops going stale** — `/model`'s Codex suggestions
   were a hardcoded quartet (`gpt-5.6-sol`, `gpt-5.5`, `gpt-5.5-codex`, `o4-mini`), two of which no
   longer exist, and the newest generation was not among them: picking GPT-6 meant knowing the slug

@@ -125,7 +125,7 @@ class TestNotify:
         channel = bot.get_channel.return_value
         resp = await client.post("/api/notify", json={"message": "Hello text!", "format": "text"})
         assert resp.status == 200
-        channel.send.assert_called_once_with("Hello text!")
+        channel.send.assert_called_once_with("Hello text!", silent=False)
 
     @pytest.mark.asyncio
     async def test_notify_no_channel(self, repo: NotificationRepository) -> None:
@@ -329,7 +329,7 @@ class TestNotifyThread:
         channel.create_thread.assert_called_once_with(
             name="PR Review", auto_archive_duration=THREAD_AUTO_ARCHIVE_MINUTES
         )
-        thread.send.assert_called_once_with("PR #42 needs review")
+        thread.send.assert_called_once_with("PR #42 needs review", silent=False)
         # Channel.send should NOT be called — message goes to thread
         channel.send.assert_not_called()
 
@@ -371,7 +371,7 @@ class TestNotifyThread:
             },
         )
         assert resp.status == 200
-        thread.send.assert_called_once_with("Auto text")
+        thread.send.assert_called_once_with("Auto text", silent=False)
 
     @pytest.mark.asyncio
     async def test_notify_without_thread_name_sends_to_channel(
@@ -384,7 +384,7 @@ class TestNotifyThread:
             json={"message": "Channel message", "format": "text"},
         )
         assert resp.status == 200
-        channel.send.assert_called_once_with("Channel message")
+        channel.send.assert_called_once_with("Channel message", silent=False)
         channel.create_thread.assert_not_called()
 
     @pytest.mark.asyncio
