@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import time
 from collections.abc import Callable, Coroutine
@@ -673,7 +674,21 @@ class EventProcessor:
 
                 # Schedule inbox classification as a background task (non-blocking).
                 # Only runs when inbox_repo is wired in (THREAD_INBOX_ENABLED=true).
-                if self._config.inbox_repo is not None and last_assistant_text:
+                # THREAD_INBOX_MODE=title reads the session's own thread title
+                # instead of spending a `claude -p` call on the final message.
+                if self._config.inbox_repo is not None and _inbox_mode() == "title":
+                    native = getattr(self._config.surface, "native_thread", None)
+                    asyncio.create_task(
+                        _title_update_inbox(
+                            thread_id=self._config.surface.thread_key,
+                            title=getattr(native, "name", None),
+                            last_message_url=last_assistant_url,
+                            inbox_repo=self._config.inbox_repo,
+                            dashboard=self._config.inbox_dashboard,
+                        ),
+                        name=f"inbox-title-{self._config.surface.thread_key}",
+                    )
+                elif self._config.inbox_repo is not None and last_assistant_text:
                     asyncio.create_task(
                         _classify_and_update_inbox(
                             thread_id=self._config.surface.thread_key,
@@ -1293,6 +1308,58 @@ async def _post_engine_status_footer(
 # ---------------------------------------------------------------------------
 # Inbox classification helper (module-level so it can be unit-tested)
 # ---------------------------------------------------------------------------
+
+
+_DEFAULT_TITLE_MARKERS = "待ち"
+
+
+def _inbox_mode() -> str:
+    """``THREAD_INBOX_MODE``: ``classify`` (default, one ``claude -p`` call) or ``title``."""
+    mode = os.getenv("THREAD_INBOX_MODE", "classify").strip().lower()
+    return "title" if mode == "title" else "classify"
+
+
+def _classify_by_title(title: str | None) -> str:
+    """Return ``waiting`` if the thread title carries a waiting marker, else ``done``.
+
+    Sessions that keep their own title current (``POST /api/threads/{id}/title``)
+    already state whether they are waiting on a human, e.g. ``#18 マージ待ち | …``.
+    Markers come from ``THREAD_INBOX_TITLE_MARKERS`` (comma-separated, default ``待ち``).
+    """
+    if not title:
+        return "done"
+    raw = os.getenv("THREAD_INBOX_TITLE_MARKERS", _DEFAULT_TITLE_MARKERS)
+    markers = [m.strip() for m in raw.split(",") if m.strip()]
+    return "waiting" if any(m in title for m in markers) else "done"
+
+
+async def _title_update_inbox(
+    thread_id: int,
+    title: str | None,
+    last_message_url: str | None,
+    inbox_repo: object,
+    dashboard: object | None,
+) -> None:
+    """Persist the inbox entry from the thread title (no model call)."""
+    from ..database.inbox_repo import ThreadInboxRepository
+    from ..discord_ui.thread_dashboard import ThreadStatusDashboard
+
+    assert isinstance(inbox_repo, ThreadInboxRepository)
+
+    try:
+        if _classify_by_title(title) == "waiting":
+            await inbox_repo.upsert(
+                thread_id=thread_id,
+                status="waiting",
+                confidence="high",
+                last_message_url=last_message_url,
+            )
+        else:
+            await inbox_repo.remove(thread_id)
+        if isinstance(dashboard, ThreadStatusDashboard):
+            await dashboard.refresh_inbox(inbox_repo)
+    except Exception:
+        logger.warning("inbox title update failed for thread_id=%d", thread_id, exc_info=True)
 
 
 async def _classify_and_update_inbox(

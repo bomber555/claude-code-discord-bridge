@@ -476,7 +476,7 @@ Behind the scenes:
 - **Timeout notifications** — Embed with elapsed time and resume guidance on timeout
 - **StatusLine display** — When Claude configures a `statusLine` (via `/statusline-setup`), the current status is shown in Discord after each session as a concise, always-visible indicator
 - **API provider indicator** — After each session, a `🔗 API: <provider>` line shows which endpoint the CLI is actually using (`Anthropic API (direct)`, `AWS Bedrock`, `Google Vertex AI`, `Azure AI Foundry`, or a custom base URL), derived from the real subprocess environment so CLI env overlays are reflected. Always shown — even without a configured `statusLine`.
-- **Thread inbox** — When `THREAD_INBOX_ENABLED=true`, the dashboard shows a persistent 📬 inbox section: after each session ends, Claude classifies the final message (`waiting` / `done` / `ambiguous`) via a lightweight `claude -p` call; threads awaiting your reply survive bot restarts and are surfaced until you respond
+- **Thread inbox** — When `THREAD_INBOX_ENABLED=true`, the dashboard shows a persistent 📬 inbox section: after each session ends, Claude classifies the final message (`waiting` / `done` / `ambiguous`) via a lightweight `claude -p` call; threads awaiting your reply survive bot restarts and are surfaced until you respond. With `THREAD_INBOX_MODE=title` no model is called: a thread whose title contains a marker (`THREAD_INBOX_TITLE_MARKERS`, default `待ち`) is listed — useful when sessions keep their own title current via `POST /api/threads/{id}/title`
 
 #### 🔌 Input & Skills
 - **Attachment support** — Text files auto-appended to prompt (up to 5 files, 200 KB each / 500 KB total; oversized files are truncated with a notice rather than skipped); images sent as Discord CDN URLs via `--input-format stream-json` (up to 4 × 5 MB); long pasted messages that Discord auto-converts to file attachments (without `content_type`) are handled via extension-based detection
@@ -924,6 +924,8 @@ for idle deadlines, attachment retries, credentials and startup rollback.
 | `CUSTOM_COGS_DIR` | Directory containing custom Cog files to load at startup (see [Custom Cogs](#custom-cogs-extend-without-forking)) | (optional) |
 | `CLAUDE_ALLOWED_TOOLS` | Comma-separated list of allowed tools for Claude CLI (legacy — prefer `CCDB_ALLOWED_TOOLS`) | (optional) |
 | `CLAUDE_CHANNEL_IDS` | Additional channel IDs (comma-separated) for multi-channel setup (legacy — prefer `CCDB_CHANNEL_IDS`) | (optional) |
+| `THREAD_INBOX_MODE` | How the inbox decides a thread is waiting: `classify` (one `claude -p` call per session end) or `title` (the thread title contains a marker; no model call) | `classify` |
+| `THREAD_INBOX_TITLE_MARKERS` | Comma-separated substrings that mark a title as waiting in `title` mode | `待ち` |
 | `THREAD_INBOX_ENABLED` | Enable the persistent thread inbox (classifies sessions as `waiting`/`done`/`ambiguous` via `claude -p`; shown in thread dashboard) | `false` |
 | `THREAD_AUTO_RENAME` | Auto-rename new thread titles using Claude AI — generates a short, descriptive title from the first user message via a background `claude -p` call (never delays session start) | `false` |
 | `CCDB_CLI_ENV_FILE` | Path to a `KEY=VALUE` file whose variables are merged into the CLI subprocess environment on every invocation. Changes take effect immediately without restarting the bot. Useful for temporary API routing (e.g., Azure Foundry) | (optional) |
