@@ -15,6 +15,7 @@ Issue: https://github.com/ebibibi/ebi-agent-chat-relay/issues/67
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,10 @@ if TYPE_CHECKING:
     from ..database.inbox_repo import InboxEntry, ThreadInboxRepository
 
 logger = logging.getLogger(__name__)
+
+_DASHBOARD_TITLE = "📊 Session Status"
+#: How far back to look for this bot's older cards when posting a new one.
+_STALE_CARD_SCAN_LIMIT = 200
 
 # Embed colours
 _COLOR_PROCESSING = 0x5865F2  # Discord blurple — all good, keep working
@@ -100,10 +105,27 @@ class ThreadStatusDashboard:
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """Post the initial (empty) dashboard embed."""
+        """Post a fresh dashboard embed and delete this bot's older ones.
+
+        ``on_ready`` fires on every gateway reconnect, not just at startup, so
+        without the cleanup each reconnect left one more frozen card behind.
+        """
         async with self._lock:
             embed = self._build_embed()
             self._dashboard_message = await self._channel.send(embed=embed)
+            await self._delete_stale_cards(self._dashboard_message)
+
+    async def _delete_stale_cards(self, keep: discord.Message) -> None:
+        """Delete this bot's earlier Session Status cards in recent channel history."""
+        try:
+            async for msg in self._channel.history(limit=_STALE_CARD_SCAN_LIMIT):
+                if msg.id == keep.id or msg.author.id != keep.author.id:
+                    continue
+                if any(e.title == _DASHBOARD_TITLE for e in msg.embeds):
+                    with contextlib.suppress(discord.HTTPException):
+                        await msg.delete()
+        except (discord.HTTPException, TypeError, AttributeError):
+            logger.debug("Could not clean up old dashboard cards", exc_info=True)
 
     async def set_state(
         self,
@@ -223,7 +245,7 @@ class ThreadStatusDashboard:
 
         if not has_live and not has_inbox:
             return discord.Embed(
-                title="📊 Session Status",
+                title=_DASHBOARD_TITLE,
                 description="No active sessions.",
                 color=_COLOR_IDLE,
             )
@@ -231,7 +253,7 @@ class ThreadStatusDashboard:
         any_live_waiting = any(t.state == ThreadState.WAITING_INPUT for t in self._threads.values())
         color = _COLOR_WAITING if (any_live_waiting or any_inbox_waiting) else _COLOR_PROCESSING
 
-        embed = discord.Embed(title="📊 Session Status", color=color)
+        embed = discord.Embed(title=_DASHBOARD_TITLE, color=color)
 
         # ── Live sessions ──────────────────────────────────────────────
         now = time.monotonic()
