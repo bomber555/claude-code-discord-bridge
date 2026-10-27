@@ -296,12 +296,41 @@ class TestBuildEmbed:
         assert embed.description is not None
         assert "No active sessions" in embed.description
 
-    def test_embed_shows_thread_mention(self) -> None:
-        dashboard, _ = _make_dashboard()
+    def test_embed_shows_thread_name_and_link(self) -> None:
+        """Mobile renders unloaded <#id> mentions as #unknown, so write the name as text."""
+        dashboard, channel = _make_dashboard()
+        channel.guild.id = 9
+        channel.guild.get_thread = MagicMock(return_value=MagicMock(name="t"))
+        channel.guild.get_thread.return_value.name = "#860 PO判断待ち CI短縮"
         dashboard._threads[123] = _thread_info(123, ThreadState.PROCESSING, "doing stuff")
         embed = dashboard._build_embed()
-        field_names = [f.name for f in embed.fields]
-        assert any("<#123>" in name for name in field_names)
+        field = embed.fields[0]
+        assert "#860 PO判断待ち CI短縮" in field.name
+        assert "<#" not in field.name
+        assert "https://discord.com/channels/9/123" in field.value
+
+    def test_embed_falls_back_when_thread_unknown(self) -> None:
+        dashboard, channel = _make_dashboard()
+        channel.guild.id = 9
+        channel.guild.get_thread = MagicMock(return_value=None)
+        dashboard._threads[123] = _thread_info(123, ThreadState.PROCESSING, "doing stuff")
+        embed = dashboard._build_embed()
+        assert "123" in embed.fields[0].name
+        assert "https://discord.com/channels/9/123" in embed.fields[0].value
+
+    def test_inbox_entry_shows_thread_name_and_link(self) -> None:
+        from claude_discord.database.inbox_repo import InboxEntry
+
+        dashboard, channel = _make_dashboard()
+        channel.guild.id = 9
+        channel.guild.get_thread = MagicMock(return_value=MagicMock())
+        channel.guild.get_thread.return_value.name = "#817 PO判断待ち 文字組み"
+        dashboard._inbox = [InboxEntry(55, "waiting", "high", None, "2026-10-27 15:55:51")]
+        embed = dashboard._build_embed()
+        entry = embed.fields[-1]
+        assert "#817 PO判断待ち 文字組み" in entry.name
+        assert "<#" not in entry.name
+        assert "https://discord.com/channels/9/55" in entry.value
 
     def test_embed_yellow_when_any_waiting(self) -> None:
         dashboard, _ = _make_dashboard()
