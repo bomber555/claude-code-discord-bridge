@@ -384,3 +384,20 @@ def _thread_info(
     description: str,
 ) -> _ThreadInfo:
     return _ThreadInfo(thread_id=thread_id, description=description, state=state)
+
+
+class TestInboxTimestamp:
+    def test_updated_at_renders_as_discord_timestamp(self) -> None:
+        """Shown in each viewer's own timezone, not the server's."""
+        from datetime import datetime
+
+        from claude_discord.database.inbox_repo import InboxEntry
+        from claude_discord.discord_ui.thread_dashboard import _discord_time
+
+        dashboard, _ = _make_dashboard()
+        dashboard._inbox = [InboxEntry(55, "waiting", "high", None, "2026-10-27 15:48:15")]
+        value = dashboard._build_embed().fields[-1].value
+        unix = int(datetime(2026, 10, 27, 15, 48, 15).astimezone().timestamp())
+        assert f"<t:{unix}:f>" in value
+        assert "2026-10-27 15:48:15" not in value
+        assert _discord_time("not a date") == "not a date"
