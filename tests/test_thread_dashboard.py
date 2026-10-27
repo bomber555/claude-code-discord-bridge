@@ -64,6 +64,40 @@ class TestInitialize:
         call_kwargs = channel.send.call_args.kwargs
         assert "embed" in call_kwargs
 
+    @pytest.mark.asyncio
+    async def test_initialize_deletes_older_own_cards(self) -> None:
+        """Each start/reconnect posts a fresh card and removes the stale ones."""
+        dashboard, channel = _make_dashboard()
+        bot_user = MagicMock(id=42)
+        new_msg = channel.send.return_value
+        new_msg.id = 100
+        new_msg.author = bot_user
+
+        def _card(msg_id: int, author_id: int, title: str) -> MagicMock:
+            m = MagicMock(spec=discord.Message)
+            m.id = msg_id
+            m.author = MagicMock(id=author_id)
+            m.embeds = [discord.Embed(title=title)]
+            m.delete = AsyncMock()
+            return m
+
+        own_old = _card(90, 42, "📊 Session Status")
+        own_older = _card(80, 42, "📊 Session Status")
+        other_bot = _card(70, 7, "📊 Session Status")
+        own_unrelated = _card(60, 42, "✅ 応答完了")
+
+        async def _history(**_kwargs: object):  # type: ignore[no-untyped-def]
+            for m in (new_msg, own_old, own_older, other_bot, own_unrelated):
+                yield m
+
+        channel.history = _history
+        await dashboard.initialize()
+
+        own_old.delete.assert_awaited_once()
+        own_older.delete.assert_awaited_once()
+        other_bot.delete.assert_not_awaited()
+        own_unrelated.delete.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # State transitions
