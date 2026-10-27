@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The thread inbox can read the title instead of calling Claude** — `THREAD_INBOX_MODE=title`
+  lists a thread as waiting when its title contains a marker (`THREAD_INBOX_TITLE_MARKERS`,
+  default `待ち`), e.g. `#18 マージ待ち | …` set by the session through the title API. No
+  `claude -p` call per session end. Replying still removes the thread from the inbox.
 - **Running sessions stop buzzing your phone** — every bot message is now sent as Discord
   `@silent` by default, so tool activity, interim text and the re-posted Stop button no longer
   raise a push or an in-app banner. Completion cards, error notices, `/api/notify`, scheduled
