@@ -20,7 +20,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import discord
 
@@ -229,6 +229,21 @@ class ThreadStatusDashboard:
         except (discord.HTTPException, RuntimeError):
             logger.debug("Failed to edit dashboard message", exc_info=True)
 
+    def _thread_label(self, thread_id: int) -> tuple[str, str]:
+        """Return the thread's name as plain text and a jump URL.
+
+        ``<#id>`` mentions are resolved by the client, and the mobile app shows
+        ``#unknown`` for threads it has not loaded yet — which is most of them.
+        """
+        guild: Any = getattr(self._channel, "guild", None)
+        guild_id = getattr(guild, "id", None)
+        thread: Any = None
+        with contextlib.suppress(Exception):
+            thread = guild.get_thread(thread_id) if guild is not None else None
+        name = getattr(thread, "name", None)
+        label = name[:80] if isinstance(name, str) and name else f"スレッド {thread_id}"
+        return label, f"https://discord.com/channels/{guild_id}/{thread_id}"
+
     def _prune_stale(self) -> None:
         """Remove threads that haven't changed state in ``_STALE_HOURS`` hours."""
         cutoff = time.monotonic() - _STALE_HOURS * 3600
@@ -265,9 +280,10 @@ class ThreadStatusDashboard:
             elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
             desc_preview = info.description[:60] + ("…" if len(info.description) > 60 else "")
 
+            name, url = self._thread_label(info.thread_id)
             embed.add_field(
-                name=f"{icon} <#{info.thread_id}>",
-                value=f"**{label}** · {elapsed_str} ago\n{desc_preview}",
+                name=f"{icon} {name}",
+                value=f"**{label}** · {elapsed_str} ago — [開く]({url})\n{desc_preview}",
                 inline=False,
             )
 
@@ -277,9 +293,10 @@ class ThreadStatusDashboard:
             for entry in self._inbox:
                 icon = "🟡" if entry.status == "waiting" else "❓"
                 conf = "" if entry.confidence == "high" else " _(uncertain)_"
-                link = f" — [→ jump]({entry.last_message_url})" if entry.last_message_url else ""
+                name, url = self._thread_label(entry.thread_id)
+                link = f" — [開く]({entry.last_message_url or url})"
                 embed.add_field(
-                    name=f"{icon} <#{entry.thread_id}>{conf}",
+                    name=f"{icon} {name}{conf}",
                     value=f"{entry.updated_at}{link}",
                     inline=False,
                 )
