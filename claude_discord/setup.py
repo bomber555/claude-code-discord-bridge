@@ -269,6 +269,14 @@ async def setup_bridge(
     if monitor_all_channels:
         logger.info("Monitor-all-channels enabled — bot will respond in ANY guild channel")
 
+    # Silent-by-default sends — CCDB_SILENT_BY_DEFAULT (on by default). Only
+    # completion, errors, notifications and @mentions reach the user's phone.
+    from .discord_ui.silent import install_silent_default, silent_by_default_enabled
+
+    if silent_by_default_enabled():
+        install_silent_default()
+        logger.info("Silent-by-default sends enabled (CCDB_SILENT_BY_DEFAULT)")
+
     # Mention-anywhere — fall back to CCDB_MENTION_ANYWHERE env var (on by default).
     # This is what turns claude_channel_ids into "channels that need no mention":
     # everywhere else the bot answers only when someone @mentions it.

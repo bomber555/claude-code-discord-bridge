@@ -117,7 +117,7 @@ class NotificationDispatchCog(commands.Cog):
                 await self.repo.mark_failed(notification_id, "No channel ID")
                 return
 
-            await channel.send(embed=self._build_embed(notification))
+            await channel.send(embed=self._build_embed(notification), silent=False)
             await self.repo.mark_sent(notification_id)
             logger.info("Notification sent: id=%d", notification_id)
         except Exception as exc:

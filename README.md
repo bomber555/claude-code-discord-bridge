@@ -913,6 +913,7 @@ for idle deadlines, attachment retries, credentials and startup rollback.
 | `CCDB_PR_COMPLETION_OWNER` | GitHub owner whose non-draft `session/<thread_id>` PRs trigger one automatic completion continuation. Requires authenticated `gh`; disabled when empty. | (optional) |
 | `DISCORD_OWNER_ID` | User ID to @-mention when Claude needs input | (optional) |
 | `COORDINATION_CHANNEL_ID` | Channel ID used as default fallback for AI Lounge channel | (optional) |
+| `CCDB_SILENT_BY_DEFAULT` | Send bot messages as `@silent`; only completion, errors, notifications and @mentions notify. Set `false` to notify on every message | `true` |
 | `CCDB_MENTION_ANYWHERE` | When true, an @mention summons Claude in any guild channel or thread; set `false` to listen only in the configured channels | `true` |
 | `CCDB_THREAD_CONTEXT_DAYS` | Days of the surrounding channel or thread's history prepended to the prompt when a mention wakes Claude there (`0` disables) | `7` |
 | `MENTION_ONLY_CHANNEL_IDS` | Comma-separated channel IDs carved back out of the no-mention set (legacy; not listing a channel now has the same effect) | (optional) |
