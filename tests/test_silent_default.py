@@ -126,3 +126,16 @@ async def test_completion_cards_notify() -> None:
         account_label=None,
     )
     assert thread.send.call_args.kwargs["silent"] is False
+
+
+async def test_session_status_dashboard_is_silent(recorder: _Recorder) -> None:
+    """The pinned 📊 Session Status card is re-posted on every start; it must not notify."""
+    from claude_discord.discord_ui.thread_dashboard import ThreadStatusDashboard
+
+    class _Channel(discord.abc.Messageable):
+        async def _get_channel(self) -> Any:  # pragma: no cover - never reached
+            return self
+
+    dashboard = ThreadStatusDashboard(_Channel())  # type: ignore[arg-type]
+    await dashboard.initialize()
+    assert recorder.calls[-1]["silent"] is True
