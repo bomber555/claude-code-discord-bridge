@@ -19,6 +19,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,20 @@ if TYPE_CHECKING:
     from ..database.inbox_repo import InboxEntry, ThreadInboxRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _discord_time(stored: str) -> str:
+    """Render a DB timestamp as ``<t:unix:f>`` so each viewer sees their own timezone.
+
+    ``thread_inbox.updated_at`` is ``datetime('now', 'localtime')`` — the
+    server's local time, naive — so it is interpreted in the same local zone.
+    """
+    try:
+        dt = datetime.strptime(stored, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return stored
+    return f"<t:{int(dt.astimezone().timestamp())}:f>"
+
 
 _DASHBOARD_TITLE = "📊 Session Status"
 #: How far back to look for this bot's older cards when posting a new one.
@@ -297,7 +312,7 @@ class ThreadStatusDashboard:
                 link = f" — [開く]({entry.last_message_url or url})"
                 embed.add_field(
                     name=f"{icon} {name}{conf}",
-                    value=f"{entry.updated_at}{link}",
+                    value=f"最終報告 {_discord_time(entry.updated_at)}{link}",
                     inline=False,
                 )
 
