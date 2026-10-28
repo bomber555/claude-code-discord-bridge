@@ -76,12 +76,18 @@ class ClaudeDiscordBot(commands.Bot):
         if isinstance(channel, discord.TextChannel):
             from .discord_ui.thread_dashboard import ThreadStatusDashboard
 
-            self.thread_dashboard = ThreadStatusDashboard(
-                channel=channel,
-                owner_id=self.owner_id,
-            )
-            await self.thread_dashboard.initialize()
-            logger.info("Thread status dashboard initialised in channel %d", self.channel_id)
+            if self.thread_dashboard is None:
+                self.thread_dashboard = ThreadStatusDashboard(
+                    channel=channel,
+                    owner_id=self.owner_id,
+                )
+                await self.thread_dashboard.initialize()
+                logger.info("Thread status dashboard initialised in channel %d", self.channel_id)
+            else:
+                # Gateway re-IDENTIFY: keep the one dashboard that cogs and
+                # running sessions already hold, so there is never a second card.
+                await self.thread_dashboard.rebind(channel)
+                logger.info("Thread status dashboard rebound in channel %d", self.channel_id)
 
             # If inbox is enabled, restore persistent entries from DB into dashboard.
             inbox_repo = getattr(self, "inbox_repo", None)
