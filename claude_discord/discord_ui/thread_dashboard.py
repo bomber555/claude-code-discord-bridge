@@ -17,11 +17,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -31,17 +33,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _discord_time(stored: str) -> str:
-    """Render a DB timestamp as ``<t:unix:f>`` so each viewer sees their own timezone.
+def _format_time(stored: str) -> str:
+    """Render a DB timestamp as ``10/28 18:59`` in ``CCDB_DISPLAY_TZ`` (default: server local).
 
     ``thread_inbox.updated_at`` is ``datetime('now', 'localtime')`` — the
-    server's local time, naive — so it is interpreted in the same local zone.
+    server's local time, naive — so it is read in the server's zone first.
     """
     try:
-        dt = datetime.strptime(stored, "%Y-%m-%d %H:%M:%S")
+        dt = datetime.strptime(stored, "%Y-%m-%d %H:%M:%S").astimezone()
     except (TypeError, ValueError):
         return stored
-    return f"<t:{int(dt.astimezone().timestamp())}:f>"
+    tz_name = os.getenv("CCDB_DISPLAY_TZ", "").strip()
+    if tz_name:
+        with contextlib.suppress(Exception):
+            dt = dt.astimezone(ZoneInfo(tz_name))
+    return f"{dt.month}/{dt.day} {dt:%H:%M}"
+
+
+def _fit(lines: list[str], limit: int) -> str:
+    """Join *lines*, dropping the tail with a count once *limit* would be exceeded."""
+    out: list[str] = []
+    size = 0
+    for i, line in enumerate(lines):
+        rest = len(lines) - i
+        tail = f"…ほか {rest} 件"
+        if size + len(line) + 1 + len(tail) > limit:
+            out.append(tail)
+            break
+        out.append(line)
+        size += len(line) + 1
+    return "\n".join(out)
+
+
+#: Discord's embed description limit.
+_DESCRIPTION_LIMIT = 4096
 
 
 _DASHBOARD_TITLE = "📊 Session Status"
@@ -257,6 +282,7 @@ class ThreadStatusDashboard:
             thread = guild.get_thread(thread_id) if guild is not None else None
         name = getattr(thread, "name", None)
         label = name[:80] if isinstance(name, str) and name else f"スレッド {thread_id}"
+        label = label.replace("[", "(").replace("]", ")")
         return label, f"https://discord.com/channels/{guild_id}/{thread_id}"
 
     def _prune_stale(self) -> None:
@@ -283,7 +309,9 @@ class ThreadStatusDashboard:
         any_live_waiting = any(t.state == ThreadState.WAITING_INPUT for t in self._threads.values())
         color = _COLOR_WAITING if (any_live_waiting or any_inbox_waiting) else _COLOR_PROCESSING
 
-        embed = discord.Embed(title=_DASHBOARD_TITLE, color=color)
+        # One line per thread in the description: embed field names cannot
+        # carry links, and fields cap the list at 25.
+        lines: list[str] = []
 
         # ── Live sessions ──────────────────────────────────────────────
         now = time.monotonic()
@@ -294,27 +322,27 @@ class ThreadStatusDashboard:
             mins, secs = divmod(elapsed, 60)
             elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
             desc_preview = info.description[:60] + ("…" if len(info.description) > 60 else "")
-
             name, url = self._thread_label(info.thread_id)
-            embed.add_field(
-                name=f"{icon} {name}",
-                value=f"**{label}** · {elapsed_str} ago — [開く]({url})\n{desc_preview}",
-                inline=False,
-            )
+            lines.append(f"{icon} [{name}]({url}) · {label} · {elapsed_str} ago")
+            if desc_preview:
+                lines.append(f"-# {desc_preview}")
 
         # ── Persistent inbox ───────────────────────────────────────────
         if has_inbox:
-            embed.add_field(name="📬 Inbox", value="\u200b", inline=False)
+            if lines:
+                lines.append("")
+            lines.append("**📬 Inbox**")
             for entry in self._inbox:
                 icon = "🟡" if entry.status == "waiting" else "❓"
                 conf = "" if entry.confidence == "high" else " _(uncertain)_"
                 name, url = self._thread_label(entry.thread_id)
-                link = f" — [開く]({entry.last_message_url or url})"
-                embed.add_field(
-                    name=f"{icon} {name}{conf}",
-                    value=f"最終報告 {_discord_time(entry.updated_at)}{link}",
-                    inline=False,
+                lines.append(
+                    f"{icon} [{name}]({entry.last_message_url or url}){conf} "
+                    f"{_format_time(entry.updated_at)}"
                 )
 
+        embed = discord.Embed(
+            title=_DASHBOARD_TITLE, description=_fit(lines, _DESCRIPTION_LIMIT), color=color
+        )
         embed.set_footer(text="Updates automatically · stale live entries removed after 4h")
         return embed
