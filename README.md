@@ -924,6 +924,7 @@ for idle deadlines, attachment retries, credentials and startup rollback.
 | `CUSTOM_COGS_DIR` | Directory containing custom Cog files to load at startup (see [Custom Cogs](#custom-cogs-extend-without-forking)) | (optional) |
 | `CLAUDE_ALLOWED_TOOLS` | Comma-separated list of allowed tools for Claude CLI (legacy — prefer `CCDB_ALLOWED_TOOLS`) | (optional) |
 | `CLAUDE_CHANNEL_IDS` | Additional channel IDs (comma-separated) for multi-channel setup (legacy — prefer `CCDB_CHANNEL_IDS`) | (optional) |
+| `CCDB_DISPLAY_TZ` | IANA timezone for times shown in the Session Status card (e.g. `Asia/Tokyo`) | server local time |
 | `THREAD_INBOX_MODE` | How the inbox decides a thread is waiting: `classify` (one `claude -p` call per session end) or `title` (the thread title contains a marker; no model call) | `classify` |
 | `THREAD_INBOX_TITLE_MARKERS` | Comma-separated substrings that mark a title as waiting in `title` mode | `待ち` |
 | `THREAD_INBOX_ENABLED` | Enable the persistent thread inbox (classifies sessions as `waiting`/`done`/`ambiguous` via `claude -p`; shown in thread dashboard) | `false` |

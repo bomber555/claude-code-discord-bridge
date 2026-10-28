@@ -304,10 +304,8 @@ class TestBuildEmbed:
         channel.guild.get_thread.return_value.name = "#860 PO判断待ち CI短縮"
         dashboard._threads[123] = _thread_info(123, ThreadState.PROCESSING, "doing stuff")
         embed = dashboard._build_embed()
-        field = embed.fields[0]
-        assert "#860 PO判断待ち CI短縮" in field.name
-        assert "<#" not in field.name
-        assert "https://discord.com/channels/9/123" in field.value
+        assert "[#860 PO判断待ち CI短縮](https://discord.com/channels/9/123)" in embed.description
+        assert "<#" not in embed.description
 
     def test_embed_falls_back_when_thread_unknown(self) -> None:
         dashboard, channel = _make_dashboard()
@@ -315,8 +313,7 @@ class TestBuildEmbed:
         channel.guild.get_thread = MagicMock(return_value=None)
         dashboard._threads[123] = _thread_info(123, ThreadState.PROCESSING, "doing stuff")
         embed = dashboard._build_embed()
-        assert "123" in embed.fields[0].name
-        assert "https://discord.com/channels/9/123" in embed.fields[0].value
+        assert "[スレッド 123](https://discord.com/channels/9/123)" in embed.description
 
     def test_inbox_entry_shows_thread_name_and_link(self) -> None:
         from claude_discord.database.inbox_repo import InboxEntry
@@ -327,10 +324,8 @@ class TestBuildEmbed:
         channel.guild.get_thread.return_value.name = "#817 PO判断待ち 文字組み"
         dashboard._inbox = [InboxEntry(55, "waiting", "high", None, "2026-10-27 15:55:51")]
         embed = dashboard._build_embed()
-        entry = embed.fields[-1]
-        assert "#817 PO判断待ち 文字組み" in entry.name
-        assert "<#" not in entry.name
-        assert "https://discord.com/channels/9/55" in entry.value
+        assert "[#817 PO判断待ち 文字組み](https://discord.com/channels/9/55)" in embed.description
+        assert "開く" not in embed.description
 
     def test_embed_yellow_when_any_waiting(self) -> None:
         dashboard, _ = _make_dashboard()
@@ -387,17 +382,32 @@ def _thread_info(
 
 
 class TestInboxTimestamp:
-    def test_updated_at_renders_as_discord_timestamp(self) -> None:
-        """Shown in each viewer's own timezone, not the server's."""
+    def test_time_is_short_and_in_display_tz(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """'10/28 00:48' at the end of the line, in CCDB_DISPLAY_TZ, no year, 24h."""
         from datetime import datetime
+        from zoneinfo import ZoneInfo
 
         from claude_discord.database.inbox_repo import InboxEntry
-        from claude_discord.discord_ui.thread_dashboard import _discord_time
+        from claude_discord.discord_ui.thread_dashboard import _format_time
 
+        monkeypatch.setenv("CCDB_DISPLAY_TZ", "Asia/Tokyo")
         dashboard, _ = _make_dashboard()
         dashboard._inbox = [InboxEntry(55, "waiting", "high", None, "2026-10-27 15:48:15")]
-        value = dashboard._build_embed().fields[-1].value
-        unix = int(datetime(2026, 10, 27, 15, 48, 15).astimezone().timestamp())
-        assert f"<t:{unix}:f>" in value
-        assert "2026-10-27 15:48:15" not in value
-        assert _discord_time("not a date") == "not a date"
+        line = dashboard._build_embed().description.splitlines()[-1]
+        local = datetime(2026, 10, 27, 15, 48, 15).astimezone()
+        expected = local.astimezone(ZoneInfo("Asia/Tokyo"))
+        assert line.endswith(f" {expected.month}/{expected.day} {expected:%H:%M}")
+        assert "2026" not in line
+        assert "最終報告" not in line
+        assert _format_time("not a date") == "not a date"
+
+    def test_long_inbox_is_truncated_within_embed_limit(self) -> None:
+        from claude_discord.database.inbox_repo import InboxEntry
+
+        dashboard, channel = _make_dashboard()
+        channel.guild.get_thread = MagicMock(return_value=MagicMock())
+        channel.guild.get_thread.return_value.name = "x" * 80
+        dashboard._inbox = [
+            InboxEntry(i, "waiting", "high", None, "2026-10-27 15:48:15") for i in range(200)
+        ]
+        assert len(dashboard._build_embed().description) <= 4096

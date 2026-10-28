@@ -176,8 +176,7 @@ async def test_dashboard_shows_inbox_section(repo):
     embed_call = channel.send.return_value.edit.call_args
     embed = channel.send.call_args[1]["embed"] if embed_call is None else embed_call[1]["embed"]
 
-    field_names = [f.name for f in embed.fields]
-    assert any("📬" in name for name in field_names), f"Inbox section missing: {field_names}"
+    assert "📬" in (embed.description or ""), f"Inbox section missing: {embed.description}"
 
 
 @pytest.mark.asyncio
@@ -194,8 +193,7 @@ async def test_dashboard_inbox_cleared_after_remove(repo):
     await dashboard.refresh_inbox(repo)
 
     embed = channel.send.return_value.edit.call_args[1]["embed"]
-    field_names = [f.name for f in embed.fields]
-    assert not any("555" in name for name in field_names)
+    assert "555" not in (embed.description or "")
 
 
 @pytest.mark.asyncio
@@ -206,5 +204,4 @@ async def test_refresh_inbox_without_entries_shows_no_inbox_section(repo):
     await dashboard.refresh_inbox(repo)
 
     embed = channel.send.return_value.edit.call_args[1]["embed"]
-    field_names = [f.name for f in embed.fields]
-    assert not any("📬" in name for name in field_names)
+    assert "📬" not in (embed.description or "")
