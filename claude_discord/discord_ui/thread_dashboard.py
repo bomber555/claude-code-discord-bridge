@@ -145,15 +145,31 @@ class ThreadStatusDashboard:
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """Post a fresh dashboard embed and delete this bot's older ones.
+        """Post a fresh dashboard embed and delete this bot's older ones."""
+        async with self._lock:
+            await self._post_card()
 
-        ``on_ready`` fires on every gateway reconnect, not just at startup, so
-        without the cleanup each reconnect left one more frozen card behind.
+    async def rebind(self, channel: discord.TextChannel) -> None:
+        """Point the dashboard at *channel* after a gateway re-IDENTIFY.
+
+        ``on_ready`` fires again after a READY, and discord.py rebuilds its
+        Guild cache then, so the old channel's ``guild.get_thread()`` stops
+        seeing renames and new threads. Keep this object (its live rows, and
+        every reference cogs and running sessions hold) and swap the channel.
         """
         async with self._lock:
-            embed = self._build_embed()
-            self._dashboard_message = await self._channel.send(embed=embed)
-            await self._delete_stale_cards(self._dashboard_message)
+            self._channel = channel
+            if self._dashboard_message is None:
+                # The first post failed; retry it as on_ready used to.
+                await self._post_card()
+            else:
+                await self._refresh_dashboard()
+
+    async def _post_card(self) -> None:
+        """Post the card and delete stale ones. Caller holds ``self._lock``."""
+        embed = self._build_embed()
+        self._dashboard_message = await self._channel.send(embed=embed)
+        await self._delete_stale_cards(self._dashboard_message)
 
     async def _delete_stale_cards(self, keep: discord.Message) -> None:
         """Delete this bot's earlier Session Status cards in recent channel history."""
