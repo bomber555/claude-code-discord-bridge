@@ -526,6 +526,14 @@ async def setup_bridge(
         )
         logger.info("Registered OllamaCommandCog")
 
+    # --- MergeCommandCog (off unless CCDB_MERGE_REPO and CCDB_MERGE_USER_IDS are set) ---
+    from .cogs.merge_command import MergeCommandCog, MergeConfig
+
+    merge_config = MergeConfig.from_env()
+    if merge_config is not None:
+        await bot.add_cog(MergeCommandCog(bot, merge_config))  # type: ignore[arg-type]
+        logger.info("Registered MergeCommandCog (repo=%s)", merge_config.repo)
+
     # --- AskCommandCog (auto-discovered: only when anonymization rules exist) ---
     # Zero-config by the same rule as the gateway itself — no rules file, no
     # command, because a /ask that forwards real names is worse than none.
