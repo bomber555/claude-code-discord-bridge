@@ -346,6 +346,7 @@ class ApiServer:
         self.app.router.add_get("/api/search", self.search_sessions)
         self.app.router.add_get("/api/threads/{thread_id}/messages", self.get_thread_messages)
         self.app.router.add_post("/api/threads/{thread_id}/message", self.relay_thread_message)
+        self.app.router.add_post("/api/threads/{thread_id}/merge-request", self.request_merge)
         self.app.router.add_post("/api/threads/{thread_id}/title", self.set_thread_title)
         # Session spawn route
         self.app.router.add_post("/api/spawn", self.spawn)
@@ -1049,6 +1050,51 @@ class ApiServer:
             {"status": "delivered", "thread_id": thread_id, "mode": mode, "hop": hop},
             status=202,
         )
+
+    async def request_merge(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/merge-request — post a merge button in a thread.
+
+        Lets a session ask a person to merge. It only posts the button: pressing
+        it is the sole path to the merge (see ``cogs/merge_command.py``), so this
+        endpoint must stay unable to merge.
+
+        Body (JSON):
+            pr: Pull request number.
+
+        Returns 201 with ``blockers`` (why a press would be refused right now),
+        404 for an unknown thread, 502 if the PR cannot be read, and 503 when
+        ``/merge`` is not configured.
+        """
+        try:
+            thread_id = int(request.match_info["thread_id"])
+        except (ValueError, KeyError):
+            return web.json_response({"error": "Invalid thread_id"}, status=400)
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        pr = data.get("pr") if isinstance(data, dict) else None
+        if not isinstance(pr, int) or isinstance(pr, bool) or pr < 1:
+            return web.json_response({"error": "pr must be a positive integer"}, status=400)
+
+        from ..cogs.merge_command import GitHubError, MergeCommandCog
+
+        cog: MergeCommandCog | None = self.bot.cogs.get("MergeCommandCog")  # type: ignore[assignment]
+        if cog is None:
+            return web.json_response({"error": "/merge is not configured"}, status=503)
+
+        thread = self.bot.get_channel(thread_id)
+        if thread is None:
+            try:
+                thread = await self.bot.fetch_channel(thread_id)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=404)
+
+        try:
+            blockers = await cog.post_request(thread, pr)
+        except GitHubError as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        return web.json_response({"status": "posted", "pr": pr, "blockers": blockers}, status=201)
 
     def _require_claims_repo(self) -> web.Response | None:
         """Return a 503 response if claims_repo is not configured."""

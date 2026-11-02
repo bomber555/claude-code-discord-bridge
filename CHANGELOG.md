@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Merge a pull request by pressing a button in Discord** — `/merge <pr>` shows the PR, its checks
+  and a button; sessions can post the same button with
+  `POST /api/threads/{id}/merge-request`. Only `CCDB_MERGE_USER_IDS` can press it, and the merge is
+  pinned to the head SHA that was on screen. Off until `CCDB_MERGE_REPO` is set.
 - **The thread inbox can read the title instead of calling Claude** — `THREAD_INBOX_MODE=title`
   lists a thread as waiting when its title contains a marker (`THREAD_INBOX_TITLE_MARKERS`,
   default `待ち`), e.g. `#18 マージ待ち | …` set by the session through the title API. No

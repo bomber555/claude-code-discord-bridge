@@ -87,6 +87,7 @@ _HELP_CATEGORY: dict[str, str | None] = {
     "backend": "🤖 Model",
     "engine-status": "🤖 Model",
     "ollama": "🤖 Model",  # manage the runtime behind the `local` backend
+    "merge": "🔧 Advanced",  # show a pull request with a merge button
     "ask": "🤖 Model",  # one anonymized question to an external model
     "effort": "⚡ Effort",
     "tools-show": "🔧 Advanced",
