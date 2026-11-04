@@ -29,10 +29,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+# pyjwt ships in extras; a Discord-only install must still start.
+jwt: Any
 try:
-    import jwt
-except ImportError:  # pyjwt ships in extras; a Discord-only install must still start
-    jwt = None  # type: ignore[assignment]
+    import jwt as _pyjwt
+
+    jwt = _pyjwt
+except ImportError:
+    jwt = None
 
 logger = logging.getLogger(__name__)
 
