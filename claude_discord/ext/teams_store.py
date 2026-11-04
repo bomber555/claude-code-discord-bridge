@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 
@@ -35,7 +36,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SYNC_SUBDIR = "teams"
 ORGS_FILE = "orgs.json"
-_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+# One Teams attachment, decoded. Diagnostic zips shared in threads are routinely
+# 30MB+; at 25MB they stayed pending forever. The browser extension
+# (teams-channel-exporter, MAX_EMBED_BYTES) uses the same value and batches its
+# pushes so one request carries at most one file of this size.
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 
 def default_vault_root(working_dir: str | Path | None = None) -> Path:
@@ -95,7 +100,7 @@ class TeamsVaultStore:
             if str(k).strip() and str(v).strip()
         }
 
-    def org_for(self, ref: ThreadRef) -> str:
+    def org_for(self, ref: ThreadRef, authors: Iterable[str] | None = None) -> str:
         """The company this thread files under, learning the label once.
 
         ``orgs.json`` wins over the label the client sent: the file is the
@@ -103,13 +108,82 @@ class TeamsVaultStore:
         override it would undo every correction on the next sync. A team the file
         does not know yet is recorded from the client's label, so labelling one
         conversation files every later thread of that company by itself.
+
+        With neither, ``authors`` (passed only when a folder is about to be
+        created) lets the vault answer — see :meth:`infer_org`. The answer is
+        recorded like a typed label, so a wrong guess is fixed in one place.
         """
         mapped = self.read_orgs().get(ref.team, "")
         if mapped:
             return mapped
         if ref.org:
             self._remember_org(ref.team, ref.org)
-        return ref.org
+            return ref.org
+        if authors is None:
+            return ""
+        inferred = self.infer_org(ref, authors)
+        if inferred:
+            logger.info("Filed Teams thread of team %s under %s by inference", ref.team, inferred)
+            self._remember_org(ref.team, inferred)
+        return inferred
+
+    def infer_org(self, ref: ThreadRef, authors: Iterable[str]) -> str:
+        """Guess the company from what is already filed, or ``""`` when unsure.
+
+        Two kinds of evidence, strongest first:
+
+        1. Another thread of the same team already sits in a company folder —
+           typically dragged there by hand, which is a filing decision for the
+           team that orgs.json never heard about.
+        2. The thread's people. A chat gets its own derived team, so the people
+           are the only link to earlier conversations. A person counts only if
+           every filed thread they appear in is under one company; the operator,
+           present everywhere, drops out on their own. All counting people must
+           agree.
+
+        Rule 2 needs at least two companies on disk: with one, the operator
+        looks unique to it and every new conversation would be filed there.
+        Anything ambiguous returns ``""`` — an unfiled thread is visibly
+        unfiled, a misfiled one sits in a customer's folder looking correct.
+        """
+        team_orgs: set[str] = set()
+        person_orgs: dict[str, set[str]] = {}
+        companies: set[str] = set()
+        for company_dir, thread_dir in self._filed_thread_dirs():
+            meta = self._read_json(thread_dir / "thread.json")
+            if not meta:
+                continue
+            company = company_dir.name
+            companies.add(company)
+            if str(meta.get("team", "")).lower() == ref.team:
+                team_orgs.add(company)
+            for person in meta.get("participants") or []:
+                person_orgs.setdefault(str(person).strip(), set()).add(company)
+        if len(team_orgs) == 1:
+            return next(iter(team_orgs))
+        if team_orgs or len(companies) < 2:
+            return ""
+        votes = {
+            next(iter(person_orgs[a]))
+            for a in {str(a).strip() for a in authors}
+            if a and len(person_orgs.get(a, ())) == 1
+        }
+        return next(iter(votes)) if len(votes) == 1 else ""
+
+    def _filed_thread_dirs(self) -> list[tuple[Path, Path]]:
+        """``(company folder, thread folder)`` for every thread filed one level in."""
+        if not self.root.is_dir():
+            return []
+        out: list[tuple[Path, Path]] = []
+        for entry in sorted(self.root.iterdir()):
+            if not entry.is_dir() or entry.name.startswith(".") or (entry / "thread.json").exists():
+                continue
+            out.extend(
+                (entry, child)
+                for child in sorted(entry.iterdir())
+                if child.is_dir() and (child / "thread.json").exists()
+            )
+        return out
 
     def _remember_org(self, team: str, org: str) -> None:
         path = self.root / ORGS_FILE
@@ -182,7 +256,7 @@ class TeamsVaultStore:
                 return entry
         return None
 
-    def ensure_thread_dir(self, ref: ThreadRef) -> Path:
+    def ensure_thread_dir(self, ref: ThreadRef, authors: Iterable[str] | None = None) -> Path:
         """Find the thread's folder, creating it under its company on first sync.
 
         An existing folder is never moved. Re-filing is the user's call — Teams
@@ -193,7 +267,7 @@ class TeamsVaultStore:
         if existing is not None:
             return existing
         parent = self.root
-        org_dir = teams_sync.org_dirname(self.org_for(ref))
+        org_dir = teams_sync.org_dirname(self.org_for(ref, authors))
         if org_dir:
             contained = self._contained(self.root, self.root / org_dir)
             if contained is None:
@@ -314,7 +388,9 @@ class TeamsVaultStore:
         note.parent.mkdir(parents=True, exist_ok=True)
 
         previous = self.latest_chain(thread_dir).get(msg.mid)
-        edited = previous is not None and previous.get("hash") != msg.hash
+        edited = previous is not None and teams_sync.is_edit(
+            str(previous.get("hash") or ""), msg.hash
+        )
         rev = int(previous.get("rev", 1)) + 1 if previous else 1
         first_synced = now
         if note.exists():
@@ -323,6 +399,8 @@ class TeamsVaultStore:
             first_synced = self._existing_first_synced(note) or now
 
         saved, pending, unavailable = self._save_attachments(thread_dir, msg)
+        declared = {teams_sync.safe_attachment_name(a.name) for a in msg.attachments}
+        kept = tuple(sorted(self._attachments_present(thread_dir, msg.mid) - declared))
         note.write_text(
             teams_sync.render_message(
                 msg,
@@ -333,6 +411,7 @@ class TeamsVaultStore:
                 last_synced_at=now,
                 pending=pending,
                 unavailable=unavailable,
+                kept_attachments=kept,
             ),
             encoding="utf-8",
         )
@@ -419,7 +498,7 @@ class TeamsVaultStore:
             except (binascii.Error, ValueError):
                 pending.append({"mid": msg.mid, "name": name, "reason": "base64が不正"})
                 continue
-            if len(blob) > _MAX_ATTACHMENT_BYTES:
+            if len(blob) > MAX_ATTACHMENT_BYTES:
                 pending.append(
                     {
                         "mid": msg.mid,

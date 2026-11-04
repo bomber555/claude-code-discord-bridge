@@ -37,22 +37,43 @@ from aiohttp import web
 from claude_code_core.thread_search import run_thread_search
 from claude_code_core.transcript_search import default_transcripts_root
 
+from ..backend_settings import ALL_BACKENDS
 from ..discord_ui.file_sender import send_file_blobs
 from ..lounge import length_hint
 from ..relay import MODE_INTERRUPT, MODE_QUEUE, VALID_MODES, RelayGuard, build_relay_prompt
 from ..session_view import STATE_HISTORY, STATE_RUNNING, build_session_views
+from ..teams_exporter import REPLY_DRAFT_PRIORITY, TEAMS_EXPORTER_TAG, is_reply_draft_request
+from ..thread_marker import (
+    MAX_THREAD_NAME_LENGTH,
+    OUTCOME_ACTION,
+    OUTCOME_CANDIDATE,
+    OUTCOME_REVIEW,
+    OUTCOME_WAITING,
+    family_code,
+    set_outcome_thread_name,
+)
 from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
+from ..thread_status import request_thread_outcome
 from ..thread_title import ThreadTitler, normalize_title
 from . import ingest_manifest, teams_sync
+from .attention_api import handle_attention
+from .entra_auth import EntraTokenVerifier, looks_like_jwt
+from .restart_api import handle_cancel_restart, handle_get_restart, handle_reserve_restart
+from .teams_store import MAX_ATTACHMENT_BYTES as TEAMS_MAX_ATTACHMENT_BYTES
 from .teams_store import TeamsVaultStore
 from .teams_sync import ThreadRef
+from .wait_api import handle_cancel_wait, handle_create_wait, handle_list_waits
 
 if TYPE_CHECKING:
     import discord
     from discord.ext.commands import Bot
 
+    from claude_code_core.attention import AttentionParams
+    from claude_code_core.attention_repo import HumanActivityRepository
+
     from ..database.claims_repo import ClaimRepository
     from ..database.ingest_repo import IngestResultRepository
+    from ..database.lineage_repo import ThreadLineageRepository
     from ..database.lounge_repo import LoungeRepository
     from ..database.notification_repo import NotificationRepository
     from ..database.repository import SessionRepository
@@ -60,6 +81,7 @@ if TYPE_CHECKING:
     from ..database.settings_repo import SettingsRepository
     from ..database.summary_repo import ThreadSummaryRepository
     from ..database.task_repo import TaskRepository
+    from ..database.wait_repo import WaitRepository
 
 # /api/ingest — authenticated spawn for untrusted external clients (browser
 # extensions, mobile shortcuts, webhooks) that may carry file attachments.
@@ -77,15 +99,20 @@ _MAX_INGEST_UNZIP_MEMBERS = 5000
 # single request from buffering an unbounded amount of base64 in memory.
 _MAX_SPAWN_ATTACHMENTS = 10
 _MAX_SPAWN_TOTAL_BYTES = 25 * 1024 * 1024
-_MAX_DISCORD_THREAD_NAME_LENGTH = 100
+_MAX_DISCORD_THREAD_NAME_LENGTH = MAX_THREAD_NAME_LENGTH
 
 # /api/sessions and /api/threads/{id}/messages — cross-session observability.
 # Bounded so one session peeking at another can never pull an unbounded amount
 # of history into its own context window.
+_SLOT_ACTIONS = ("prioritize", "defer", "pause")
 _DEFAULT_SESSION_LIMIT = 20
+# How long a mark request waits for the rename before answering "queued".
+_MARK_WAIT_SECONDS = 5.0
 _MAX_SESSION_LIMIT = 100
 _DEFAULT_THREAD_MESSAGE_LIMIT = 30
 _MAX_THREAD_MESSAGE_LIMIT = 100
+_DEFAULT_CHANNEL_THREAD_LIMIT = 50
+_MAX_CHANNEL_THREAD_LIMIT = 100
 _DEFAULT_SEARCH_LIMIT = 15
 _MAX_SEARCH_LIMIT = 50
 # How far back to scan the lounge when attaching each thread's latest note.
@@ -118,7 +145,12 @@ def _serialize_thread_message(message: Any) -> dict[str, object]:
 # ingest (a full conversation thread plus base64 attachments). Base64 inflates
 # the decoded payload ~4/3, so the body limit must exceed the decoded
 # attachment cap by that factor, plus headroom for the surrounding JSON.
-_DEFAULT_MAX_BODY_BYTES = _MAX_INGEST_TOTAL_BYTES * 4 // 3 + 1024 * 1024
+# /api/teams/sync/push carries one attachment of up to MAX_ATTACHMENT_BYTES
+# as base64 plus the message JSON, so the limit covers whichever is larger.
+_DEFAULT_MAX_BODY_BYTES = max(
+    _MAX_INGEST_TOTAL_BYTES * 4 // 3 + 1024 * 1024,
+    TEAMS_MAX_ATTACHMENT_BYTES * 4 // 3 + 16 * 1024 * 1024,
+)
 # Characters allowed in a saved attachment filename; everything else → "_".
 _UNSAFE_FILENAME_RE = re.compile(r"[^\w.\-]+")
 
@@ -181,6 +213,23 @@ def _decode_spawn_attachments(
 
 logger = logging.getLogger(__name__)
 
+# A Discord user/role mention (<@123>, <@!123>, <@&123>).
+_DISCORD_MENTION = re.compile(r"<@[!&]?\d+>")
+
+
+# A scheduled task may pin a model only together with a backend. Model ids are
+# backend-specific — "gpt-6-astra" means nothing to the Claude CLI — so a model
+# pinned on its own would be handed to whichever backend happened to be active
+# when the task fired, and fail there instead of here.
+_MODEL_WITHOUT_BACKEND_ERROR = (
+    "model requires backend: a model id belongs to one backend, so pin both or neither."
+)
+
+
+def _unknown_backend_error(name: str) -> str:
+    """Error text naming the backend that was rejected and the ones accepted."""
+    return f"Unknown backend {name!r}. Choose: {', '.join(ALL_BACKENDS)}."
+
 
 def _sanitize_log(value: object) -> str:
     """Sanitize user-provided values before writing to logs.
@@ -226,6 +275,7 @@ class ApiServer:
         port: int = 8080,
         api_secret: str | None = None,
         ingest_token: str | None = None,
+        ingest_entra: EntraTokenVerifier | None = None,
         ingest_host: str | None = None,
         ingest_port: int | None = None,
         max_body_bytes: int | None = None,
@@ -239,6 +289,7 @@ class ApiServer:
         summary_repo: ThreadSummaryRepository | None = None,
         claims_repo: ClaimRepository | None = None,
         settings_repo: SettingsRepository | None = None,
+        lineage_repo: ThreadLineageRepository | None = None,
         transcripts_path: str | None = None,
         ingest_require_complete: bool | None = None,
         teams_vault_root: str | None = None,
@@ -257,6 +308,9 @@ class ApiServer:
         self.port = port
         self.api_secret = api_secret
         self.ingest_token = ingest_token
+        # Optional second way in for the external routes: an Entra ID access
+        # token for one app, scope and allowlist of users (see entra_auth.py).
+        self.ingest_entra = ingest_entra
         self.ingest_host = ingest_host
         self.ingest_port = ingest_port
         self.max_body_bytes = max_body_bytes or _DEFAULT_MAX_BODY_BYTES
@@ -271,6 +325,21 @@ class ApiServer:
         # Session-requested thread titles. The titler reads settings_repo
         # lazily, so wiring it after construction (setup_bridge) still works.
         self.titler = ThreadTitler(settings_repo)
+        self.lineage_repo = lineage_repo
+        # Human-activity metering (GET /api/attention). Wired by
+        # BridgeComponents.apply_to_api_server; 503 until then.
+        self.attention_repo: HumanActivityRepository | None = None
+        # Waits (POST /api/waits): wired by BridgeComponents; 503 until then.
+        self.wait_repo: WaitRepository | None = None
+        # Everything setup_bridge built. The Ebi AI Console reads its session
+        # wiring (backend factory, settings, ledger) from here to run agents
+        # in conversations of its own. None until apply_to_api_server.
+        self.components: Any = None
+        # The Ebi AI Console's own conversations (set when the console starts).
+        # An agent running in one marks its outcome through the same
+        # /api/threads/{id}/done|waiting|review|action as a chat thread.
+        self.console_conversations: Any = None
+        self.attention_params: AttentionParams | None = None
         # Where Claude Code transcripts live, for /api/search?body=1. Falls back
         # to the standard ~/.claude/projects location so body search is
         # Zero-Config wherever Claude Code has run.
@@ -321,6 +390,7 @@ class ApiServer:
         self.external_app = self._build_external_app()
         self._runner: web.AppRunner | None = None
         self._ext_runner: web.AppRunner | None = None
+        self._console: Any = None
 
     def _setup_routes(self) -> None:
         self.app.router.add_get("/api/health", self.health)
@@ -341,13 +411,29 @@ class ApiServer:
         self.app.router.add_post("/api/claims", self.create_claim)
         self.app.router.add_get("/api/claims", self.list_claims)
         self.app.router.add_delete("/api/claims", self.delete_claim)
+        # Waits — end the turn, resume when a probe says done (requires wait_repo)
+        self.app.router.add_post("/api/waits", self.create_wait)
+        self.app.router.add_get("/api/waits", self.list_waits)
+        self.app.router.add_delete("/api/waits/{id}", self.cancel_wait)
         # Cross-session observability routes (requires session_repo)
         self.app.router.add_get("/api/sessions", self.list_sessions)
+        self.app.router.add_get("/api/slots", self.list_slots)
+        self.app.router.add_post("/api/slots/{thread_id}/{action}", self.slot_action)
+        self.app.router.add_get("/api/restart", self.get_restart)
+        self.app.router.add_post("/api/restart", self.reserve_restart)
+        self.app.router.add_delete("/api/restart", self.cancel_restart)
+        self.app.router.add_get("/api/attention", self.get_attention)
         self.app.router.add_get("/api/search", self.search_sessions)
         self.app.router.add_get("/api/threads/{thread_id}/messages", self.get_thread_messages)
         self.app.router.add_post("/api/threads/{thread_id}/message", self.relay_thread_message)
+        self.app.router.add_get("/api/channels/{channel_id}/threads", self.list_channel_threads)
         self.app.router.add_post("/api/threads/{thread_id}/merge-request", self.request_merge)
         self.app.router.add_post("/api/threads/{thread_id}/title", self.set_thread_title)
+        self.app.router.add_post("/api/threads/{thread_id}/done", self.mark_thread_done)
+        self.app.router.add_post("/api/threads/{thread_id}/candidate", self.mark_thread_done)
+        self.app.router.add_post("/api/threads/{thread_id}/waiting", self.mark_thread_waiting)
+        self.app.router.add_post("/api/threads/{thread_id}/review", self.mark_thread_review)
+        self.app.router.add_post("/api/threads/{thread_id}/action", self.mark_thread_action)
         # Session spawn route
         self.app.router.add_post("/api/spawn", self.spawn)
         # Authenticated external ingest route (browser extension / webhooks)
@@ -472,6 +558,10 @@ class ApiServer:
         await site.start()
         logger.info("REST API started: http://%s:%d", self.host, self.port)
         await self._start_external_listener()
+        # Ebi AI Console: its own listener, off unless CCDB_CONSOLE_PORT is set.
+        from ..console.server import maybe_start_console
+
+        self._console = await maybe_start_console(self)
 
     async def _start_external_listener(self) -> None:
         """Start the ingest-only listener on a non-localhost interface.
@@ -483,11 +573,12 @@ class ApiServer:
         """
         if not (self.ingest_host and self.ingest_port):
             return
-        if not self.ingest_token:
+        if not self.ingest_token and self.ingest_entra is None:
             logger.warning(
-                "External ingest listener requested (%s:%d) but no ingest_token "
-                "is set — refusing to expose an unauthenticated surface. "
-                "Set CCDB_INGEST_TOKEN to enable it.",
+                "External ingest listener requested (%s:%d) but neither an "
+                "ingest_token nor Entra ID auth is set — refusing to expose an "
+                "unauthenticated surface. Set CCDB_INGEST_TOKEN or "
+                "CCDB_INGEST_ENTRA_* to enable it.",
                 self.ingest_host,
                 self.ingest_port,
             )
@@ -510,6 +601,8 @@ class ApiServer:
             await self._runner.cleanup()
         if self._ext_runner:
             await self._ext_runner.cleanup()
+        if self._console is not None:
+            await self._console.stop()
 
     async def health(self, request: web.Request) -> web.Response:
         """GET /api/health — health check, including delivery backlog.
@@ -568,6 +661,9 @@ class ApiServer:
         if not channel_id:
             return web.json_response({"error": "No channel specified"}, status=400)
 
+        if (sent := await self._notify_console(channel_id, message)) is not None:
+            return sent
+
         raw_channel = self.bot.get_channel(channel_id)
         if not raw_channel:
             try:
@@ -619,6 +715,31 @@ class ApiServer:
             result["thread_id"] = str(thread.id)  # type: ignore[union-attr]
             result["thread_name"] = thread.name  # type: ignore[union-attr]
         return web.json_response(result)
+
+    async def _notify_console(self, channel_id: object, message: str) -> web.Response | None:
+        """Post *message* into an Ebi AI Console conversation, if that is the target.
+
+        Console conversations share the thread-key space with Discord threads,
+        so a reminder job keeps working when its conversation moves to the
+        console. Returns None when *channel_id* is not a console conversation.
+        """
+        conversations = self.console_conversations
+        if conversations is None:
+            return None
+        try:
+            thread_key = int(channel_id)  # type: ignore[call-overload]
+        except (TypeError, ValueError):
+            return None
+        if await conversations.get(thread_key) is None:
+            return None
+
+        from ..console.surface import AGENT_AUTHOR
+
+        # A Discord mention means nothing in the console; it would show as raw markup.
+        text = _DISCORD_MENTION.sub("", message).strip() or message
+        await conversations.append(thread_key, author=AGENT_AUTHOR, is_bot=True, content=text)
+        logger.info("notify: posted to console conversation %d", thread_key)
+        return web.json_response({"status": "sent", "frontend": "console"})
 
     async def schedule(self, request: web.Request) -> web.Response:
         """POST /api/schedule — schedule a notification for later."""
@@ -716,6 +837,14 @@ class ApiServer:
                 instead of creating a new one.
             one_shot: (optional, default false) If true, auto-disable after
                 a single execution.
+            backend: (optional) Pin the task to one backend — one of
+                ``claude``, ``codex``, ``local``, ``agui``, ``pi``. Omit it and
+                the task keeps following whatever backend is active for its
+                thread/global setting when it fires.
+            model: (optional) Pin the model too. Only accepted together with
+                ``backend``, because a model id belongs to one backend —
+                ``gpt-6-astra`` means nothing to the Claude CLI. Omit it and
+                the pinned backend uses its configured ``/model``.
         """
         if err := self._require_task_repo():
             return err
@@ -742,6 +871,15 @@ class ApiServer:
 
         one_shot = bool(data.get("one_shot", False))
 
+        raw_backend = data.get("backend")
+        backend = None if raw_backend is None else str(raw_backend)
+        if backend is not None and backend not in ALL_BACKENDS:
+            return web.json_response({"error": _unknown_backend_error(backend)}, status=400)
+        raw_model = data.get("model")
+        model = None if raw_model is None else str(raw_model)
+        if model is not None and backend is None:
+            return web.json_response({"error": _MODEL_WITHOUT_BACKEND_ERROR}, status=400)
+
         try:
             task_id = await self.task_repo.create(  # type: ignore[union-attr]
                 name=str(data["name"]),
@@ -754,6 +892,8 @@ class ApiServer:
                 anchor_minute=anchor_minute,
                 thread_id=thread_id,
                 one_shot=one_shot,
+                backend=backend,
+                model=model,
             )
         except Exception as exc:
             # Most likely a UNIQUE constraint violation on name
@@ -793,6 +933,12 @@ class ApiServer:
             interval_seconds: int
             working_dir: str
             anchor_time: ``"HH:MM"`` to set, or ``null`` to clear
+            backend: backend name to pin, or ``null`` to clear the pin and
+                resume following the thread/global setting
+            model: model id to pin, or ``null`` to clear it. A pinned model
+                needs a pinned backend — whether it arrives in this request or
+                is already stored — so clearing the backend while a model is
+                still pinned is rejected rather than silently stranding it.
             next_run_at: float (epoch) — manual schedule reset
         """
         if err := self._require_task_repo():
@@ -833,6 +979,30 @@ class ApiServer:
                 patch_kwargs["anchor_hour"] = h
                 patch_kwargs["anchor_minute"] = m
 
+        # backend/model: a name to pin, null to clear. Validated as the pair the
+        # task ends up with, not as the fields this request happens to carry, so
+        # dropping the backend out from under a stored model is caught too.
+        if "backend" in data or "model" in data:
+            task = await self.task_repo.get(task_id)  # type: ignore[union-attr]
+            if task is None:
+                return web.json_response({"error": "Task not found"}, status=404)
+            effective_backend = task.get("backend")
+            effective_model = task.get("model")
+            if "backend" in data:
+                raw = data["backend"]
+                effective_backend = None if raw is None else str(raw)
+                if effective_backend is not None and effective_backend not in ALL_BACKENDS:
+                    return web.json_response(
+                        {"error": _unknown_backend_error(effective_backend)}, status=400
+                    )
+                patch_kwargs["backend"] = effective_backend
+            if "model" in data:
+                raw = data["model"]
+                effective_model = None if raw is None else str(raw)
+                patch_kwargs["model"] = effective_model
+            if effective_model is not None and effective_backend is None:
+                return web.json_response({"error": _MODEL_WITHOUT_BACKEND_ERROR}, status=400)
+
         if patch_kwargs:
             result = await self.task_repo.update(task_id, **patch_kwargs)  # type: ignore[union-attr]
             updated = updated or result
@@ -861,6 +1031,45 @@ class ApiServer:
                 status=503,
             )
         return None
+
+    def _require_wait_repo(self) -> web.Response | None:
+        if self.wait_repo is None:
+            return web.json_response({"error": "wait_repo is not configured"}, status=503)
+        return None
+
+    async def create_wait(self, request: web.Request) -> web.Response:
+        """POST /api/waits — resume this thread when a probe says done (see wait_api)."""
+        if err := self._require_wait_repo():
+            return err
+        return await handle_create_wait(request, self.wait_repo, self.session_repo)  # type: ignore[arg-type]
+
+    async def list_waits(self, request: web.Request) -> web.Response:
+        """GET /api/waits — active waits, optionally for one thread."""
+        if err := self._require_wait_repo():
+            return err
+        return await handle_list_waits(request, self.wait_repo)  # type: ignore[arg-type]
+
+    async def cancel_wait(self, request: web.Request) -> web.Response:
+        """DELETE /api/waits/{id} — cancel an active wait."""
+        if err := self._require_wait_repo():
+            return err
+        return await handle_cancel_wait(request, self.wait_repo)  # type: ignore[arg-type]
+
+    async def reserve_restart(self, request: web.Request) -> web.Response:
+        """POST /api/restart — hold the queue and restart once idle (see restart_api)."""
+        return await handle_reserve_restart(request, self.bot, self.resume_repo)
+
+    async def get_restart(self, request: web.Request) -> web.Response:
+        """GET /api/restart — the reserved restart's state."""
+        return await handle_get_restart(request)
+
+    async def cancel_restart(self, request: web.Request) -> web.Response:
+        """DELETE /api/restart — cancel the reservation; the queue resumes."""
+        return await handle_cancel_restart(request)
+
+    async def get_attention(self, request: web.Request) -> web.Response:
+        """GET /api/attention — estimated operator attention (see attention_api)."""
+        return await handle_attention(request, self.attention_repo, self.attention_params)
 
     async def get_lounge(self, request: web.Request) -> web.Response:
         """GET /api/lounge — list recent AI Lounge messages.
@@ -1014,6 +1223,18 @@ class ApiServer:
             logger.info("Relay refused (%s → %s): %s", from_thread, thread_id, refusal)
             return web.json_response({"error": refusal}, status=429)
 
+        prompt = build_relay_prompt(text=text, from_thread=from_thread, hop=hop)
+
+        # An Ebi AI Console conversation shares the thread-key space but has no
+        # Discord channel behind it: looking one up would fail with "Unknown Channel".
+        from ..console.host import ConsoleSessionHost
+
+        console = getattr(self.bot, "console_sessions", None)
+        if isinstance(console, ConsoleSessionHost) and await console.owns(thread_id):
+            return await self._relay_to_console(
+                console, thread_id, prompt, from_thread=from_thread, mode=mode, hop=hop, now=now
+            )
+
         from ..cogs.claude_chat import ClaudeChatCog
 
         cog: ClaudeChatCog | None = self.bot.cogs.get("ClaudeChatCog")  # type: ignore[assignment]
@@ -1027,11 +1248,16 @@ class ApiServer:
             try:
                 thread = await self.bot.fetch_channel(thread_id)
             except Exception as exc:
-                return web.json_response({"error": str(exc)}, status=404)
+                return web.json_response(
+                    {
+                        "error": f"Thread {thread_id} not found (no Discord thread and no "
+                        f"Console conversation): {exc}"
+                    },
+                    status=404,
+                )
         if not isinstance(thread, _discord.Thread):
             return web.json_response({"error": "Target must be a thread"}, status=400)
 
-        prompt = build_relay_prompt(text=text, from_thread=from_thread, hop=hop)
         self.relay_guard.record(from_thread=from_thread, to_thread=thread_id, now=now)
 
         # Run in the background so the sender is not blocked for the length of
@@ -1047,7 +1273,67 @@ class ApiServer:
             hop,
         )
         return web.json_response(
-            {"status": "delivered", "thread_id": thread_id, "mode": mode, "hop": hop},
+            {
+                "status": "delivered",
+                "thread_id": thread_id,
+                "mode": mode,
+                "hop": hop,
+                "frontend": "discord",
+            },
+            status=202,
+        )
+
+    async def _relay_to_console(
+        self,
+        console: Any,
+        thread_id: int,
+        prompt: str,
+        *,
+        from_thread: int,
+        mode: str,
+        hop: int,
+        now: float,
+    ) -> web.Response:
+        """Deliver a relay into a Console conversation and report what actually happened.
+
+        Unlike the Discord path this is awaited: recording the message and queuing
+        the turn is quick, so a failure reaches the sender as an error status
+        instead of disappearing into a background task after a 202.
+        """
+        try:
+            delivery = await console.relay(
+                thread_id,
+                prompt,
+                f"thread {from_thread}",
+                interrupt=mode == MODE_INTERRUPT,
+            )
+        except LookupError:
+            return web.json_response(
+                {"error": f"Console conversation {thread_id} not found"}, status=404
+            )
+        except Exception as exc:
+            logger.exception("Relay to console conversation %s failed", thread_id)
+            return web.json_response(
+                {"error": f"Message not delivered to console conversation {thread_id}: {exc}"},
+                status=500,
+            )
+        self.relay_guard.record(from_thread=from_thread, to_thread=thread_id, now=now)
+        logger.info(
+            "Relayed message: thread %s → console conversation %s (mode=%s, hop=%s)",
+            from_thread,
+            thread_id,
+            mode,
+            hop,
+        )
+        return web.json_response(
+            {
+                "status": "delivered",
+                "thread_id": thread_id,
+                "mode": mode,
+                "hop": hop,
+                "frontend": "console",
+                "delivery": delivery,
+            },
             status=202,
         )
 
@@ -1332,12 +1618,20 @@ class ApiServer:
 
         active = self._active_sessions()
         thread_ids = {r.thread_id for r in records} | {s.thread_id for s in active}
+        lineage = []
+        if self.lineage_repo is not None:
+            try:
+                lineage = await self.lineage_repo.list_all()
+            except Exception:
+                # Who is running is the answer; who spawned whom is the garnish.
+                logger.exception("Could not read spawn lineage")
         views = build_session_views(
             records=records,
             active=active,
             running_thread_ids=self._running_thread_ids(),
             lounge_messages=lounge_messages,
             thread_names=self._thread_names(thread_ids),
+            lineage=lineage,
         )
 
         if request.rel_url.query.get("state") == STATE_RUNNING:
@@ -1346,6 +1640,61 @@ class ApiServer:
             views = [v for v in views if v["thread_id"] != exclude_thread]
 
         return web.json_response({"sessions": views})
+
+    async def list_slots(self, request: web.Request) -> web.Response:
+        """GET /api/slots — who holds a session slot and who is queued for one.
+
+        Running entries come first, then the queue in the order it will start.
+        """
+        from ..session_slots import get_session_slots
+
+        slots = get_session_slots()
+        if slots is None:
+            return web.json_response({"max_slots": None, "running": [], "waiting": []})
+        snapshot = [info.as_dict() for info in slots.snapshot()]
+        return web.json_response(
+            {
+                "max_slots": slots.max_slots,
+                "held": slots.held,
+                "running": [i for i in snapshot if i["state"] == "running"],
+                "waiting": [i for i in snapshot if i["state"] == "waiting"],
+            }
+        )
+
+    async def slot_action(self, request: web.Request) -> web.Response:
+        """POST /api/slots/{thread_id}/{prioritize|defer|pause} — steer the queue.
+
+        ``prioritize`` and ``defer`` reorder a waiting thread.  ``pause``
+        interrupts a running thread so a waiting one gets its slot; the paused
+        session resumes automatically once nobody is ahead of it.
+        """
+        from ..session_slots import SlotActionError, get_session_slots
+
+        action = request.match_info["action"]
+        if action not in _SLOT_ACTIONS:
+            return web.json_response(
+                {"error": f"action must be one of {', '.join(_SLOT_ACTIONS)}"}, status=400
+            )
+        try:
+            thread_id = int(request.match_info["thread_id"])
+        except ValueError:
+            return web.json_response({"error": "thread_id must be an integer"}, status=400)
+        slots = get_session_slots()
+        if slots is None:
+            return web.json_response({"error": "no session limit is configured"}, status=503)
+        try:
+            if action == "prioritize":
+                slots.prioritize(thread_id)
+            elif action == "defer":
+                slots.defer(thread_id)
+            else:
+                await slots.pause(thread_id)
+        except SlotActionError as exc:
+            status = 404 if exc.reason in ("not_queued", "not_running") else 409
+            return web.json_response({"error": str(exc), "reason": exc.reason}, status=status)
+        return web.json_response(
+            {"status": "ok", "action": action, "position": slots.position(thread_id)}
+        )
 
     async def search_sessions(self, request: web.Request) -> web.Response:
         """GET /api/search — find a past thread by keyword.
@@ -1499,6 +1848,222 @@ class ApiServer:
             }
         )
 
+    async def list_channel_threads(self, request: web.Request) -> web.Response:
+        """GET /api/channels/{channel_id}/threads — list a channel's public threads.
+
+        Read-only and localhost-only, like ``/api/threads/{id}/messages``, which
+        reads the body of whatever this returns. It never joins a thread, and it
+        only answers for a channel in the configured guild that the bot can read.
+
+        Query params:
+            state: ``active``, ``archived`` or ``all`` (default ``all``).
+            limit: Page size (default 50, max 100).
+            cursor: ``next_cursor`` of the previous page.
+
+        Active threads come first (newest first), then archived threads (most
+        recently archived first). IDs are strings: snowflakes do not survive a
+        JSON double. A thread archived between two pages can appear twice, so
+        callers should de-duplicate by ``id``. ``next_cursor`` is ``null`` on the
+        last page; a non-null cursor may lead to an empty page.
+        """
+        try:
+            channel_id = int(request.match_info["channel_id"])
+        except (ValueError, KeyError):
+            return web.json_response({"error": "Invalid channel_id"}, status=400)
+
+        query = request.rel_url.query
+        state = query.get("state", "all")
+        if state not in ("active", "archived", "all"):
+            return web.json_response({"error": "state must be active, archived or all"}, status=400)
+        try:
+            limit = max(
+                1,
+                min(
+                    _MAX_CHANNEL_THREAD_LIMIT,
+                    int(query.get("limit", _DEFAULT_CHANNEL_THREAD_LIMIT)),
+                ),
+            )
+        except ValueError:
+            return web.json_response({"error": "limit must be an integer"}, status=400)
+
+        stage = "archived" if state == "archived" else "active"
+        after_id: int | None = None
+        before: datetime | None = None
+        if "cursor" in query:
+            stage, _, position = query["cursor"].partition(":")
+            try:
+                if stage == "active" and state != "archived":
+                    after_id = int(position)
+                elif stage == "archived" and state != "active":
+                    before = datetime.fromisoformat(position) if position else None
+                else:
+                    raise ValueError(stage)
+            except ValueError:
+                return web.json_response({"error": "Invalid cursor"}, status=400)
+
+        channel: Any = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=404)
+
+        guild = getattr(channel, "guild", None)
+        guild_id = self._guild_id()
+        if guild is None or guild.id != guild_id:
+            return web.json_response({"error": "Channel is outside this guild"}, status=403)
+        if not hasattr(channel, "archived_threads"):
+            return web.json_response({"error": "Channel cannot have threads"}, status=400)
+        # A bot is told about channels it cannot open, and Discord's guild-wide
+        # active-thread list is not narrowed by channel permission.
+        permissions = channel.permissions_for(guild.me)
+        if not (permissions.view_channel and permissions.read_message_history):
+            return web.json_response({"error": "Bot cannot read this channel"}, status=403)
+
+        threads: list[Any] = []
+        next_cursor: str | None = None
+        try:
+            if stage == "active":
+                active = sorted(
+                    (
+                        t
+                        for t in await guild.active_threads()
+                        if t.parent_id == channel_id and not t.is_private()
+                    ),
+                    key=lambda t: t.id,
+                    reverse=True,
+                )
+                if after_id is not None:
+                    active = [t for t in active if t.id < after_id]
+                threads = active[:limit]
+                if len(active) > limit:
+                    next_cursor = f"active:{threads[-1].id}"
+            remaining = limit - len(threads)
+            if next_cursor is None and state != "active":
+                if remaining == 0:
+                    next_cursor = "archived:"
+                else:
+                    fetched = [
+                        t
+                        async for t in channel.archived_threads(
+                            limit=remaining + 1, before=before, private=False
+                        )
+                    ]
+                    page = fetched[:remaining]
+                    if len(fetched) > remaining:
+                        next_cursor = f"archived:{page[-1].archive_timestamp.isoformat()}"
+                    threads.extend(t for t in page if not t.is_private())
+        except Exception as exc:  # forbidden, transient API error
+            return web.json_response({"error": str(exc)}, status=502)
+
+        return web.json_response(
+            {
+                "guild_id": str(guild_id),
+                "channel_id": str(channel_id),
+                "threads": [
+                    {
+                        "id": str(t.id),
+                        "name": t.name,
+                        "parent_id": str(t.parent_id),
+                        "archived": bool(t.archived),
+                        "url": f"https://discord.com/channels/{guild_id}/{t.id}",
+                    }
+                    for t in threads
+                ],
+                "next_cursor": next_cursor,
+            }
+        )
+
+    async def mark_thread_done(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/done (or ``/candidate``) — propose closing the thread.
+
+        Prefixes the thread title with the completion-candidate marker (``🏁``
+        by default). The agent calls this at the end of a turn whose work it
+        believes finished. It is a proposal, never a verdict: the console keeps
+        the thread listed under "completion candidates" until a human marks it
+        done (``✅``), because an agent's guess that the work is over must not
+        make an unfinished request disappear from the human's screen. ``/done``
+        keeps its name for the prompts that already call it. The chat cog
+        removes the marker again when a human replies in the thread.
+
+        Idempotent: an already-marked thread is not renamed, because Discord
+        allows a thread only two renames per ten minutes.
+
+        Returns ``{"status": "marked" | "unchanged", "thread_name": ...}``, or
+        202 ``{"status": "queued", ...}`` when the rename is waiting out
+        Discord's rate limit and will land on its own; 404 for an unknown
+        channel, 400 when it is not a thread, 502 when the rename fails.
+        """
+        return await self._mark_thread_outcome(request, OUTCOME_CANDIDATE)
+
+    async def mark_thread_waiting(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/waiting — the next move is the human's.
+
+        Prefixes the title with the waiting marker (``❓`` by default), replacing
+        a done or error marker. Same contract as :meth:`mark_thread_done`,
+        including removal on the human's next reply.
+        """
+        return await self._mark_thread_outcome(request, OUTCOME_WAITING)
+
+    async def mark_thread_review(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/review — a deliverable awaits the human's look.
+
+        ``👀`` by default. Same contract as :meth:`mark_thread_done`.
+        """
+        return await self._mark_thread_outcome(request, OUTCOME_REVIEW)
+
+    async def mark_thread_action(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/action — the human has a task to do (a todo).
+
+        ``📋`` by default: something only they can do outside the chat. Same
+        contract as :meth:`mark_thread_done`.
+        """
+        return await self._mark_thread_outcome(request, OUTCOME_ACTION)
+
+    async def _mark_thread_outcome(self, request: web.Request, outcome: str) -> web.Response:
+        try:
+            thread_id = int(request.match_info["thread_id"])
+        except (ValueError, KeyError):
+            return web.json_response({"error": "Invalid thread_id"}, status=400)
+
+        conversations = self.console_conversations
+        if conversations is not None and await conversations.get(thread_id) is not None:
+            from ..console.surface import apply_outcome
+
+            marked = await apply_outcome(conversations, thread_id, outcome)
+            logger.info("console conversation %d marked %s", thread_id, outcome)
+            return web.json_response({"status": "marked", "thread_name": marked})
+
+        import discord as _discord
+
+        channel = self.bot.get_channel(thread_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(thread_id)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=404)
+        if not isinstance(channel, _discord.Thread):
+            return web.json_response({"error": "Channel is not a thread"}, status=400)
+
+        current = channel.name or ""
+        marked = set_outcome_thread_name(current, outcome)
+        if marked == current:
+            return web.json_response({"status": "unchanged", "thread_name": current})
+        # A thread may be renamed twice per ten minutes and discord.py sleeps
+        # out the limit, so the rename runs in the background.  Waiting for it
+        # would hold the caller's curl for up to ten minutes and make it
+        # report a failure for a mark that does land later.
+        rename = request_thread_outcome(channel, outcome)
+        done, _ = await asyncio.wait({rename}, timeout=_MARK_WAIT_SECONDS)
+        if not done:
+            logger.info("thread %d mark %s queued behind the rename rate limit", thread_id, outcome)
+            return web.json_response({"status": "queued", "thread_name": marked}, status=202)
+        error = rename.result()
+        if error is not None:
+            return web.json_response({"error": str(error)}, status=502)
+        logger.info("thread %d marked %s: %r -> %r", thread_id, outcome, current, marked)
+        return web.json_response({"status": "marked", "thread_name": marked})
+
     async def set_thread_title(self, request: web.Request) -> web.Response:
         """POST /api/threads/{thread_id}/title — a session renames its own thread.
 
@@ -1564,6 +2129,10 @@ class ApiServer:
                 (optional; defaults to ``true``).  When ``false``, only the
                 thread and seed message are created — a Claude session will
                 start when a user replies in the thread.
+            parent_thread_id: The calling thread (optional). Both titles then
+                carry that thread's family code — ``🤖K2`` on the child,
+                ``🌳K2`` on the parent — and the link is recorded so
+                ``GET /api/sessions`` can report it without parsing titles.
             user_id: Discord user to add to the new thread (optional), so the
                 thread appears in their joined list instead of having to be
                 found in the channel. Mirrors what ``/api/ingest`` does for the
@@ -1621,6 +2190,18 @@ class ApiServer:
         # Validated here rather than swallowed downstream: a typo'd user_id is a
         # caller bug and should say so, while a Discord-side failure to add the
         # member is only a visibility miss and must never fail the spawn.
+        raw_parent_id = data.get("parent_thread_id")
+        parent_thread_id: int | None = None
+        if raw_parent_id is not None:
+            try:
+                parent_thread_id = int(raw_parent_id)
+            except (TypeError, ValueError):
+                return web.json_response(
+                    {"error": "parent_thread_id must be an integer"}, status=400
+                )
+            if parent_thread_id <= 0:
+                return web.json_response({"error": "parent_thread_id must be positive"}, status=400)
+
         raw_user_id = data.get("user_id")
         invite_user_id: int | None = None
         if raw_user_id is not None:
@@ -1646,20 +2227,34 @@ class ApiServer:
                 auto_start=auto_start,
                 attachments=decoded_attachments or None,
                 invite_user_id=invite_user_id,
+                agent_spawned=True,
+                parent_thread_id=parent_thread_id,
             )
         except Exception as exc:
             logger.error("spawn_session failed: %s", exc, exc_info=True)
             return web.json_response({"error": str(exc)}, status=500)
 
+        # Recorded after the thread exists, and never allowed to undo it: the
+        # titles already carry the family code, so a failed write costs the
+        # queryable half of the lineage, not the visible one.
+        if parent_thread_id is not None and self.lineage_repo is not None:
+            try:
+                await self.lineage_repo.record(
+                    thread.id, parent_thread_id, family_code(parent_thread_id)
+                )
+            except Exception:
+                logger.exception("Could not record spawn lineage for thread %s", thread.id)
+
         logger.info("Spawned new Claude session in thread %s (%s)", thread.id, thread.name)
-        return web.json_response(
-            {
-                "status": "spawned",
-                "thread_id": str(thread.id),
-                "thread_name": thread.name,
-            },
-            status=201,
-        )
+        body: dict[str, str] = {
+            "status": "spawned",
+            "thread_id": str(thread.id),
+            "thread_name": thread.name,
+        }
+        if parent_thread_id is not None:
+            body["parent_thread_id"] = str(parent_thread_id)
+            body["family"] = family_code(parent_thread_id)
+        return web.json_response(body, status=201)
 
     # ------------------------------------------------------------------
     # Authenticated external ingest endpoint (/api/ingest)
@@ -2015,14 +2610,8 @@ class ApiServer:
                "attachments_saved": N}``
         """
         # --- Opt-in + auth (independent of the global api_secret middleware) ---
-        if not self.ingest_token:
-            return web.json_response({"error": "Ingest endpoint is disabled"}, status=503)
-
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return web.json_response({"error": "Missing Authorization header"}, status=401)
-        if not hmac.compare_digest(auth_header[7:], self.ingest_token):
-            return web.json_response({"error": "Invalid token"}, status=401)
+        if err := await self._check_ingest_token(request):
+            return err
 
         try:
             data = await request.json()
@@ -2048,6 +2637,15 @@ class ApiServer:
         )
         if manifest_err is not None:
             return web.json_response({"error": manifest_err}, status=400)
+
+        # Optional labels for the console board, so a saved view can select the
+        # threads this integration creates (``tag:<name>``).
+        from ..console.work_repo import WorkItemError, clean_tags
+
+        try:
+            ingest_tags = list(clean_tags(data.get("tags")))
+        except WorkItemError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
         # Optional running-summary linkage. When the client supplies a stable
         # summary_key, this ingest is one turn of a long upstream thread: ccdb
@@ -2213,6 +2811,11 @@ class ApiServer:
         if result_id is not None and self.ingest_repo is not None:
             await self.ingest_repo.set_thread(result_id, str(thread.id), thread.name)
 
+        reply_draft = is_reply_draft_request(content)
+        if reply_draft:
+            ingest_tags.append(TEAMS_EXPORTER_TAG)
+        await self._label_ingest_thread(thread.id, ingest_tags, reply_draft=reply_draft)
+
         # Pull the owner into the thread and ping them on start, so the
         # unattended session is visible and they're notified again on completion
         # (via the result sink). Only when a session actually started.
@@ -2242,6 +2845,30 @@ class ApiServer:
             # Poll GET /api/ingest/{result_id} to retrieve the final reply.
             response["result_id"] = result_id
         return web.json_response(response, status=201)
+
+    async def _label_ingest_thread(
+        self, thread_id: int, tags: list[str], *, reply_draft: bool
+    ) -> None:
+        """Write an ingested thread's tags, and a Teams reply draft's P0, on the board.
+
+        Someone in Teams is waiting for a reply draft, so it outranks the rest of
+        the board from the start. It is written as the item's own priority, the
+        way a person sets one: triage leaves it alone, and the human can still
+        lower it. Best effort — no console, no board to rank on.
+        """
+        console = self._console
+        if console is None or not (tags or reply_draft):
+            return
+        from ..console.work_repo import thread_item_id
+
+        item_id = thread_item_id(thread_id)
+        try:
+            if tags:
+                await console.work_repo.add_tags(item_id, tags)
+            if reply_draft:
+                await console.work_repo.update(item_id, {"priority": REPLY_DRAFT_PRIORITY})
+        except Exception:
+            logger.warning("could not label the ingested thread %d", thread_id, exc_info=True)
 
     async def _ingest_add_owner(self, thread: discord.Thread) -> None:
         """Add the configured bot owner to an ingest thread (no-op if unset).
@@ -2293,13 +2920,8 @@ class ApiServer:
         independent of the global ``api_secret`` middleware) so the same
         external client that posted the work can retrieve its answer.
         """
-        if not self.ingest_token:
-            return web.json_response({"error": "Ingest endpoint is disabled"}, status=503)
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return web.json_response({"error": "Missing Authorization header"}, status=401)
-        if not hmac.compare_digest(auth_header[7:], self.ingest_token):
-            return web.json_response({"error": "Invalid token"}, status=401)
+        if err := await self._check_ingest_token(request):
+            return err
 
         if err := self._require_ingest_repo():
             return err
@@ -2336,16 +2958,28 @@ class ApiServer:
             )
         return None
 
-    def _check_ingest_token(self, request: web.Request) -> web.Response | None:
-        """Enforce the dedicated ingest bearer token (shared with /api/ingest)."""
-        if not self.ingest_token:
+    async def _check_ingest_token(self, request: web.Request) -> web.Response | None:
+        """Authenticate an ingest / Teams sync request.
+
+        Two credentials are accepted as the bearer value: the static
+        ``ingest_token`` (constant-time compare, unchanged), or — when
+        configured — an Entra ID access token verified by ``ingest_entra``.
+        With neither configured the surface is disabled (503).
+        """
+        if not self.ingest_token and self.ingest_entra is None:
             return web.json_response({"error": "Ingest endpoint is disabled"}, status=503)
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return web.json_response({"error": "Missing Authorization header"}, status=401)
-        if not hmac.compare_digest(auth_header[7:], self.ingest_token):
-            return web.json_response({"error": "Invalid token"}, status=401)
-        return None
+        presented = auth_header[7:]
+        if self.ingest_token and hmac.compare_digest(presented, self.ingest_token):
+            return None
+        if self.ingest_entra is not None and looks_like_jwt(presented):
+            ok, reason = await self.ingest_entra.verify(presented)
+            if ok:
+                return None
+            logger.warning("Rejected Entra ID token on %s: %s", request.path, reason)
+        return web.json_response({"error": "Invalid token"}, status=401)
 
     # ------------------------------------------------------------------
     # Teams thread sync (/api/teams/sync) — raw messages, one file each
@@ -2358,7 +2992,7 @@ class ApiServer:
         self, request: web.Request, *, require_body: bool
     ) -> tuple[tuple[ThreadRef, list, dict], None] | tuple[None, web.Response]:
         """Auth + parse the shared body shape of both sync endpoints."""
-        if err := self._check_ingest_token(request):
+        if err := await self._check_ingest_token(request):
             return None, err
         try:
             data = await request.json()
@@ -2468,7 +3102,7 @@ class ApiServer:
 
         store = self._teams_store()
         try:
-            thread_dir = store.ensure_thread_dir(ref)
+            thread_dir = store.ensure_thread_dir(ref, authors=[m.author for m in messages])
         except (OSError, ValueError) as exc:
             logger.error("Teams sync could not open a thread folder: %s", exc)
             return web.json_response({"error": "Could not open the thread folder"}, status=500)
@@ -2557,7 +3191,7 @@ class ApiServer:
         Returns 200 with ``exists=false`` and empty fields when the key is
         unknown — friendlier for a first-run client than a 404.
         """
-        if err := self._check_ingest_token(request):
+        if err := await self._check_ingest_token(request):
             return err
         if err := self._require_summary_repo():
             return err
@@ -2640,7 +3274,7 @@ class ApiServer:
         the next export to be treated as a first run. Token-gated when an ingest
         token is configured, for parity with the other ingest routes.
         """
-        if err := self._check_ingest_token(request):
+        if err := await self._check_ingest_token(request):
             return err
         if err := self._require_summary_repo():
             return err

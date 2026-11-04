@@ -28,6 +28,8 @@ from ..worktree import WorktreeManager
 from .session_sync import sync_cli_sessions
 
 if TYPE_CHECKING:
+    from claude_code_core.account_router import AccountRouter
+
     from ..bot import ClaudeDiscordBot
 
 logger = logging.getLogger(__name__)
@@ -168,12 +170,16 @@ class SessionManageCog(commands.Cog):
         settings_repo: SettingsRepository | None = None,
         runner: object | None = None,
         usage_repo: UsageStatsRepository | None = None,
+        account_router: AccountRouter | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.cli_sessions_path = cli_sessions_path
         self.settings_repo = settings_repo
         self.usage_repo = usage_repo
+        # Set when CCDB_ACCOUNT_POOLS_FILE configures account pools: /usage
+        # then lists every profile instead of the single implicit login.
+        self.account_router = account_router
         # Optional ClaudeRunner reference for reading the default model.
         # Resolved lazily from ClaudeChatCog if not provided directly.
         self._runner = runner
@@ -478,7 +484,7 @@ class SessionManageCog(commands.Cog):
         """Show the claude --resume command for the current thread."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.",
+                "This command can only be used in an agent chat thread.",
                 ephemeral=True,
             )
             return
@@ -508,7 +514,7 @@ class SessionManageCog(commands.Cog):
 
     @app_commands.command(
         name="sessions",
-        description="List all known Claude Code sessions",
+        description="List all known agent sessions",
     )
     @app_commands.describe(origin="Filter by session origin")
     @app_commands.choices(origin=_ORIGIN_CHOICES)
@@ -670,7 +676,7 @@ class SessionManageCog(commands.Cog):
 
     @app_commands.command(
         name="worktree-list",
-        description="List all active Claude Code session worktrees",
+        description="List all active session worktrees",
     )
     async def worktree_list(self, interaction: discord.Interaction) -> None:
         """Show all session worktrees (branch ``session/\\d+``) and their status."""
@@ -832,7 +838,7 @@ class SessionManageCog(commands.Cog):
         """Display context window usage (%) with a progress bar and autocompact distance."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in an agent chat thread.", ephemeral=True
             )
             return
 
@@ -879,6 +885,9 @@ class SessionManageCog(commands.Cog):
     )
     async def usage_show(self, interaction: discord.Interaction) -> None:
         """Display rate limit utilization (5-hour / 7-day) with reset countdown."""
+        if self.account_router is not None:
+            await self._usage_show_pools(interaction)
+            return
         if self.usage_repo is None:
             await interaction.response.send_message(
                 "ℹ️ Usage tracking is not enabled for this bot instance.", ephemeral=True
@@ -917,5 +926,19 @@ class SessionManageCog(commands.Cog):
             title="📊 Claude Code Usage",
             description="\n".join(lines).rstrip(),
             color=COLOR_ERROR if has_warning else COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    async def _usage_show_pools(self, interaction: discord.Interaction) -> None:
+        """/usage with account pools: every profile, its windows and availability."""
+        from ..account_turns import usage_lines
+
+        assert self.account_router is not None
+        statuses = await self.account_router.statuses()
+        any_exhausted = any(s.unavailable_until is not None for s in statuses)
+        embed = discord.Embed(
+            title="📊 Account Pool Usage",
+            description="\n".join(usage_lines(statuses)).rstrip()[:4000],
+            color=COLOR_ERROR if any_exhausted else COLOR_INFO,
         )
         await interaction.response.send_message(embed=embed)

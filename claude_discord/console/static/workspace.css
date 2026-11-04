@@ -1,0 +1,90 @@
+.workspace-capture { display:flex; gap:8px; align-items:center; padding:6px 14px; font-size:12px; border-bottom:1px solid var(--line); }
+.workspace-picker { min-width:0; max-width:320px; flex:1; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px; }
+.workspace-panel { position:fixed; inset:0; z-index:50; background:#0009; padding:3vh 3vw; display:flex; align-items:center; justify-content:center; }
+.workspace-panel[hidden], .workspace-capture[hidden] { display:none; }
+.ws-shell { width:min(1100px,100%); height:90vh; background:var(--bg); border:1px solid var(--line); border-radius:12px; display:flex; flex-direction:column; overflow:hidden; }
+.ws-head { display:flex; gap:8px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); }
+.ws-head h1 { font-size:18px; margin:0; flex:1; }
+.ws-body { display:flex; flex:1; min-height:0; }
+.ws-entries { width:30%; min-width:160px; overflow:auto; border-right:1px solid var(--line); padding:8px; }
+.ws-entry { display:block; width:100%; text-align:left; padding:9px; border:0; border-radius:5px; background:transparent; color:var(--text); overflow-wrap:anywhere; cursor:pointer; }
+.ws-entry.on { background:var(--raise); border-left:3px solid var(--accent); }
+.ws-content { flex:1; min-width:0; overflow:auto; padding:16px; }
+.ws-content h2 { font-size:17px; overflow-wrap:anywhere; }
+.ws-task { display:flex; gap:8px; align-items:center; padding:10px 0; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+.ws-task-text { flex:1; min-width:120px; overflow-wrap:anywhere; white-space:pre-wrap; }
+.ws-task.done .ws-task-text { opacity:.55; text-decoration:line-through; }
+.ws-add, .ws-edit { display:flex; gap:6px; width:100%; margin-top:12px; }
+.ws-add input, .ws-edit input { flex:1; min-width:0; padding:8px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:5px; }
+.ws-overview pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+.ws-related { display:block; margin:6px 0; text-align:left; }
+@media(max-width:640px) {
+  .workspace-panel { padding:0; }
+  .ws-shell { height:100dvh; border-radius:0; }
+  .ws-body { flex-direction:column; }
+  .ws-entries { width:auto; max-height:25vh; min-height:90px; border-right:0; border-bottom:1px solid var(--line); }
+  .workspace-capture { flex-wrap:wrap; }
+}
+
+.workspace-offer { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.workspace-offer span { flex:1; min-width:150px; }
+.ws-onboarding { max-width:720px; height:auto; max-height:90vh; }
+.ws-onboarding .ws-content { line-height:1.7; }
+.ws-onboarding li { margin:8px 0; }
+.ws-purchase { display:inline-block; white-space:normal; margin:12px 0; }
+
+/* Ebi Workspace inside the Focus view (focusws.js) */
+.ws-focus, .ws-focus-plan { list-style:none; padding:0 0 6px; border-bottom:1px solid var(--line); }
+.ws-focus-head { display:flex; gap:4px; align-items:baseline; }
+.ws-focus-list { list-style:none; margin:0; padding:0; }
+.ws-focus-item { padding:8px 14px; border-top:1px solid var(--line); }
+.ws-due-over { color:var(--err); border-color:currentColor; }
+.ws-focus-text { overflow-wrap:anywhere; }
+.ws-focus-meta, .ws-focus-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top:4px; font-size:12px; }
+.ws-focus-path { overflow-wrap:anywhere; }
+.ws-focus-status, .ws-focus-milestone { font-size:12px; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ws-focus-actions .btn { padding:3px 8px; font-size:12px; }
+.ws-focus-date[hidden] { display:none; }
+.ws-focus-lapsed { padding:6px 14px; font-size:12px; }
+.ws-stale { color:var(--me); border-color:currentColor; }
+.ws-focus-stalled-more summary { cursor:pointer; padding:6px 14px; font-size:12px; }
+.ws-focus-plan details { padding:8px 14px; }
+.ws-focus-plan summary { cursor:pointer; font-weight:600; }
+.ws-focus-plan-body { margin-top:6px; font-size:13px; overflow-wrap:anywhere; }
+.linkish { background:none; border:0; padding:0; color:inherit; cursor:pointer; text-decoration:underline dotted; font:inherit; }
+
+/* Workspace binding badge and picker (wsbind.js) */
+.ws-bind { cursor:default; }
+.ws-bind.ws-inferred, .ws-bind.ws-heuristic { border-style:dashed; }
+.ws-bind.ws-unresolved { opacity:.7; }
+.ws-bind-control { position:relative; flex-wrap:wrap; }
+.ws-bind-pop { position:absolute; z-index:40; top:100%; left:0; margin-top:4px; width:min(420px,92vw); max-height:60vh; display:flex; flex-direction:column; gap:6px; padding:8px; background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px #0008; }
+.ws-bind-search { padding:8px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:5px; }
+.ws-bind-hint { font-size:11px; }
+.ws-bind-list { overflow:auto; display:flex; flex-direction:column; }
+.ws-bind-head { font-size:11px; opacity:.7; padding:6px 6px 2px; }
+.ws-bind-option { text-align:left; padding:7px 8px; border:0; border-radius:5px; background:transparent; color:var(--text); cursor:pointer; overflow-wrap:anywhere; }
+.ws-bind-option:hover, .ws-bind-option:focus { background:var(--raise); }
+.ws-bind-option.on { border-left:3px solid var(--accent); }
+.ws-bind-empty { padding:8px; }
+
+/* Workspace pane in the thread detail and the folded context note (wspane.js) */
+.ws-pane { border-bottom:1px solid var(--line); padding:4px 14px; font-size:13px; }
+.ws-pane[hidden] { display:none; }
+.ws-pane-summary { cursor:pointer; display:flex; gap:8px; align-items:baseline; overflow:hidden; }
+.ws-pane-path { font-weight:600; white-space:nowrap; }
+.ws-pane-first { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.ws-pane-body { max-height:40vh; overflow:auto; padding:6px 0; display:flex; flex-direction:column; gap:8px; }
+.ws-pane-head { font-weight:600; font-size:12px; opacity:.8; margin-bottom:2px; }
+.ws-pane-block ul { margin:0; padding-left:18px; }
+.ws-pane-task { display:flex; gap:6px; align-items:flex-start; padding:2px 0; overflow-wrap:anywhere; }
+.ws-pane-thread { display:block; text-align:left; padding:2px 0; }
+.ws-pane-log summary { cursor:pointer; }
+.ws-sent { margin-top:6px; font-size:12px; }
+.ws-sent summary { cursor:pointer; }
+.ws-sent pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:11px; }
+.group.ws-group { text-transform:none; }
+.ws-exclude-text { width:100%; box-sizing:border-box; font-family:ui-monospace,monospace; font-size:13px; padding:8px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; }
+.ws-exclude-file { font-family:ui-monospace,monospace; font-size:11px; overflow-wrap:anywhere; }
+.ws-exclude-actions { display:flex; gap:8px; margin-top:8px; }
+.ws-focus-plan-body li > .ws-plan-run { margin-left:6px; padding:1px 8px; font-size:12px; vertical-align:baseline; }

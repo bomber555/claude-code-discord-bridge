@@ -104,6 +104,18 @@ async def test_deferred_rename_respects_human_rename(
     assert thread.name == "human"
 
 
+async def test_status_and_lineage_tags_are_not_a_human_rename(db_path: str) -> None:
+    """ccdb's own markers neither lock the title nor disappear when it changes."""
+    titler = ThreadTitler(SettingsRepository(db_path))
+    thread = _thread()
+    await titler.request(thread, "#1 調査中")
+    thread.name = "\u2753 \U0001f333P9 #1 調査中"  # outcome + parent tags added by ccdb
+
+    assert (await titler.request(thread, "#1 調査中")).status == "unchanged"
+    assert (await titler.request(thread, "#1 PR待ち")).status == "renamed"
+    assert thread.name == "\u2753 \U0001f333P9 #1 PR待ち"
+
+
 @pytest.fixture
 async def api(db_path: str) -> tuple[TestClient, MagicMock]:
     notif_repo = NotificationRepository(db_path)

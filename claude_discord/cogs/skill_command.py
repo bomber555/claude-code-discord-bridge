@@ -15,7 +15,6 @@ Skills are lazily reloaded every 60 seconds so new skills appear without restart
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -26,9 +25,12 @@ from discord import app_commands
 from discord.ext import commands
 
 from claude_code_core.backend import SessionBackend
+from claude_code_core.claude_plugins import plugin_skill_dirs
 
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
+from ..database.settings_repo import SettingsRepository
+from ..execution_settings import apply_thread_execution_mode
 from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -83,30 +85,10 @@ def _load_skills(skills_dir: Path) -> list[dict[str, str]]:
 def _get_plugin_skill_dirs(claude_dir: Path | None = None) -> list[Path]:
     """Discover skills/ directories from all installed Claude Code plugins.
 
-    Reads ``~/.claude/plugins/installed_plugins.json`` and returns the
-    ``skills/`` subdirectory for each plugin whose installPath contains one.
-    Returns an empty list if the file does not exist or cannot be parsed.
+    Thin wrapper over :func:`claude_code_core.claude_plugins.plugin_skill_dirs`,
+    which the pi backend shares.
     """
-    if claude_dir is None:
-        claude_dir = Path.home() / ".claude"
-    plugins_json = claude_dir / "plugins" / "installed_plugins.json"
-    if not plugins_json.exists():
-        return []
-    try:
-        data = json.loads(plugins_json.read_text(encoding="utf-8"))
-        dirs: list[Path] = []
-        for entries in data.get("plugins", {}).values():
-            for entry in entries:
-                install_path = entry.get("installPath")
-                if not install_path:
-                    continue
-                skills_dir = Path(install_path) / "skills"
-                if skills_dir.is_dir():
-                    dirs.append(skills_dir)
-        return dirs
-    except (OSError, json.JSONDecodeError, TypeError, KeyError):
-        logger.warning("Failed to discover plugin skill dirs from %s", plugins_json)
-        return []
+    return plugin_skill_dirs(claude_dir)
 
 
 def _collect_skills(primary_dir: Path, extra_dirs: list[Path]) -> list[dict[str, str]]:
@@ -146,8 +128,12 @@ class SkillCommandCog(commands.Cog):
         registry: SessionRegistry | None = None,
         claude_channel_ids: set[int] | None = None,
         claude_dir: Path | str | None = None,
+        settings_repo: SettingsRepository | None = None,
     ) -> None:
         self.bot = bot
+        # Source of the thread's /sandbox choice; without it skills run in the
+        # deployment's default execution environment.
+        self._settings_repo = settings_repo
         self.repo = repo
         self.runner = runner
         self.claude_channel_id = claude_channel_id
@@ -211,7 +197,7 @@ class SkillCommandCog(commands.Cog):
         """Check if the channel is a thread under any configured claude channel."""
         return isinstance(channel, discord.Thread) and channel.parent_id in self._channel_ids
 
-    @app_commands.command(name="skill", description="Run a Claude Code skill")
+    @app_commands.command(name="skill", description="Run a skill")
     @app_commands.describe(
         name="Skill name (type to filter)",
         args="Optional arguments to pass to the skill",
@@ -265,6 +251,7 @@ class SkillCommandCog(commands.Cog):
             await interaction.followup.send(f"Running {display} in this thread…")
 
             runner = self.runner.clone(thread_id=channel.id)
+            await apply_thread_execution_mode(runner, self._settings_repo, channel.id)
             await run_claude_with_config(
                 RunConfig(
                     thread=channel,
@@ -287,7 +274,7 @@ class SkillCommandCog(commands.Cog):
         else:
             channel = self.bot.get_channel(self.claude_channel_id)
         if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send("Claude channel not found.", ephemeral=True)
+            await interaction.followup.send("Chat channel not found.", ephemeral=True)
             return
 
         thread_name = f"/{name} {args}" if args else f"/{name}"
@@ -302,6 +289,7 @@ class SkillCommandCog(commands.Cog):
         await interaction.followup.send(f"Running {display} → {thread.mention}")
 
         runner = self.runner.clone(thread_id=thread.id)
+        await apply_thread_execution_mode(runner, self._settings_repo, thread.id)
         await run_claude_with_config(
             RunConfig(
                 thread=thread,

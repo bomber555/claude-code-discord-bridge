@@ -10,13 +10,19 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from claude_code_core.attention import HumanActivity
+from claude_code_core.attention_repo import AttentionRecorder
 from claude_code_core.frontend import ConversationSurface, SessionFrontend, ThreadKey
 
 from .backend_settings import session_is_resumable
 from .cogs._run_helper import run_claude_with_config
 from .cogs.run_config import RunConfig
+from .connection_choice import apply_connection
+from .cross_backend_handoff import ConversationHistoryReader, carry_history_across_backends
+from .execution_settings import apply_thread_execution_mode
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
@@ -33,9 +39,10 @@ __all__ = [
     "TeamsSessionHost",
     "build_teams_runtime",
     "parse_frontends",
+    "teams_activity",
 ]
 
-_KNOWN_FRONTENDS = frozenset({"discord", "teams"})
+_KNOWN_FRONTENDS = frozenset({"discord", "teams", "console"})
 
 
 def parse_frontends(value: str) -> tuple[str, ...]:
@@ -86,6 +93,21 @@ class FrontendRouter:
     async def create_surface(self, *, parent_id: str, title: str) -> ConversationSurface:
         return await self._primary.create_surface(parent_id=parent_id, title=title)
 
+    @property
+    def primary(self) -> str:
+        return self._primary.name
+
+    def replace_primary(self, frontend: SessionFrontend) -> None:
+        """Make *frontend* the one new conversations open on, dropping the old primary.
+
+        A headless deployment builds the router around Discord (setup_bridge
+        always does) and then hands it to the console: Discord cannot resolve
+        or create anything without a login, so it must not stay in the chain.
+        """
+        self._frontends.pop(self._primary.name, None)
+        self._frontends[frontend.name] = frontend
+        self._primary = frontend
+
 
 class TeamsSessionHost:
     """Turn trusted relayed activities into ordinary ccdb session turns."""
@@ -105,8 +127,12 @@ class TeamsSessionHost:
         usage_repo: Any = None,
         registry: Any = None,
         worktree_manager: Any = None,
+        attention_recorder: AttentionRecorder | None = None,
+        conversation_history: ConversationHistoryReader | None = None,
     ) -> None:
         self._app_id = app_id
+        self._conversation_history = conversation_history or ConversationHistoryReader()
+        self._attention_recorder = attention_recorder
         self._frontend = frontend
         self._ledger = ledger
         self._session_repo = session_repo
@@ -144,21 +170,30 @@ class TeamsSessionHost:
         surface = await self._frontend.resolve_surface(thread_key)
         if surface is None:
             raise LookupError(f"Teams conversation {activity.conversation_id!r} cannot be resolved")
+        await self._record_attention(activity, parent_id=parent_id, text=prompt)
 
         record = await self._session_repo.get(thread_key)
         backend = await self._settings.current_backend(thread_key)
         model = await self._settings.current_model(backend, thread_key)
         runner = self._factory.build(backend=backend, model=model, thread_id=thread_key)
+        await apply_thread_execution_mode(runner, getattr(self._settings, "repo", None), thread_key)
 
         session_id = None
         if record is not None and session_is_resumable(record.backend, backend):
             session_id = record.session_id
             if record.working_dir:
                 runner.working_dir = record.working_dir
+        else:
+            # A new backend cannot resume the old session natively; carry its
+            # text so the conversation continues instead of starting blank.
+            prompt = await carry_history_across_backends(
+                self._conversation_history, record, backend, prompt
+            )
 
         effort = await self._settings.current_effort(backend, thread_key)
         if effort is not None and hasattr(runner, "effort"):
             runner.effort = effort
+        await apply_connection(runner, self._settings, backend, thread_key)
 
         await self._run_session(
             RunConfig(
@@ -179,6 +214,14 @@ class TeamsSessionHost:
             )
         )
 
+    async def _record_attention(
+        self, activity: InboundActivity, *, parent_id: str | None, text: str
+    ) -> None:
+        recorder = self._attention_recorder
+        if recorder is None or not recorder.enabled or not activity.id:
+            return
+        await recorder.record(teams_activity(activity, parent_id=parent_id, text=text))
+
     def _handle_invoke(self, activity: InboundActivity) -> None:
         if activity.raw.get("name") != "adaptiveCard/action":
             return
@@ -187,6 +230,37 @@ class TeamsSessionHost:
         data = action.get("data") if isinstance(action, dict) else None
         if not self._frontend.interactions.resolve(activity.conversation_id, data):
             logger.info("A relayed Teams card action did not match a live prompt")
+
+
+def teams_activity(activity: InboundActivity, *, parent_id: str | None, text: str) -> HumanActivity:
+    """Describe a Teams message as human activity — metadata only, never the text."""
+    conversation = activity.raw.get("conversation")
+    title = conversation.get("name") if isinstance(conversation, dict) else None
+    attachments = activity.raw.get("attachments")
+    # Teams repeats the message body as a text/html attachment; that is not a file.
+    files = (
+        [a for a in attachments if isinstance(a, dict) and a.get("contentType") != "text/html"]
+        if isinstance(attachments, list)
+        else []
+    )
+    raw_time = activity.raw.get("timestamp")
+    try:
+        occurred_at = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+        if occurred_at.tzinfo is None:
+            raise ValueError("naive timestamp")
+    except ValueError:
+        occurred_at = datetime.now(UTC)
+    return HumanActivity(
+        frontend="teams",
+        conversation_id=activity.conversation_id,
+        parent_id=parent_id,
+        thread_title=title if isinstance(title, str) and title else None,
+        author_id=activity.from_id,
+        occurred_at=occurred_at,
+        char_count=len(text),
+        attachment_count=len(files),
+        message_id=activity.id,
+    )
 
 
 class TeamsRuntime:
@@ -267,6 +341,7 @@ async def build_teams_runtime(
             usage_repo=components.usage_repo,
             registry=registry,
             worktree_manager=worktree_manager,
+            attention_recorder=getattr(components, "attention_recorder", None),
         )
         queue = StorageQueue(queue_url, aiohttp_request(session))
         puller = ActivityPuller(queue, host.handle, on_service_url=frontend.remember)

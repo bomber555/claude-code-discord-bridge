@@ -17,18 +17,55 @@ import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from ..message_actions import STYLE_SUCCESS, MessageAction, message_actions
 from ..protocols import DrainAware
+from ..thread_marker import OUTCOME_ACTION, OUTCOME_DONE, OUTCOME_ERROR
 from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
+from ..thread_status import request_thread_outcome
 
 logger = logging.getLogger(__name__)
 
 # Default timeout for each subprocess step (seconds).
 _STEP_TIMEOUT = 120
+
+# Posted when the bot shuts down while a prompt is still waiting for approval.
+#: How long a final title change may hold up a restart or shutdown. A rename can
+#: sit in a rate-limit sleep for minutes; the restart must not wait for it.
+_FINAL_OUTCOME_TIMEOUT = 5.0
+
+
+async def _mark_outcome(thread: object, outcome: str, *, wait: bool = False) -> None:
+    """Show where the upgrade stands in the thread title, the way agent threads do.
+
+    Every upgrade thread has the same name, so without the marker the Console
+    cannot tell the one waiting for approval from the finished ones. With
+    *wait*, give the rename a moment to land before the process goes away.
+    """
+    if not isinstance(thread, discord.Thread):
+        return
+    task = request_thread_outcome(thread, outcome)
+    if wait:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), _FINAL_OUTCOME_TIMEOUT)
+
+
+#: Settings key holding the thread that asked for the restart now under way. The
+#: next process reads it once at startup to say the restart actually happened.
+_RESTART_THREAD_KEY = "auto_upgrade.restart_thread_id"
+
+
+_ABANDONED_NOTE = (
+    "⏹️ The bot restarted before this was approved, so this request is no longer "
+    "waiting — reacting ✅ above does nothing now. Run `/upgrade` if the new release "
+    "still needs to be applied."
+)
 
 
 class UpgradeApprovalView(discord.ui.View):
@@ -104,6 +141,15 @@ class UpgradeApprovalView(discord.ui.View):
         await interaction.response.edit_message(view=self)
         self._event.set()
         self.stop()
+
+
+@dataclass(frozen=True)
+class _PendingApproval:
+    """An approval prompt whose waiter has not returned yet."""
+
+    thread: discord.Thread
+    offered: list[int]
+    button: Callable[[], discord.Message | None]
 
 
 @dataclass(frozen=True)
@@ -185,6 +231,85 @@ class AutoUpgradeCog(commands.Cog):
         self._drain_timeout = drain_timeout
         self._drain_poll_interval = drain_poll_interval
         self._lock = asyncio.Lock()
+        # Approval prompts still waiting, by thread id. Lives in memory like the
+        # wait itself, so cog_unload can say the prompt is dead before it is.
+        self._pending: dict[int, _PendingApproval] = {}
+        self._announce_task: asyncio.Task[None] | None = None
+
+    async def cog_load(self) -> None:
+        """Report a restart this cog started in the previous process, once ready."""
+        self._announce_task = asyncio.create_task(self._announce_when_ready())
+
+    async def _announce_when_ready(self) -> None:
+        await self.bot.wait_until_ready()
+        await self.announce_restart()
+
+    async def announce_restart(self) -> None:
+        """Post "restarted" in the upgrade thread whose restart brought this process up.
+
+        Without it the thread ends at "🔄 Restarting..." and nobody can tell
+        from the thread whether the new process ever came back. The key is
+        removed before posting so a reconnect never repeats the notice.
+        """
+        settings = getattr(self.bot, "settings_repo", None)
+        if settings is None:
+            return
+        try:
+            raw = await settings.get(_RESTART_THREAD_KEY)
+            if raw is None:
+                return
+            await settings.delete(_RESTART_THREAD_KEY)
+            thread_id = int(raw)
+        except Exception:
+            logger.warning("Could not read the pending restart notice", exc_info=True)
+            return
+        try:
+            channel = self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
+            await channel.send(self._restarted_text())  # type: ignore[union-attr]
+        except discord.HTTPException:
+            logger.info("Could not post the restart notice to thread %d", thread_id)
+            return
+        logger.info("Restart notice posted to thread %d", thread_id)
+
+    def _restarted_text(self) -> str:
+        name = self.config.package_name
+        try:
+            return f"✅ Restarted — now running {name} v{package_version(name)}."
+        except PackageNotFoundError:
+            return "✅ Restarted."
+
+    async def _remember_restart(self, thread: discord.Thread) -> None:
+        settings = getattr(self.bot, "settings_repo", None)
+        if settings is None:
+            return
+        try:
+            await settings.set(_RESTART_THREAD_KEY, str(thread.id))
+        except Exception:
+            # The notice is a courtesy; it must never stand in the way of the restart.
+            logger.warning("Could not record the restart thread", exc_info=True)
+
+    async def cog_unload(self) -> None:
+        """Close every approval prompt that the shutdown is about to orphan.
+
+        The wait is an in-memory coroutine: once the process exits, the ✅
+        reaction, the channel button and the console action all lead nowhere,
+        while the thread still reads as if it is waiting.
+        """
+        if self._announce_task is not None:
+            self._announce_task.cancel()
+        pending, self._pending = list(self._pending.values()), {}
+        for entry in pending:
+            message_actions.clear(*entry.offered)
+            button = entry.button()
+            if button is not None:
+                with contextlib.suppress(discord.HTTPException):
+                    await button.delete()
+            try:
+                await entry.thread.send(_ABANDONED_NOTE)
+            except discord.HTTPException:
+                logger.info("Could not close approval prompt in thread %d", entry.thread.id)
+            # Nothing is left to approve; the next release opens a new thread.
+            await _mark_outcome(entry.thread, OUTCOME_DONE, wait=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -306,6 +431,7 @@ class AutoUpgradeCog(commands.Cog):
             if not ok:
                 if status_target is not None:
                     await status_target.add_reaction("❌")
+                await _mark_outcome(thread, OUTCOME_ERROR)
                 return
 
             # Step 2: Sync dependencies
@@ -314,6 +440,7 @@ class AutoUpgradeCog(commands.Cog):
             if not ok:
                 if status_target is not None:
                     await status_target.add_reaction("❌")
+                await _mark_outcome(thread, OUTCOME_ERROR)
                 return
 
             # Step 3: Optional restart
@@ -329,16 +456,33 @@ class AutoUpgradeCog(commands.Cog):
                 if status_target is not None:
                     await status_target.add_reaction("✅")
                 await thread.send("✅ Upgrade complete (no restart configured).")
+                await _mark_outcome(thread, OUTCOME_DONE)
 
+        except discord.NotFound:
+            # The thread was deleted mid-pipeline (e.g. swept while awaiting approval).
+            logger.info("Upgrade thread %d no longer exists; aborting pipeline", thread.id)
         except TimeoutError:
-            await thread.send("❌ Step timed out.")
-            if status_target is not None:
-                await status_target.add_reaction("❌")
+            await self._report_failure(thread, status_target, "❌ Step timed out.")
         except Exception:
             logger.exception("Auto-upgrade error")
-            await thread.send("❌ Upgrade failed with an unexpected error.")
+            await self._report_failure(
+                thread, status_target, "❌ Upgrade failed with an unexpected error."
+            )
+
+    async def _report_failure(
+        self,
+        thread: discord.Thread,
+        status_target: discord.Message | None,
+        text: str,
+    ) -> None:
+        """Post *text* and mark the trigger ❌; a deleted thread/message is not an error."""
+        try:
+            await thread.send(text)
             if status_target is not None:
                 await status_target.add_reaction("❌")
+            await _mark_outcome(thread, OUTCOME_ERROR)
+        except discord.NotFound:
+            logger.info("Upgrade thread %d vanished before failure was reported", thread.id)
 
     def _collect_active_thread_ids(self) -> frozenset[int]:
         """Return the IDs of threads with currently-running Claude sessions.
@@ -470,9 +614,28 @@ class AutoUpgradeCog(commands.Cog):
         text = prompt or "📦 Update installed. React ✅ on this message to restart."
         approval_msg = await thread.send(text)
         await approval_msg.add_reaction("✅")
+        await _mark_outcome(thread, OUTCOME_ACTION)
 
         # Shared event — set by either the reaction loop or the button callback.
         approved = asyncio.Event()
+
+        # The Ebi AI Console reads the thread but cannot react or click, so the
+        # approval message (and every reminder) also offers an approve action.
+        async def _approve_from_console(who: str) -> None:
+            logger.info("Restart approved from the console by %s", who)
+            approved.set()
+
+        offered: list[int] = []
+
+        def _offer(message: discord.Message) -> None:
+            message_actions.register(
+                thread.id,
+                message.id,
+                [MessageAction("✅ Approve", _approve_from_console, STYLE_SUCCESS)],
+            )
+            offered.append(message.id)
+
+        _offer(approval_msg)
 
         # Post a button in the parent channel so approval is always one click
         # away at the bottom of the channel (no need to scroll up to the thread).
@@ -510,10 +673,11 @@ class AutoUpgradeCog(commands.Cog):
                     approved.set()
                 except TimeoutError:
                     if not approved.is_set():
-                        await thread.send(
+                        reminder = await thread.send(
                             "⏳ Still waiting for restart approval... "
                             "React ✅ above or click the button in the channel."
                         )
+                        _offer(reminder)
                         # Re-post the button at the bottom so it stays visible.
                         if view is not None and parent is not None:
                             await view.bump(parent)
@@ -524,11 +688,20 @@ class AutoUpgradeCog(commands.Cog):
 
         reaction_task = asyncio.create_task(_watch_reaction())
         button_task = asyncio.create_task(_watch_button())
-
-        done, pending = await asyncio.wait(
-            {reaction_task, button_task},
-            return_when=asyncio.FIRST_COMPLETED,
+        self._pending[thread.id] = _PendingApproval(
+            thread=thread,
+            offered=offered,
+            button=lambda: (view._message if view is not None else None) or channel_msg,
         )
+
+        try:
+            done, pending = await asyncio.wait(
+                {reaction_task, button_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            self._pending.pop(thread.id, None)
+            message_actions.clear(*offered)
 
         for task in pending:
             task.cancel()
@@ -561,6 +734,8 @@ class AutoUpgradeCog(commands.Cog):
         await thread.send("🔄 Restarting...")
         if status_target is not None:
             await status_target.add_reaction("✅")
+        await _mark_outcome(thread, OUTCOME_DONE, wait=True)
+        await self._remember_restart(thread)
         await asyncio.sleep(1)
         assert self.config.restart_command is not None  # Caller checks this
         await asyncio.create_subprocess_exec(

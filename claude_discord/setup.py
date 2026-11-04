@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
 
+    from claude_code_core.attention import AttentionParams
+    from claude_code_core.attention_repo import AttentionRecorder, HumanActivityRepository
     from claude_code_core.backend import SessionBackend
     from claude_code_core.frontend import SessionFrontend
 
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
     from .database.claims_repo import ClaimRepository
     from .database.frontend_thread_repo import FrontendThreadRepository
     from .database.ingest_repo import IngestResultRepository
+    from .database.lineage_repo import ThreadLineageRepository
     from .database.lounge_repo import LoungeRepository
     from .database.notification_repo import NotificationRepository
     from .database.repository import SessionRepository, UsageStatsRepository
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
     from .database.settings_repo import SettingsRepository
     from .database.summary_repo import ThreadSummaryRepository
     from .database.task_repo import TaskRepository
+    from .database.wait_repo import WaitRepository
     from .ext.api_server import ApiServer
 
 from .deployment import DEFAULT_DATA_ROOT, DataLayout
@@ -56,6 +60,11 @@ class BridgeComponents:
     task_repo: TaskRepository | None = None
     lounge_repo: LoungeRepository | None = None
     claims_repo: ClaimRepository | None = None
+    #: Waits (``/api/waits``): resume a thread when a probe says CI is done.
+    wait_repo: WaitRepository | None = None
+    #: Which thread spawned which — read by /api/sessions so a manager session
+    #: can see its own fan-out instead of inferring it from thread titles.
+    lineage_repo: ThreadLineageRepository | None = None
     resume_repo: PendingResumeRepository | None = None
     ingest_repo: IngestResultRepository | None = None
     summary_repo: ThreadSummaryRepository | None = None
@@ -73,6 +82,11 @@ class BridgeComponents:
     #: so a custom Cog scheduling a reminder lands in the same database the
     #: dispatcher reads.  A Cog that opens its own file writes into a void.
     notification_repo: NotificationRepository | None = None
+    #: Human-activity metering (docs/attention.md): the stored rows, the hook
+    #: frontends record through, and the parameters reports are estimated with.
+    attention_repo: HumanActivityRepository | None = None
+    attention_recorder: AttentionRecorder | None = None
+    attention_params: AttentionParams | None = None
 
     def apply_to_api_server(self, api_server: ApiServer) -> None:
         """Wire all optional repos to an ApiServer instance.
@@ -89,6 +103,10 @@ class BridgeComponents:
             api_server.lounge_repo = self.lounge_repo
         if self.claims_repo is not None:
             api_server.claims_repo = self.claims_repo
+        if self.wait_repo is not None:
+            api_server.wait_repo = self.wait_repo
+        if self.lineage_repo is not None:
+            api_server.lineage_repo = self.lineage_repo
         if self.resume_repo is not None:
             api_server.resume_repo = self.resume_repo
         if self.ingest_repo is not None:
@@ -97,7 +115,12 @@ class BridgeComponents:
             api_server.summary_repo = self.summary_repo
         if self.settings_repo is not None:
             api_server.titler.settings_repo = self.settings_repo
+        if self.attention_repo is not None:
+            api_server.attention_repo = self.attention_repo
+        if self.attention_params is not None:
+            api_server.attention_params = self.attention_params
         api_server.session_repo = self.session_repo
+        api_server.components = self
 
 
 async def setup_bridge(
@@ -120,6 +143,7 @@ async def setup_bridge(
     max_concurrent: int | None = None,
     worktree_base_dir: str | None = None,
     enable_thread_inbox: bool = False,
+    enable_waits: bool = True,
     auto_rename_threads: bool | None = None,
     monitor_all_channels: bool | None = None,
     mention_anywhere: bool | None = None,
@@ -184,6 +208,9 @@ async def setup_bridge(
                                env var (comma-separated).
         cli_sessions_path: Path to ~/.claude/projects for session sync.
         enable_scheduler: Whether to enable SchedulerCog.
+        enable_waits: Whether to watch waits registered through ``/api/waits``
+                      and resume their threads (WaitWatcherCog). On by default:
+                      it is what lets a session end its turn while CI runs.
         task_db_path: Path for scheduled tasks SQLite DB. Overrides *data_root*.
         lounge_channel_id: Discord channel ID for AI Lounge messages.
                            Defaults to COORDINATION_CHANNEL_ID env var.
@@ -209,6 +236,7 @@ async def setup_bridge(
     from .cogs.context_links import ContextLinksCog
     from .cogs.scheduler import SchedulerCog
     from .cogs.session_manage import SessionManageCog
+    from .cogs.session_queue import SessionQueueCog
     from .cogs.skill_command import SkillCommandCog
     from .cross_backend_handoff import ConversationHistoryReader
     from .database.inbox_repo import ThreadInboxRepository
@@ -305,7 +333,7 @@ async def setup_bridge(
 
     from .cogs._run_helper import configure_pr_completion_gate, configure_session_limit
 
-    configure_session_limit(max_concurrent)
+    configure_session_limit(max_concurrent, allowed_user_ids=allowed_user_ids)
     pr_completion_owner = os.getenv("CCDB_PR_COMPLETION_OWNER", "").strip()
     configure_pr_completion_gate(pr_completion_owner or None)
     if pr_completion_owner:
@@ -368,15 +396,35 @@ async def setup_bridge(
     ask_repo = stores.asks
     lounge_repo = stores.lounge
     claims_repo = stores.claims
+    lineage_repo = stores.lineage
     resume_repo = stores.resumes
     usage_repo = stores.usage
     ingest_repo = stores.ingest
+    # Account pools (CCDB_ACCOUNT_POOLS_FILE). None without the file — one
+    # implicit login per backend, exactly as before. An invalid file raises
+    # here so the bot does not start routing turns to the wrong login.
+    from claude_code_core.account_router import build_account_router
+
+    account_router = build_account_router(session_db_path)
     summary_repo = stores.summaries
+
+    # --- Attention metering (on by default; CCDB_ATTENTION_ENABLED=false stops recording) ---
+    from claude_code_core.attention import AttentionConfig
+    from claude_code_core.attention_repo import AttentionRecorder
+
+    attention_config = AttentionConfig.from_env(os.environ)
+    attention_recorder = AttentionRecorder(stores.attention, attention_config)
+    if not attention_config.enabled:
+        logger.info("Attention metering disabled (CCDB_ATTENTION_ENABLED)")
 
     # Attach repos to bot so generic cogs (e.g. AutoUpgradeCog) can discover them
     # without a hard import dependency on ccdb internals.
     bot.session_repo = session_repo  # type: ignore[attr-defined]
     bot.resume_repo = resume_repo  # type: ignore[attr-defined]
+    bot.settings_repo = settings_repo  # type: ignore[attr-defined]
+    # The Ebi AI Console reads these for its usage strip.
+    bot.usage_repo = usage_repo  # type: ignore[attr-defined]
+    bot.account_router = account_router  # type: ignore[attr-defined]
 
     # --- Thread inbox (optional — THREAD_INBOX_ENABLED=true) ---
     if enable_thread_inbox:
@@ -397,6 +445,12 @@ async def setup_bridge(
             env_backend=_runner_class.replace("Runner", "").lower(),
             env_model_for_claude=(runner.model if _runner_class == "ClaudeRunner" else ""),
             env_model_for_codex=(runner.model if _runner_class == "CodexRunner" else ""),
+            # Dedicated var first, so a Claude-default deployment can still
+            # name a pi model for the threads that switch to it.
+            env_model_for_pi=(
+                os.getenv("CCDB_PI_MODEL", "")
+                or (runner.model if _runner_class == "PiRunner" else "")
+            ),
         )
 
     chat_cog = ClaudeChatCog(
@@ -422,6 +476,9 @@ async def setup_bridge(
         monitor_all_channels=monitor_all_channels,
         mention_anywhere=mention_anywhere,
         thread_context_days=thread_context_days,
+        usage_repo=usage_repo,
+        account_router=account_router,
+        attention_recorder=attention_recorder,
     )
     await bot.add_cog(chat_cog)
     logger.info("Registered ClaudeChatCog")
@@ -443,9 +500,14 @@ async def setup_bridge(
         cli_sessions_path=cli_sessions_path,
         settings_repo=settings_repo,
         usage_repo=usage_repo,
+        account_router=account_router,
     )
     await bot.add_cog(session_manage_cog)
     logger.info("Registered SessionManageCog")
+
+    # --- SessionQueueCog (/queue: steer the session slot queue) ---
+    await bot.add_cog(SessionQueueCog(bot, allowed_user_ids=allowed_user_ids))
+    logger.info("Registered SessionQueueCog")
 
     # --- SkillCommandCog (requires at least one channel ID) ---
     if _all_channel_ids:
@@ -458,9 +520,20 @@ async def setup_bridge(
             claude_channel_id=_primary_channel_id,
             claude_channel_ids=_all_channel_ids,
             allowed_user_ids=allowed_user_ids,
+            settings_repo=settings_repo,
         )
         await bot.add_cog(skill_cog)
         logger.info("Registered SkillCommandCog")
+
+    # --- Waits (on by default) ---
+    # Refused where an agent may run sandboxed: a probe runs on the host.
+    if enable_waits:
+        from .waits import waits_unavailable_reason
+
+        reason = waits_unavailable_reason()
+        if reason is not None:
+            enable_waits = False
+            logger.warning("Waits disabled: %s", reason)
 
     # --- SchedulerCog (optional) ---
     task_repo: TaskRepository | None = None
@@ -481,9 +554,19 @@ async def setup_bridge(
             backend_factory=backend_factory,
             backend_settings=backend_settings,
             frontend=frontend,
+            wait_repo=stores.waits if enable_waits else None,
         )
         await bot.add_cog(scheduler_cog)
         logger.info("Registered SchedulerCog")
+
+    # --- WaitWatcherCog ---
+    # Resumes a thread when a wait registered via /api/waits ends, so a session
+    # can end its turn (and free its slot) while CI runs.
+    if enable_waits:
+        from .cogs.wait_watcher import WaitWatcherCog
+
+        await bot.add_cog(WaitWatcherCog(bot, stores.waits))
+        logger.info("Registered WaitWatcherCog")
 
     # --- ContextLinksCog (optional — CONTEXT_LINKS_CONFIG or context_links.json) ---
     if context_links_config is None:
@@ -507,9 +590,22 @@ async def setup_bridge(
             settings=backend_settings,
             factory=backend_factory,
             chat_cog=chat_cog,
+            allowed_user_ids=allowed_user_ids,
         )
         await bot.add_cog(backend_cmd_cog)
         logger.info("Registered BackendCommandCog")
+
+        # --- SandboxCommandCog: per-thread execution environment (/sandbox) ---
+        from .cogs.sandbox_command import SandboxCommandCog
+
+        await bot.add_cog(
+            SandboxCommandCog(
+                bot,  # type: ignore[arg-type]
+                settings_repo=settings_repo,
+                allowed_user_ids=allowed_user_ids,
+            )
+        )
+        logger.info("Registered SandboxCommandCog")
 
         # --- OllamaCommandCog: management for the `local` backend's runtime ---
         # Registered alongside /backend rather than gated on reachability: the
@@ -522,6 +618,7 @@ async def setup_bridge(
                 bot,  # type: ignore[arg-type]
                 settings=backend_settings,
                 chat_cog=chat_cog,
+                allowed_user_ids=allowed_user_ids,
             )
         )
         logger.info("Registered OllamaCommandCog")
@@ -533,6 +630,14 @@ async def setup_bridge(
     if merge_config is not None:
         await bot.add_cog(MergeCommandCog(bot, merge_config))  # type: ignore[arg-type]
         logger.info("Registered MergeCommandCog (repo=%s)", merge_config.repo)
+
+    # --- AttentionCog: /attention reads the estimate back to the operator ---
+    from .cogs.attention_command import AttentionCog
+
+    await bot.add_cog(
+        AttentionCog(bot, repo=stores.attention, params=attention_config.params)  # type: ignore[arg-type]
+    )
+    logger.info("Registered AttentionCog")
 
     # --- AskCommandCog (auto-discovered: only when anonymization rules exist) ---
     # Zero-config by the same rule as the gateway itself — no rules file, no
@@ -555,6 +660,8 @@ async def setup_bridge(
         task_repo=task_repo,
         lounge_repo=lounge_repo,
         claims_repo=claims_repo,
+        wait_repo=stores.waits if enable_waits else None,
+        lineage_repo=lineage_repo,
         resume_repo=resume_repo,
         ingest_repo=ingest_repo,
         summary_repo=summary_repo,
@@ -565,6 +672,9 @@ async def setup_bridge(
         settings_repo=settings_repo,
         ask_repo=ask_repo,
         usage_repo=usage_repo,
+        attention_repo=stores.attention,
+        attention_recorder=attention_recorder,
+        attention_params=attention_config.params,
     )
 
     # Auto-wire repos to ApiServer and set runner.api_port if provided

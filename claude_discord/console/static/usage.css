@@ -1,0 +1,52 @@
+/* Usage strip: always on screen above the board. */
+body { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+body > .app { flex: 1 1 0; min-height: 0; height: auto; }
+
+.usage { display: flex; flex: none; align-items: center; gap: 8px; padding: 5px 10px; background: var(--panel);
+  border-bottom: 1px solid var(--line); overflow-x: auto; white-space: nowrap; font-size: 12px; scrollbar-width: none; }
+.usage::-webkit-scrollbar { display: none; }
+.u-be { display: inline-flex; align-items: center; gap: 8px; padding: 2px 9px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); }
+.u-be.warn { border-color: color-mix(in srgb, var(--me) 55%, var(--line)); }
+.u-be.hot, .u-be.out { border-color: var(--err); background: color-mix(in srgb, var(--err) 12%, var(--bg)); }
+.u-name { font-weight: 700; display: inline-flex; gap: 4px; align-items: baseline; }
+.u-prof { color: var(--dim); font-weight: 400; }
+.u-win { display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
+.u-k, .u-rs, .u-note { color: var(--dim); }
+.u-bar { width: 44px; height: 6px; border-radius: 3px; background: var(--raise); overflow: hidden; }
+.u-bar i { display: block; height: 100%; background: var(--ai); }
+.u-win.warn .u-bar i { background: var(--me); }
+.u-win.hot .u-bar i { background: var(--err); }
+.u-pct { min-width: 30px; text-align: right; font-weight: 600; }
+.u-win.warn .u-pct { color: var(--me); }
+.u-win.hot .u-pct { color: var(--err); }
+.u-out { color: var(--err); font-weight: 700; }
+
+/* CLI sign-in (clilogin.js): a chip per CLI that is not signed in, and its dialog. */
+.cl-btn { font: inherit; font-size: 12px; padding: 1px 8px; border-radius: 5px; border: 1px solid var(--line);
+  background: var(--raise); color: inherit; cursor: pointer; }
+.cl-btn.primary { background: var(--ai); border-color: var(--ai); color: var(--bg); font-weight: 600; }
+.cl-dialog { max-width: min(560px, 92vw); border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  color: inherit; padding: 16px 18px; }
+.cl-dialog::backdrop { background: rgb(0 0 0 / 45%); }
+.cl-title { margin: 0 0 10px; font-size: 16px; }
+.cl-step { margin: 10px 0 4px; font-weight: 600; }
+.cl-url { display: flex; gap: 8px; align-items: center; margin: 0; }
+.cl-link { word-break: break-all; font-size: 12px; max-height: 4.5em; overflow: hidden; }
+.cl-code { display: flex; gap: 10px; align-items: center; margin: 0; }
+.cl-code code { font-size: 22px; letter-spacing: 2px; font-weight: 700; }
+.cl-form { display: flex; gap: 8px; }
+.cl-input { flex: 1; font: inherit; padding: 4px 8px; border-radius: 5px; border: 1px solid var(--line);
+  background: var(--bg); color: inherit; }
+.cl-dim { color: var(--dim); margin: 6px 0; }
+.cl-ok { color: var(--ai); font-weight: 700; }
+.cl-err { color: var(--err); font-weight: 700; }
+.cl-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+
+@media (max-width: 900px) {
+  .nav, .detail { top: var(--usage-h, 0px); }
+  /* Every backend visible without scrolling: one row each if need be. */
+  .usage { flex-wrap: wrap; gap: 4px 6px; padding: 4px 8px; }
+  .u-be { gap: 2px 6px; padding: 1px 7px; flex-wrap: wrap; max-width: 100%; }
+  .u-bar { width: 28px; }
+}

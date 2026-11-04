@@ -13,8 +13,10 @@ Teams app.
 | OpenAI Codex | local `codex` CLI | the CLI's existing login | Codex coding and review workflows |
 | Local | local `codex` CLI to an OpenAI-compatible `/v1/responses` endpoint | none by default | data that should stay on a controlled network |
 | AG-UI | HTTP request plus JSON server-sent events | optional bearer token | custom and hosted agents that implement AG-UI |
+| pi | local `pi` CLI | the CLI's own login or an API key | one agent over many providers, including subscriptions and local servers |
+| Antigravity | local `agy` CLI | the CLI's own Google sign-in | Gemini, Claude and GPT-OSS models on a Google AI subscription |
 
-All four work from both Discord and Microsoft Teams. The frontend controls message rendering,
+All six work from both Discord and Microsoft Teams. The frontend controls message rendering,
 buttons, files, and rate limits; the backend controls model execution and streamed events.
 
 ## Select a backend
@@ -32,6 +34,8 @@ On Discord, switch an individual conversation without restarting:
 /backend codex
 /backend local
 /backend agui
+/backend pi
+/backend antigravity
 ```
 
 These are Discord slash commands, and a conversation override is persisted in SQLite so it survives
@@ -42,6 +46,32 @@ run together.
 
 Use `/model` and `/effort` to inspect or change backend-specific choices. Each backend remembers
 its own model and reasoning setting.
+
+## Manager and child AI in Console
+
+The sidebar's **Default** picker selects the AI for new conversations. **Default child AI**
+selects a separate backend, model and effort for delegated child threads. Both preferences
+persist across restarts.
+
+Inside a conversation, **Manager / this thread AI** changes that conversation's AI.
+**AI for future children** overrides the child defaults for that manager. For example,
+choose Claude Code for the manager and pi with a provider-qualified model for its children.
+The picker uses each backend's discovered catalog and also accepts a custom model ID.
+Backend installation, authentication and deployment safety gates still apply.
+
+Child settings resolve in this order: that manager's child overrides, global child defaults,
+ordinary global defaults, environment defaults. The manager's own thread overrides do not leak
+into child settings. When `POST /api/spawn` includes `parent_thread_id`, resolved choices are
+written to the new child before its first turn, including with `auto_start: false`. Changing
+child preferences affects future children; select an existing child to change its own AI.
+These settings govern relay child threads, not a CLI's internal subagents.
+
+Console endpoints (authenticated; writes also require `X-Console-Request: 1`):
+
+- `GET/POST /console/api/defaults/children`: global child preferences.
+- `GET/POST /console/api/items/{item_id}/children`: a manager's child preferences.
+- POST accepts the same `{ "name": "backend|model|effort", "arg": "value" }` commands
+  as the existing backend picker. GET returns its backend-specific model/effort catalog.
 
 ## Claude Code and Codex
 
@@ -93,6 +123,113 @@ conversation state.
 
 See [AG-UI backend](agui-backend.md) for the event mapping, security boundary, and intentionally
 unsupported protocol features.
+
+## pi
+
+[pi](https://github.com/earendil-works/pi) is a terminal coding agent that normalises Anthropic,
+OpenAI, Google, GitHub Copilot and OpenAI-compatible local servers behind one CLI, and reads
+`AGENTS.md` and skills on its own.
+
+```bash
+npm install -g @earendil-works/pi-coding-agent
+pi          # then /login, once, to authorise a provider
+```
+
+```dotenv
+CCDB_PI_ALLOW_UNSANDBOXED=1
+```
+
+That opt-in is required, and ccdb refuses to spawn `pi` without it. pi documents that it has no
+built-in sandbox and shows no trust prompt in its non-interactive modes, so there is no setting
+that corresponds to the approval loop Claude Code offers: the tool allowlist passed through
+`CCDB_ALLOWED_TOOLS` is the only restriction that applies. Isolation has to come from the host —
+a container, a VM, or the worktree discipline every session prompt already carries.
+
+Project-local `.pi/` settings, skills and extensions are ignored unless
+`CCDB_PI_APPROVE_PROJECT=1` is also set, so a repository ccdb checks out cannot reconfigure the
+agent about to run inside it.
+
+pi does not read Claude Code plugins, so ccdb passes the `skills/` directory of each enabled,
+user-scope plugin as `--skill` (`CCDB_PI_CLAUDE_PLUGIN_SKILLS=0` turns that off). See
+[pi-backend.md](pi-backend.md#claude-code-plugin-skills).
+
+Select a provider and model together, because pi resolves both from one value:
+
+```text
+/model anthropic/claude-sonnet
+/effort high
+```
+
+`/effort` maps to pi's thinking level, which includes an explicit `off`.
+
+See [pi backend](pi-backend.md) for the measured CLI contract and the event mapping.
+
+## Google Antigravity (agy)
+
+The [Google Antigravity CLI](https://antigravity.google/) (`agy`) runs as a CLI-spawn backend the
+same way Claude Code, Codex and pi do. Sign in once in an interactive `agy`, then:
+
+```dotenv
+# agy installs to ~/.local/bin, which a systemd unit's PATH usually lacks.
+CCDB_AGY_COMMAND=/home/you/.local/bin/agy
+```
+
+```text
+/backend antigravity
+/model claude-opus-4-6-thinking   # ids from `agy models`; unset = agy's own default
+/effort high                      # low, medium, high, xhigh, max
+```
+
+**Permissions.** agy's print mode cannot ask for approval, so a tool that needs it is
+auto-denied and the turn ends without doing the work. ccdb maps its own settings onto agy:
+
+| ccdb | agy |
+|---|---|
+| `CCDB_DANGEROUSLY_SKIP_PERMISSIONS=true` or permission mode `bypassPermissions` | `--dangerously-skip-permissions` |
+| permission mode `acceptEdits` / `plan` / `auto` | `--mode accept-edits` / `plan` / `auto` |
+| anything else | agy's default (request-review: approval-gated tools are denied) |
+
+Because the default fails closed, no extra opt-in is needed to spawn agy (unlike pi). A denied
+tool is reported in the thread instead of rendering as an empty answer; allow-rules under
+`permissions.allow` in agy's own `settings.json` are honoured. agy has no tool allowlist flag, so
+ccdb refuses a turn that combines `CCDB_ALLOWED_TOOLS` with any mode in which agy approves tools
+on its own (skipped permissions, `acceptEdits`, `auto`) rather than silently exceed the list. With
+an allowlist, only permission mode `default` (auto-deny) or `plan` runs.
+
+**Limits.** The prompt is sent over stdin as one stream-json message, never in argv.
+`APPEND_SYSTEM_PROMPT` is not passed (agy has no flag for it), images are not forwarded,
+and only the `host` execution environment has been verified (agy keeps its sign-in under
+`~/.gemini`). An unknown `--conversation` id makes agy start a new conversation, whose id ccdb then
+stores, so a lost conversation degrades to a fresh one instead of an error.
+
+## Pinning a scheduled task to a backend
+
+A scheduled task resolves its backend the same way a chat turn does: whatever `/backend` is set to
+for its thread or globally when the 30-second master loop fires it. That default is the useful one
+— move the deployment to Codex and the nightly jobs move with it — but it makes a task's agent an
+ambient property of the deployment rather than part of the task.
+
+`POST /api/tasks` and `PATCH /api/tasks/{id}` take an optional `backend`, and an optional `model`
+alongside it:
+
+```bash
+curl -X POST http://localhost:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"name": "nightly-digest", "prompt": "Summarise today'"'"'s commits",
+       "interval_seconds": 86400, "channel_id": 123,
+       "backend": "codex", "model": "gpt-5.6-sol"}'
+```
+
+`backend` is checked against the same list `/backend` accepts. `model` is free text, as `/model`
+is, but is only accepted **with** a backend: model ids are backend-specific, so a model pinned on
+its own would be handed to whichever backend happened to be active and fail there every night
+instead of being refused once, here. `null` on either field clears it.
+
+`/effort` is deliberately not part of the pin. It still resolves from the settings of whichever
+backend the task runs on, so raising the effort for a backend reaches its pinned tasks too.
+
+A task with no pin behaves exactly as before, which is what every task created before this feature
+does.
 
 ## Mixing frontends and backends
 

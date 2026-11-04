@@ -1199,3 +1199,329 @@ class TestApprovalButton:
         await cog._wait_for_approval(MagicMock(), thread)
 
         thread.send.assert_any_call("👍 Restart approved!")
+
+
+class TestPipelineThreadDeleted:
+    """The upgrade thread can be deleted while the pipeline waits on approval."""
+
+    @pytest.mark.asyncio
+    async def test_deleted_thread_does_not_leak_notfound(self, bot: MagicMock) -> None:
+        config = UpgradeConfig(package_name="pkg", upgrade_approval=True)
+        cog = AutoUpgradeCog(bot, config)
+        thread = MagicMock(spec=discord.Thread)
+        gone = discord.NotFound(MagicMock(status=404, reason="Not Found"), "Unknown Channel")
+        thread.send = AsyncMock(side_effect=gone)
+        cog._wait_for_approval = AsyncMock(side_effect=TimeoutError)  # type: ignore[method-assign]
+
+        await cog._run_pipeline(thread, status_target=None)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_deleted_thread_on_unexpected_error_does_not_leak(self, bot: MagicMock) -> None:
+        config = UpgradeConfig(package_name="pkg", upgrade_approval=True)
+        cog = AutoUpgradeCog(bot, config)
+        thread = MagicMock(spec=discord.Thread)
+        gone = discord.NotFound(MagicMock(status=404, reason="Not Found"), "Unknown Channel")
+        thread.send = AsyncMock(side_effect=gone)
+        cog._wait_for_approval = AsyncMock(side_effect=gone)  # type: ignore[method-assign]
+
+        await cog._run_pipeline(thread, status_target=None)  # must not raise
+
+
+class TestConsoleApproval:
+    """The approval gate offers an approve action the Ebi AI Console can press."""
+
+    def _make(self, bot: MagicMock) -> tuple[AutoUpgradeCog, MagicMock]:
+        config = UpgradeConfig(
+            package_name="pkg",
+            restart_command=["true"],
+            working_dir="/tmp",
+            restart_approval=True,
+        )
+        cog = AutoUpgradeCog(bot=bot, config=config)
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent = None
+        approval_msg = MagicMock()
+        approval_msg.id = 777
+        approval_msg.add_reaction = AsyncMock()
+        thread.send = AsyncMock(return_value=approval_msg)
+        bot.user = MagicMock()
+        bot.user.id = 1
+        return cog, thread
+
+    @pytest.mark.asyncio
+    async def test_console_action_grants_approval(self, bot: MagicMock) -> None:
+        from claude_discord.message_actions import message_actions
+
+        cog, thread = self._make(bot)
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        bot.wait_for = AsyncMock(side_effect=hang)
+
+        async def press() -> None:
+            for _ in range(5):
+                await asyncio.sleep(0)
+            offered = message_actions.for_message(555, 777)
+            assert [a["label"] for a in offered] == ["✅ Approve"]
+            assert await message_actions.invoke(555, 777, offered[0]["id"], "ebi")
+
+        task = asyncio.create_task(press())
+        await asyncio.wait_for(cog._wait_for_approval(MagicMock(), thread), 5)
+        await task
+
+        thread.send.assert_any_call("👍 Restart approved!")
+
+    @pytest.mark.asyncio
+    async def test_action_withdrawn_after_reaction_approval(self, bot: MagicMock) -> None:
+        from claude_discord.message_actions import message_actions
+
+        cog, thread = self._make(bot)
+        event = MagicMock(message_id=777, emoji="✅", user_id=42)
+        bot.wait_for = AsyncMock(return_value=event)
+
+        await cog._wait_for_approval(MagicMock(), thread)
+
+        assert message_actions.for_message(555, 777) == []
+
+
+class TestUnloadWhileWaiting:
+    """A restart while approval is pending must not leave a dead prompt behind."""
+
+    def _make(self, bot: MagicMock) -> tuple[AutoUpgradeCog, MagicMock, MagicMock]:
+        config = UpgradeConfig(
+            package_name="pkg",
+            restart_command=["true"],
+            working_dir="/tmp",
+            restart_approval=True,
+        )
+        cog = AutoUpgradeCog(bot=bot, config=config)
+        parent = MagicMock()
+        button_msg = MagicMock()
+        button_msg.delete = AsyncMock()
+        parent.send = AsyncMock(return_value=button_msg)
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 556
+        thread.parent = parent
+        approval_msg = MagicMock()
+        approval_msg.id = 778
+        approval_msg.add_reaction = AsyncMock()
+        thread.send = AsyncMock(return_value=approval_msg)
+        bot.user = MagicMock()
+        bot.user.id = 1
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        bot.wait_for = AsyncMock(side_effect=hang)
+        return cog, thread, button_msg
+
+    @pytest.mark.asyncio
+    async def test_unload_closes_pending_prompt(self, bot: MagicMock) -> None:
+        from claude_discord.message_actions import message_actions
+
+        cog, thread, button_msg = self._make(bot)
+        task = asyncio.create_task(cog._wait_for_approval(MagicMock(), thread))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert message_actions.for_message(556, 778) != []
+
+        await cog.cog_unload()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        notes = [c.args[0] for c in thread.send.call_args_list if c.args]
+        assert any("no longer waiting" in n for n in notes)
+        button_msg.delete.assert_awaited()
+        assert message_actions.for_message(556, 778) == []
+
+    @pytest.mark.asyncio
+    async def test_unload_without_pending_posts_nothing(self, bot: MagicMock) -> None:
+        cog, thread, _ = self._make(bot)
+        await cog.cog_unload()
+        thread.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_approved_prompt_is_not_closed_on_unload(self, bot: MagicMock) -> None:
+        cog, thread, _ = self._make(bot)
+        bot.wait_for = AsyncMock(return_value=MagicMock(message_id=778, emoji="✅", user_id=42))
+        await cog._wait_for_approval(MagicMock(), thread)
+        thread.send.reset_mock()
+
+        await cog.cog_unload()
+
+        thread.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unload_survives_deleted_thread(self, bot: MagicMock) -> None:
+        cog, thread, _ = self._make(bot)
+        task = asyncio.create_task(cog._wait_for_approval(MagicMock(), thread))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        thread.send = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "gone"))
+
+        await cog.cog_unload()  # must not raise
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+class TestThreadOutcome:
+    """The upgrade thread's title says whether it waits on a person or is finished."""
+
+    @staticmethod
+    def _record() -> tuple[list[str], MagicMock]:
+        seen: list[str] = []
+
+        def request(thread, outcome):
+            seen.append(outcome)
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            return done
+
+        return seen, MagicMock(side_effect=request)
+
+    @pytest.mark.asyncio
+    async def test_waiting_for_approval_is_action_and_restart_is_done(self, bot: MagicMock) -> None:
+        config = UpgradeConfig(
+            package_name="pkg",
+            trigger_prefix="🔄 ebibot-upgrade",
+            restart_command=["true"],
+            working_dir="/tmp",
+            restart_approval=True,
+        )
+        cog = AutoUpgradeCog(bot=bot, config=config)
+        msg = _make_message()
+        approval = MagicMock(id=7)
+        approval.add_reaction = AsyncMock()
+        msg.create_thread.return_value.send = AsyncMock(return_value=approval)
+        msg.create_thread.return_value.parent = None
+        bot.user = MagicMock(id=1)
+        bot.wait_for = AsyncMock(return_value=MagicMock(message_id=7, emoji="✅", user_id=42))
+        seen, request = self._record()
+        with (
+            patch("claude_discord.cogs.auto_upgrade.request_thread_outcome", request),
+            patch(_PATCH_EXEC, new_callable=AsyncMock, return_value=_make_process()),
+            patch(_PATCH_SLEEP, new_callable=AsyncMock),
+        ):
+            await cog.on_message(msg)
+        assert seen == ["action", "done"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_upgrade_is_marked_as_an_error(self, bot: MagicMock) -> None:
+        config = UpgradeConfig(
+            package_name="pkg", trigger_prefix="🔄 ebibot-upgrade", working_dir="/tmp"
+        )
+        cog = AutoUpgradeCog(bot=bot, config=config)
+        seen, request = self._record()
+        with (
+            patch("claude_discord.cogs.auto_upgrade.request_thread_outcome", request),
+            patch(_PATCH_EXEC, new_callable=AsyncMock, return_value=_make_process(returncode=1)),
+        ):
+            await cog.on_message(_make_message())
+        assert seen == ["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_prompt_abandoned_by_a_restart_is_closed_as_done(self, bot: MagicMock) -> None:
+        cog, thread, _ = TestUnloadWhileWaiting()._make(bot)
+        seen, request = self._record()
+        with patch("claude_discord.cogs.auto_upgrade.request_thread_outcome", request):
+            task = asyncio.create_task(cog._wait_for_approval(MagicMock(), thread))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            await cog.cog_unload()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert seen == ["action", "done"]
+
+
+class TestRestartNotice:
+    """After a restart, the new process says so in the thread that asked for it."""
+
+    @staticmethod
+    def _settings(stored: dict[str, str]) -> MagicMock:
+        settings = MagicMock()
+        settings.get = AsyncMock(side_effect=lambda key, default=None: stored.get(key, default))
+
+        async def _set(key: str, value: str) -> None:
+            stored[key] = value
+
+        async def _delete(key: str) -> bool:
+            return stored.pop(key, None) is not None
+
+        settings.set = AsyncMock(side_effect=_set)
+        settings.delete = AsyncMock(side_effect=_delete)
+        return settings
+
+    @staticmethod
+    def _restart_cog(bot: MagicMock) -> AutoUpgradeCog:
+        config = UpgradeConfig(
+            package_name="pkg",
+            trigger_prefix="🔄 ebibot-upgrade",
+            restart_command=["true"],
+            working_dir="/tmp",
+        )
+        return AutoUpgradeCog(bot=bot, config=config)
+
+    @pytest.mark.asyncio
+    async def test_restart_remembers_the_thread(self, bot: MagicMock) -> None:
+        stored: dict[str, str] = {}
+        bot.settings_repo = self._settings(stored)
+        cog = self._restart_cog(bot)
+        thread = MagicMock(id=555)
+        thread.send = AsyncMock()
+        with (
+            patch(_PATCH_EXEC, new_callable=AsyncMock, return_value=_make_process()),
+            patch(_PATCH_SLEEP, new_callable=AsyncMock),
+            patch("claude_discord.cogs.auto_upgrade.request_thread_outcome", MagicMock()),
+        ):
+            await cog._restart(None, thread)
+        assert stored == {"auto_upgrade.restart_thread_id": "555"}
+
+    @pytest.mark.asyncio
+    async def test_startup_posts_once_with_the_version(self, bot: MagicMock) -> None:
+        stored = {"auto_upgrade.restart_thread_id": "555"}
+        bot.settings_repo = self._settings(stored)
+        thread = MagicMock(spec=discord.Thread)
+        thread.send = AsyncMock()
+        bot.get_channel = MagicMock(return_value=thread)
+        cog = self._restart_cog(bot)
+        with patch("claude_discord.cogs.auto_upgrade.package_version", return_value="9.9.9"):
+            await cog.announce_restart()
+            await cog.announce_restart()
+        thread.send.assert_awaited_once()
+        text = thread.send.await_args.args[0]
+        assert "9.9.9" in text and "pkg" in text
+        assert stored == {}
+
+    @pytest.mark.asyncio
+    async def test_startup_without_a_pending_restart_posts_nothing(self, bot: MagicMock) -> None:
+        bot.settings_repo = self._settings({})
+        bot.get_channel = MagicMock()
+        await self._restart_cog(bot).announce_restart()
+        bot.get_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_thread_is_not_an_error(self, bot: MagicMock) -> None:
+        stored = {"auto_upgrade.restart_thread_id": "555"}
+        bot.settings_repo = self._settings(stored)
+        bot.get_channel = MagicMock(return_value=None)
+        bot.fetch_channel = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "gone"))
+        await self._restart_cog(bot).announce_restart()
+        assert stored == {}
+
+    @pytest.mark.asyncio
+    async def test_no_settings_store_is_a_no_op(self, bot: MagicMock) -> None:
+        cog = self._restart_cog(bot)
+        thread = MagicMock(id=555)
+        thread.send = AsyncMock()
+        with (
+            patch(_PATCH_EXEC, new_callable=AsyncMock, return_value=_make_process()),
+            patch(_PATCH_SLEEP, new_callable=AsyncMock),
+            patch("claude_discord.cogs.auto_upgrade.request_thread_outcome", MagicMock()),
+        ):
+            await cog._restart(None, thread)
+        await cog.announce_restart()

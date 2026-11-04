@@ -241,6 +241,55 @@ class TestInterruptOnNewMessage:
         assert kwargs.get("interrupt_existing") is True
 
     @pytest.mark.asyncio
+    async def test_reply_goes_into_the_running_turn_when_it_takes_input(self) -> None:
+        """Issue #1129: a reply reaches the agent mid-turn, as in Claude Code itself."""
+        from claude_discord import live_runs
+
+        cog = _make_cog()
+        message = self._make_thread_message(4242)
+        message.add_reaction = AsyncMock()
+        cog._run_claude = AsyncMock()
+        received: list[str] = []
+
+        class _Live:
+            async def inject_user_message(self, text: str, images=None) -> bool:
+                received.append(text)
+                return True
+
+        run = live_runs.LiveRun(runner=_Live())
+        live_runs.register(4242, run)
+        try:
+            await cog._handle_thread_reply(message)
+        finally:
+            live_runs.unregister(4242, run)
+
+        assert received == ["new instruction"]
+        cog._run_claude.assert_not_called()
+        message.add_reaction.assert_awaited_once_with("📥")
+
+    @pytest.mark.asyncio
+    async def test_stop_reaches_the_runner_that_owns_the_process(self) -> None:
+        """/stop must SIGINT the live clone, not the template it was cloned from."""
+        from claude_discord import live_runs
+
+        cog = _make_cog()
+        interaction = _make_thread_interaction(777)
+        template = MagicMock()
+        template.interrupt = AsyncMock()
+        cog._active_runners[777] = template
+        live = MagicMock()
+        live.interrupt = AsyncMock()
+        run = live_runs.LiveRun(runner=live)
+        live_runs.register(777, run)
+        try:
+            await cog.stop_session.callback(cog, interaction)
+        finally:
+            live_runs.unregister(777, run)
+
+        live.interrupt.assert_awaited_once()
+        template.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_evict_active_run_interrupts_and_notifies(self) -> None:
         """_evict_active_run(interrupt=True) posts the notice and SIGINTs the runner."""
         cog = _make_cog()
@@ -895,6 +944,86 @@ class TestOnReady:
         await cog.on_ready()
         # delete was still called (single-fire)
         resume_repo.delete.assert_called_once_with(1)
+
+    @staticmethod
+    def _console_entry(thread_id: int, prompt: str | None):
+        from claude_discord.database.resume_repo import PendingResume
+
+        return PendingResume(
+            id=9,
+            thread_id=thread_id,
+            session_id="sess-console",
+            reason="self_restart",
+            resume_prompt=prompt,
+            created_at="2026-10-12 09:00:00",
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_ready_resumes_console_conversation(self) -> None:
+        """A Ebi AI Console conversation has no Discord thread: resume it through the console."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from claude_discord.console.host import ConsoleSessionHost
+        from claude_discord.database.resume_repo import PendingResumeRepository
+
+        resume_repo = MagicMock(spec=PendingResumeRepository)
+        resume_repo.get_pending = AsyncMock(
+            return_value=[self._console_entry(6123, "Report back.")]
+        )
+        resume_repo.delete = AsyncMock()
+
+        console = MagicMock(spec=ConsoleSessionHost)
+        console.owns = AsyncMock(return_value=True)
+        console.reply = AsyncMock()
+
+        bot = MagicMock()
+        bot.console_sessions = console
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
+
+        await cog.on_ready()
+
+        resume_repo.delete.assert_called_once_with(9)
+        console.reply.assert_awaited_once()
+        thread_key, prompt, _author = console.reply.await_args.args
+        assert thread_key == 6123
+        assert "Report back." in prompt
+        bot.get_channel.assert_not_called()
+        bot.fetch_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_ready_falls_back_to_discord_when_console_does_not_own(self) -> None:
+        """A thread the console does not own still resumes in Discord."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import discord
+
+        from claude_discord.console.host import ConsoleSessionHost
+        from claude_discord.database.resume_repo import PendingResumeRepository
+
+        resume_repo = MagicMock(spec=PendingResumeRepository)
+        resume_repo.get_pending = AsyncMock(return_value=[self._console_entry(555, None)])
+        resume_repo.delete = AsyncMock()
+
+        console = MagicMock(spec=ConsoleSessionHost)
+        console.owns = AsyncMock(return_value=False)
+        console.reply = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.send = AsyncMock(return_value=MagicMock())
+        thread.parent = MagicMock(spec=discord.TextChannel)
+
+        bot = MagicMock()
+        bot.console_sessions = console
+        bot.get_channel.return_value = thread
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
+
+        with patch.object(cog, "_run_claude", new=AsyncMock()) as run:
+            await cog.on_ready()
+            await asyncio.sleep(0)
+
+        console.reply.assert_not_called()
+        run.assert_called_once()
 
 
 class TestCogUnloadMarkForResume:
@@ -2452,3 +2581,120 @@ class TestOtherBotMentions:
         await cog.on_message(msg)
 
         cog._handle_thread_reply.assert_awaited_once_with(msg)
+
+
+class TestQueuedRunsAcrossRestart:
+    """A run still queued at shutdown is replayed with the prompt it was about to send."""
+
+    @pytest.fixture
+    def slots(self):
+        from claude_discord.session_slots import (
+            SessionSlotScheduler,
+            get_session_slots,
+            set_session_slots,
+        )
+
+        original = get_session_slots()
+        scheduler = SessionSlotScheduler(1)
+        set_session_slots(scheduler)
+        yield scheduler
+        set_session_slots(original)
+
+    @pytest.mark.asyncio
+    async def test_cog_unload_saves_queued_prompt_instead_of_generic_resume(self, slots) -> None:
+        from claude_discord.restart_reservation import QUEUED_RESTART_REASON
+
+        await slots.acquire(111)
+        waiter = asyncio.ensure_future(slots.acquire(222, resume_prompt="the user's message"))
+        await asyncio.sleep(0)
+
+        repo = MagicMock()
+        repo.get = AsyncMock(return_value=None)
+        resume_repo = MagicMock()
+        resume_repo.mark = AsyncMock(return_value=1)
+        cog = ClaudeChatCog(bot=MagicMock(), repo=repo, runner=MagicMock(), resume_repo=resume_repo)
+        cog._active_runners[111] = MagicMock()
+        cog._active_runners[222] = MagicMock()
+
+        await cog.cog_unload()
+
+        marks = {c.args[0]: c.kwargs for c in resume_repo.mark.call_args_list}
+        assert marks[222] == {
+            "reason": QUEUED_RESTART_REASON,
+            "resume_prompt": "the user's message",
+        }
+        assert marks[111]["reason"] == "bot_shutdown"
+        assert resume_repo.mark.call_count == 2
+        waiter.cancel()
+
+    @pytest.mark.asyncio
+    async def test_on_ready_replays_queued_prompt_in_discord_thread(self) -> None:
+        from claude_discord.database.resume_repo import PendingResume
+        from claude_discord.restart_reservation import QUEUED_RESTART_REASON
+
+        entry = PendingResume(
+            id=3,
+            thread_id=555,
+            session_id=None,
+            reason=QUEUED_RESTART_REASON,
+            resume_prompt="please deploy",
+            created_at="2026-10-12 11:00:00",
+        )
+        resume_repo = MagicMock()
+        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.delete = AsyncMock()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 900
+        notice = MagicMock()
+        thread.send = AsyncMock(return_value=notice)
+        bot = MagicMock(spec=["get_channel", "fetch_channel"])
+        bot.get_channel.return_value = thread
+        record = MagicMock(session_id=None, working_dir="/w")
+        repo = MagicMock()
+        repo.get = AsyncMock(return_value=record)
+        cog = ClaudeChatCog(
+            bot=bot,
+            repo=repo,
+            runner=MagicMock(),
+            resume_repo=resume_repo,
+            chat_only_channel_ids={900},
+        )
+
+        run = AsyncMock()
+        with patch.object(cog, "_run_claude", new=run):
+            await cog.on_ready()
+            await asyncio.sleep(0)
+
+        resume_repo.delete.assert_awaited_once_with(3)
+        assert "queued" in thread.send.call_args.args[0]
+        run.assert_awaited_once()
+        assert run.call_args.args == (notice, thread, "please deploy")
+        assert run.call_args.kwargs["working_dir_override"] == "/w"
+        assert run.call_args.kwargs["chat_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_on_ready_routes_console_conversations_to_the_console(self) -> None:
+        from claude_discord.database.resume_repo import PendingResume
+        from claude_discord.restart_reservation import QUEUED_RESTART_REASON
+
+        entry = PendingResume(
+            id=4,
+            thread_id=777,
+            session_id=None,
+            reason=QUEUED_RESTART_REASON,
+            resume_prompt="console ask",
+            created_at="2026-10-12 11:00:00",
+        )
+        resume_repo = MagicMock()
+        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.delete = AsyncMock()
+        bot = MagicMock()
+        bot.console_sessions.owns = AsyncMock(return_value=True)
+        bot.console_sessions.resume_queued = AsyncMock()
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
+
+        await cog.on_ready()
+
+        bot.console_sessions.resume_queued.assert_awaited_once_with(777, "console ask")
+        bot.get_channel.assert_not_called()

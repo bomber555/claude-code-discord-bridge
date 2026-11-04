@@ -25,6 +25,8 @@ from ..database.repository import SessionRepository
 from ..discord_ui.status import StatusManager
 
 if TYPE_CHECKING:
+    from claude_code_core.account_pool import AccountTurn
+
     from ..backend_settings import BackendSettings
     from ..collision import FileActivityTracker
     from ..database.inbox_repo import ThreadInboxRepository
@@ -122,6 +124,14 @@ class RunConfig:
     # Which frontend created this session mapping. Historical callers remain
     # Discord by default; the Teams host sets this explicitly.
     session_origin: str = "discord"
+    # Account-pool observations for this turn (rejections, terminal error).
+    # Set only when the backend has a pool; shared by reference across the
+    # compact/ask reruns so the router sees the whole turn.
+    account_turn: AccountTurn | None = None
+    # True for the automatic continuation of a session that was paused to
+    # free its slot. The run queues as deferred, so it resumes only once
+    # nobody else is ahead of it (see session_slots.py).
+    resumed_from_pause: bool = False
 
     # Prevent accidental field mutation — RunConfig is a value object.
     # Use dataclasses.replace() to create modified copies.

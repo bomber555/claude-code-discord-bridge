@@ -20,38 +20,62 @@ import contextlib
 import logging
 import re
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import discord
 
 from claude_code_core.frontend import Notice, NoticeLevel
 
+from .. import live_runs
 from ..discord_ui.ask_handler import collect_ask_answers
 from ..discord_ui.embeds import error_embed, timeout_embed
+from ..discord_ui.slot_views import SlotWaitView, waiting_embed
 from ..lounge import build_lounge_prompt
 from ..pr_completion_gate import GitHubPrCompletionGate, build_completion_prompt
-from .event_processor import EventProcessor
+from ..session_slots import (
+    SessionSlotScheduler,
+    SlotEntry,
+    SlotPriority,
+    configure_session_slots,
+    get_session_slots,
+)
+from ..thread_marker import OUTCOME_ERROR, OUTCOME_WAITING
+from ..thread_status import schedule_thread_outcome
+from .event_processor import EventProcessor, _backend_name_from_runner
 from .run_config import RunConfig
+
+if TYPE_CHECKING:
+    from claude_code_core.types import AskQuestion, InjectedMessage
+
+    from ..database.wait_repo import WaitRepository
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Global session slot limiter
 # ---------------------------------------------------------------------------
-_global_semaphore: asyncio.Semaphore | None = None
-_max_concurrent: int = 3
 _pr_completion_gate: GitHubPrCompletionGate | None = None
 
+# Prompt for the automatic continuation of a session paused to free its slot.
+# The interrupted turn is already in the transcript, so --resume plus this
+# prompt picks the work up where it stopped.
+PAUSE_RESUME_PROMPT = (
+    "[Resumed automatically] This session was paused mid-turn so another "
+    "session could use its slot. Continue the interrupted work from where it "
+    "stopped. Do not redo steps that already completed."
+)
 
-def configure_session_limit(max_concurrent: int) -> None:
+
+def configure_session_limit(
+    max_concurrent: int, *, allowed_user_ids: set[int] | None = None
+) -> None:
     """Set the process-wide concurrent session limit.
 
     Called once from ``setup_bridge()`` during startup.  All subsequent calls to
     ``run_claude_with_config()`` — regardless of which Cog invokes them — will
-    honour the limit.
+    honour the limit, through one reorderable queue (``session_slots.py``).
     """
-    global _global_semaphore, _max_concurrent  # noqa: PLW0603
-    _max_concurrent = max_concurrent
-    _global_semaphore = asyncio.Semaphore(max_concurrent)
+    configure_session_slots(max_concurrent, allowed_user_ids=allowed_user_ids)
 
 
 def configure_pr_completion_gate(owner: str | None) -> None:
@@ -126,6 +150,98 @@ def _truncate_result(content: str) -> str:
     return content[:TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
 
 
+def _build_done_marker_section(config: RunConfig) -> str | None:
+    """Tell the agent how to propose that this thread can be closed.
+
+    The agent proposes; only a human closes. Only offered where it can work: a
+    surface that renames threads, a backend that exposes the control-plane API,
+    and a candidate marker the operator has not disabled.
+    """
+    from ..thread_marker import candidate_marker
+
+    marker = candidate_marker()
+    if not marker or not config.surface.capabilities.supports_thread_rename:
+        return None
+    if getattr(config.runner, "api_port", None) is None:
+        return None
+    return (
+        "## Finishing a Thread\n"
+        "When the user's request in this thread is fully finished — changes committed "
+        "and pushed/merged, pipelines green, deliverables sent, nothing waiting on you "
+        "or on the user — end your final reply by telling the user, in their language, "
+        "that this thread looks ready to close, and mark it as a completion candidate:\n"
+        '  `curl -s -X POST "$CCDB_API_URL/api/threads/$DISCORD_THREAD_ID/candidate"`\n'
+        f"This prefixes the thread title with {marker}. It is only a proposal: the thread "
+        "stays listed until the user confirms it done, which only the user can do. Do NOT "
+        "mark it when you are asking "
+        "a question, waiting for a pipeline or a decision, or leaving work pending. "
+        "If the user replies later, the marker is removed automatically.\n"
+        "Customer replies: Preparing a draft is NOT sending it to the customer. "
+        "Producing an answer, an attachment, or posting it in this AI conversation does not "
+        "prove external delivery. Keep the thread in review while the user checks the draft, "
+        "or action while they still need to send it. Do not infer completion from polished "
+        "customer-facing wording or the end of your turn. Require explicit evidence of "
+        "customer delivery and no remaining work before considering completion.\n"
+        "Teams Channel Exporter: imported/synced Teams reply-draft threads require human "
+        "completion. Never autonomously mark these threads done, even after generating "
+        "the final reply body or observing delivery; leave completion to the user's "
+        "explicit completion action. This also applies on later turns in the same thread. "
+        "Use review/action for pending human work. Keep status commentary outside the "
+        "customer-facing reply body." + _waiting_marker_hint()
+    )
+
+
+def _build_wait_section(config: RunConfig) -> str | None:
+    """Tell the agent to end its turn while CI runs — only where a watcher will resume it."""
+    from .. import waits
+
+    if not _waits_available(config):
+        return None
+    return waits.build_wait_section()
+
+
+def _waits_available(config: RunConfig) -> bool:
+    """A watcher runs and this turn's agent can reach the control plane to register."""
+    from .. import waits
+
+    return waits.watcher_active() and getattr(config.runner, "api_port", None) is not None
+
+
+def _waiting_marker_hint() -> str:
+    """The counterpart of done: the turn ends because the human has to move next.
+
+    Split three ways so the channel list says *what* is expected, not just that
+    something is: a reply, a look at a deliverable, or a task outside the chat.
+    """
+    from ..thread_marker import action_marker, review_marker, waiting_marker
+
+    kinds = [
+        ("waiting", waiting_marker(), "a reply is enough — a question, a choice, a go/no-go"),
+        ("review", review_marker(), "a deliverable (draft, slides, attachment) to look over"),
+        (
+            "action",
+            action_marker(),
+            "a task they must do themselves outside this chat — a manual step in a UI, "
+            "sign-in/MFA, an approval in a portal, a payment, anything physical",
+        ),
+    ]
+    lines = [
+        f"  {marker} {desc}:\n"
+        f'    `curl -s -X POST "$CCDB_API_URL/api/threads/$DISCORD_THREAD_ID/{path}"`'
+        for path, marker, desc in kinds
+        if marker
+    ]
+    if not lines:
+        return ""
+    return (
+        "\nWhen instead your turn ends because only the user can move the work forward, "
+        "say plainly what you need from them and mark the thread with the ONE that fits:\n"
+        + "\n".join(lines)
+        + "\nThe marker is removed when the user replies. Do not use any of these while "
+        "you are the one who still has work to do."
+    )
+
+
 async def _build_system_context(config: RunConfig) -> str | None:
     """Build ephemeral system context from AI Lounge and concurrency notice.
 
@@ -175,9 +291,16 @@ async def _build_system_context(config: RunConfig) -> str | None:
 
     wd = config.runner.working_dir or "your current working directory"
     marker = _attachment_marker_name(config.surface.thread_key)
+    where = _platform_label(config.surface.frontend)
     parts.append(
         "## File Delivery\n"
-        "When you need to send files to Discord, use your Bash tool to append "
+        f"{where} cannot open local filesystem paths. Never describe a local path as a "
+        "clickable link, and never use a local path or file:// URI as a user-facing Markdown "
+        "link. For every file the user asks to view, open, download, or receive, deliver it as "
+        f"a real {where} attachment using the marker below and refer to it as an attached file "
+        f"in the final response. This {where}-specific rule overrides general instructions to "
+        "prefer clickable local-file links.\n"
+        f"When you need to send files to {where}, use your Bash tool to append "
         "each file's ABSOLUTE path (one path per line, UTF-8) to:\n"
         f"  {wd}/{marker}\n"
         f"Example: `echo /absolute/path/to/file >> {wd}/{marker}`\n"
@@ -187,6 +310,40 @@ async def _build_system_context(config: RunConfig) -> str | None:
         "that file path here. Otherwise, only include files the user explicitly "
         "asked to receive."
     )
+
+    parts.append(
+        "## Ebi AI Console thread links\n"
+        "When the user asks where an earlier conversation is, find it before linking. "
+        "The relay's GET $CCDB_API_URL/api/search?q=<URL-encoded keywords>&body=1 "
+        "can search saved session summaries and local Claude transcripts. "
+        "For Console navigation, return [thread title](/#focus/t<thread_id>) using the "
+        "actual thread_id from the search result (replace the placeholder). "
+        "If you have a Console work-item ID, use /#focus/<item_id> unchanged instead. "
+        "To link a note in the Obsidian vault, use [note title](/#note/<vault-relative path>), "
+        "e.g. /#note/02_Contexts/<context>/status.md; URL-encode each path segment that "
+        "contains spaces or parentheses. It opens in the Console note viewer. "
+        "These relative links open inside Ebi AI Console; on Discord use the returned "
+        "deep_link as well when available. Never invent thread IDs or Console hostnames, "
+        "and never include authentication tokens in links. If nothing matches, say so."
+    )
+
+    parts.append(
+        "## Delegated child thread AI\n"
+        "When creating an authorized child thread via POST $CCDB_API_URL/api/spawn, "
+        f"include parent_thread_id: {config.surface.thread_key}. "
+        "The relay applies the user's saved child AI preferences (backend, model, effort) "
+        "before the first turn. Do not switch the child to your own backend or model. "
+        "These settings govern relay child threads, not a backend's native subagents. "
+        "Creating a child thread still requires authorization to delegate."
+    )
+
+    done_section = _build_done_marker_section(config)
+    if done_section:
+        parts.append(done_section)
+
+    wait_section = _build_wait_section(config)
+    if wait_section:
+        parts.append(wait_section)
 
     # Post-compact guardrail: prevent auto-execution of "pending tasks" from summary.
     if config.post_compact_rerun:
@@ -326,6 +483,16 @@ async def _get_pr_completion_prompt(
     ):
         return None
 
+    # A thread that registered a wait has done exactly what the gate asks for;
+    # continuing it now would only register the same wait again.
+    wait_repo = _waits_repo_if_available(config)
+    if wait_repo is not None:
+        try:
+            if config.surface.thread_key in await wait_repo.active_thread_ids():
+                return None
+        except Exception:
+            logger.warning("Could not read waits for the PR completion gate", exc_info=True)
+
     try:
         prs = await gate.find_for_thread(config.surface.thread_key)
     except Exception:
@@ -361,7 +528,13 @@ async def _get_pr_completion_prompt(
                 ),
             )
         )
-    return build_completion_prompt(prs)
+    return build_completion_prompt(prs, waits_available=_waits_available(config))
+
+
+def _waits_repo_if_available(config: RunConfig) -> WaitRepository | None:
+    from .. import waits
+
+    return waits.watcher_repo() if _waits_available(config) else None
 
 
 async def run_claude_with_config(config: RunConfig) -> str | None:
@@ -401,27 +574,40 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
 
     processor = EventProcessor(config)
 
-    # --- Session slot limiter (global semaphore) ---
-    sem = _global_semaphore
-    if sem is not None and sem.locked():
-        with contextlib.suppress(Exception):
-            await config.surface.send_notice(
-                Notice(
-                    level=NoticeLevel.SUBTLE,
-                    body=(
-                        f"\u23f3 Waiting for a free session slot\u2026 "
-                        f"({_max_concurrent} max sessions running)"
-                    ),
-                )
-            )
-    if sem is not None:
-        await sem.acquire()
+    # --- Session slot limiter (reorderable queue) ---
+    slots = get_session_slots()
+    slot = await _acquire_slot(config, slots) if slots is not None else None
+    if slot is not None:
+        slot.on_pause = runner.interrupt
+    if config.resumed_from_pause:
+        # Deferred only while queueing; later compact/ask reruns queue normally.
+        config = replace(config, resumed_from_pause=False)
 
+    live = live_runs.LiveRun(
+        runner=runner,
+        slot=slot,
+        processor=processor,
+        backend=_backend_name_from_runner(runner),
+    )
+    live_runs.register(config.surface.thread_key, live)
     try:
         async for event in runner.run(config.prompt, session_id=config.session_id):
             if processor.should_drain and not event.is_complete:
                 continue
             await processor.process(event)
+    except asyncio.CancelledError:
+        # Shutdown or eviction: whatever the human sent into this turn and the
+        # agent never read must not vanish without a word.
+        unread_on_cancel = _unread_messages(runner)
+        if unread_on_cancel:
+            logger.warning(
+                "Run in %d cancelled with %d unread message(s)",
+                config.surface.thread_key,
+                len(unread_on_cancel),
+            )
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(_report_undelivered(config, unread_on_cancel))
+        raise
     except Exception as exc:
         logger.exception("Error running Claude CLI for thread %d", config.surface.thread_key)
         with contextlib.suppress(Exception):
@@ -436,16 +622,30 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         if config.status:
             with contextlib.suppress(Exception):
                 await config.status.set_error()
+        await _show_outcome(config, OUTCOME_ERROR)
         await _emit_result_sink(config, None, f"{type(exc).__name__}: {exc}")
+        await _report_undelivered(config, _unread_messages(runner))
         return processor.session_id
     finally:
-        if sem is not None:
-            sem.release()
+        live_runs.unregister(config.surface.thread_key, live)
+        if slots is not None and slot is not None:
+            slots.release(slot)
         await processor.finalize()
         if config.registry is not None:
             config.registry.unregister(config.surface.thread_key)
         if config.worktree_manager is not None:
             await _cleanup_session_worktree(config)
+
+    # Messages the human sent into this turn that the agent never read (the
+    # turn was stopped, paused or interrupted first). A continuation of this
+    # run carries them; a run that simply ends shows them as undelivered rather
+    # than starting work the human may have just stopped.
+    unread = _unread_messages(runner)
+
+    # Paused to free the slot: queue the continuation as deferred so it
+    # resumes on its own once the sessions it yielded to are through.
+    if slot is not None and slot.pause_requested:
+        return await _requeue_paused(config, processor, unread)
 
     # After compact_boundary, rerun with a guardrail to prevent Claude from
     # auto-executing "pending tasks" from the compacted context summary.
@@ -454,7 +654,9 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         logger.info(
             "Compact detected for session %s — rerunning with post-compact guardrail", session_id
         )
-        guardrail_config = replace(config, session_id=session_id, post_compact_rerun=True)
+        guardrail_config = _carry_unread(
+            replace(config, session_id=session_id, post_compact_rerun=True), unread
+        )
         return await run_claude_with_config(guardrail_config)
 
     # Honour a ScheduleWakeup tool call by registering a one-shot scheduled
@@ -467,6 +669,14 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     # After the stream ends, handle pending AskUserQuestion by showing Discord
     # UI and resuming the session with the user's answer.
     if processor.pending_ask and processor.session_id:
+        await _show_outcome(config, OUTCOME_WAITING)
+        if config.thread is None:
+            # No Discord UI to collect the answer on. The questions go into the
+            # conversation, and the human's next message resumes the session.
+            await _post_questions(config, processor.pending_ask)
+            await _report_undelivered(config, unread)
+            await _emit_result_sink(config, processor.final_assistant_text, processor.final_error)
+            return processor.session_id
         answer_prompt = await collect_ask_answers(
             config.thread,
             processor.pending_ask,
@@ -475,11 +685,14 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             notify_user_id=config.notify_user_id,
         )
         if answer_prompt:
+            await _show_outcome(config, None)
             logger.info(
                 "Resuming session %s after AskUserQuestion answer",
                 processor.session_id,
             )
-            return await run_claude_with_config(config.with_prompt(answer_prompt))
+            return await run_claude_with_config(
+                _carry_unread(config.with_prompt(answer_prompt), unread)
+            )
 
     # A PR created by this Discord thread is an intermediate artifact, not a
     # terminal outcome. Resume the same agent once so green owner PRs are
@@ -492,8 +705,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     )
     if completion_prompt is not None:
         completion_config = replace(
-            config,
-            prompt=completion_prompt,
+            _carry_unread(config.with_prompt(completion_prompt), unread),
             session_id=session_id,
             pr_completion_gate_rerun=True,
         )
@@ -504,8 +716,174 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     # sink fires exactly once, from the outermost completed run. An in-stream
     # RESULT error (e.g. API 400/429) is reported as an error, not an empty
     # "done", so the caller can tell a failure from an empty answer.
+    await _report_undelivered(config, unread)
+    if processor.final_error:
+        await _show_outcome(config, OUTCOME_ERROR)
     await _emit_result_sink(config, processor.final_assistant_text, processor.final_error)
     return processor.session_id
+
+
+def _unread_messages(runner: object) -> list[InjectedMessage]:
+    """Messages delivered into the run that its agent never read."""
+    unconsumed = getattr(runner, "unconsumed_messages", None)
+    if unconsumed is None:
+        return []
+    return list(unconsumed())
+
+
+def _message_text(message: InjectedMessage) -> str:
+    if message.text:
+        return message.text
+    return f"({len(message.images)} image(s), no text)"
+
+
+def _carry_unread(config: RunConfig, unread: list[InjectedMessage]) -> RunConfig:
+    """*config* with the human's unread messages — text and images — added to its prompt."""
+    if not unread:
+        return config
+    messages = "\n\n---\n\n".join(_message_text(m) for m in unread)
+    prompt = (
+        f"{config.prompt}\n\n"
+        "The human also sent the following while you were working; you have not "
+        f"read it yet:\n\n{messages}"
+    )
+    images = [image for message in unread for image in message.images]
+    return replace(
+        config,
+        prompt=prompt,
+        images=[*(config.images or []), *images] if images else config.images,
+    )
+
+
+async def _report_undelivered(config: RunConfig, unread: list[InjectedMessage]) -> None:
+    """Say which messages the agent never read, so the human can send them again."""
+    if not unread:
+        return
+    quoted = "\n\n".join("> " + _message_text(message).replace("\n", "\n> ") for message in unread)
+    with contextlib.suppress(Exception):
+        await config.surface.send_notice(
+            Notice(
+                level=NoticeLevel.WARNING,
+                title="Not read by the agent",
+                body=(
+                    "The turn ended before the agent read these messages. "
+                    f"Send them again if they still apply.\n\n{quoted}"
+                ),
+            )
+        )
+
+
+_PLATFORM_LABELS = {"discord": "Discord", "teams": "Teams", "console": "Ebi AI Console"}
+
+
+def _platform_label(frontend: str) -> str:
+    """How the agent should name where the human reads its answer."""
+    return _PLATFORM_LABELS.get(frontend, "Discord")
+
+
+async def _show_outcome(config: RunConfig, outcome: str | None) -> None:
+    """Show how the turn ended on whatever the conversation lives in.
+
+    A Discord thread gets the marker in its title. A surface that keeps its
+    own title (the Ebi AI Console) exposes ``set_outcome``; any other surface
+    has nowhere to show it.
+    """
+    if config.thread is not None:
+        schedule_thread_outcome(config.thread, outcome)
+        return
+    set_outcome = getattr(config.surface, "set_outcome", None)
+    if set_outcome is None:
+        return
+    try:
+        await set_outcome(outcome)
+    except Exception:
+        logger.warning(
+            "Could not show outcome %r on %d", outcome, config.surface.thread_key, exc_info=True
+        )
+
+
+async def _post_questions(config: RunConfig, questions: list[AskQuestion]) -> None:
+    """Write AskUserQuestion's questions into a conversation that has no buttons."""
+    blocks = []
+    for q in questions:
+        lines = [f"**{q.header}**"] if q.header else []
+        lines.append(q.question)
+        lines.extend(
+            f"- {o.label}" + (f" — {o.description}" if o.description else "") for o in q.options
+        )
+        blocks.append("\n".join(lines))
+    with contextlib.suppress(Exception):
+        await config.surface.send_text("\n\n".join(blocks) + "\n\n_Reply with your answer._")
+
+
+def _slot_label(config: RunConfig) -> str:
+    name = getattr(config.thread, "name", None)
+    return name if isinstance(name, str) and name else str(config.surface.thread_key)
+
+
+async def _acquire_slot(config: RunConfig, slots: SessionSlotScheduler) -> SlotEntry:
+    """Take a session slot, showing queue controls while the run waits."""
+    thread_key = config.surface.thread_key
+    priority = SlotPriority.DEFERRED if config.resumed_from_pause else SlotPriority.NORMAL
+    acquire_coro = slots.acquire(
+        thread_key,
+        label=_slot_label(config),
+        priority=priority,
+        resumed_from_pause=config.resumed_from_pause,
+        resume_prompt=config.prompt,
+    )
+    if not slots.would_wait(priority):
+        return await acquire_coro
+
+    acquire = asyncio.ensure_future(acquire_coro)
+    # Let the entry join the queue first so the message shows its position.
+    await asyncio.sleep(0)
+
+    view: SlotWaitView | None = None
+    message: discord.Message | None = None
+    if isinstance(config.thread, discord.abc.Messageable):
+        view = SlotWaitView(slots, thread_key)
+        with contextlib.suppress(Exception):
+            message = await config.thread.send(
+                embed=waiting_embed(slots, thread_key, resumed=config.resumed_from_pause),
+                view=view,
+            )
+    else:
+        with contextlib.suppress(Exception):
+            await config.surface.send_notice(
+                Notice(
+                    level=NoticeLevel.SUBTLE,
+                    body=(
+                        "\U0001f504 A bot restart is reserved \u2014 this run starts "
+                        "right after the restart."
+                        if slots.held
+                        else f"\u23f3 Waiting for a free session slot\u2026 "
+                        f"({slots.max_slots} max sessions running)"
+                    ),
+                )
+            )
+    try:
+        return await acquire
+    finally:
+        if view is not None:
+            await view.close(message, resumed=config.resumed_from_pause)
+
+
+async def _requeue_paused(
+    config: RunConfig, processor: EventProcessor, unread: list[InjectedMessage] | None = None
+) -> str | None:
+    """Continue a paused session once a slot is free again."""
+    session_id = processor.session_id or config.session_id
+    logger.info("Thread %d paused to free its slot; re-queued", config.surface.thread_key)
+    resume_config = replace(
+        config,
+        # Without a session there is nothing to resume, so the original
+        # request runs again from the start.
+        prompt=PAUSE_RESUME_PROMPT if session_id else config.prompt,
+        session_id=session_id,
+        resumed_from_pause=True,
+    )
+    return await run_claude_with_config(_carry_unread(resume_config, unread or []))
 
 
 async def _emit_result_sink(config: RunConfig, text: str | None, error: str | None) -> None:
