@@ -13,7 +13,8 @@ Two rules are enforced here rather than left to the prompt:
   thread's current name is something else, a person (or another bot) renamed
   it, and the thread is locked against further automatic renames until a
   request arrives with ``override: true`` — which the session should only send
-  when the human has said so.
+  when the human has said so.  Tags ccdb adds itself (outcome, scheduled,
+  lineage) are not a rename: they are ignored here and kept on the new title.
 * **Discord's rename limit is respected.**  Discord allows two name changes per
   thread per ten minutes; past that, discord.py silently sleeps inside
   ``edit()`` for minutes.  Extra requests inside the window are coalesced and
@@ -30,6 +31,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from .thread_marker import bare_thread_title, carry_thread_tags
+
 logger = logging.getLogger(__name__)
 
 #: Discord: 2 thread renames per 10 minutes per channel.
@@ -38,6 +41,10 @@ RENAME_WINDOW_SECONDS = 600.0
 MAX_TITLE_LENGTH = 100
 
 _SETTINGS_KEY = "thread_title:{thread_id}"
+
+
+def _renamed_by_someone_else(current: str | None, last_set: str) -> bool:
+    return bare_thread_title(current or "") != bare_thread_title(last_set)
 
 
 def normalize_title(raw: object) -> str:
@@ -117,7 +124,11 @@ class ThreadTitler:
 
             if override:
                 state["locked"] = False
-            elif not state.get("locked") and last_set is not None and current != last_set:
+            elif (
+                not state.get("locked")
+                and last_set is not None
+                and _renamed_by_someone_else(current, last_set)
+            ):
                 state["locked"] = True
                 await self._save(thread_id, state)
                 logger.info("thread %d renamed by someone else; auto-title locked", thread_id)
@@ -125,7 +136,7 @@ class ThreadTitler:
                 self._cancel(thread_id)
                 return TitleResult("locked", title, current=current)
 
-            if title == current:
+            if bare_thread_title(title) == bare_thread_title(current or ""):
                 self._cancel(thread_id)
                 state["last_set"] = title
                 await self._save(thread_id, state)
@@ -149,7 +160,7 @@ class ThreadTitler:
             timer.cancel()
 
     async def _edit(self, thread: Any, title: str, state: dict[str, Any]) -> None:
-        await thread.edit(name=title)
+        await thread.edit(name=carry_thread_tags(getattr(thread, "name", None) or "", title))
         self._edits.setdefault(int(thread.id), deque()).append(time.monotonic())
         state["last_set"] = title
         await self._save(int(thread.id), state)
@@ -166,12 +177,13 @@ class ThreadTitler:
                 state = await self._load(thread_id)
                 current = getattr(thread, "name", None)
                 if state.get("locked") or (
-                    state.get("last_set") is not None and current != state["last_set"]
+                    state.get("last_set") is not None
+                    and _renamed_by_someone_else(current, state["last_set"])
                 ):
                     state["locked"] = True
                     await self._save(thread_id, state)
                     return
-                if title != current:
+                if bare_thread_title(title) != bare_thread_title(current or ""):
                     await self._edit(thread, title, state)
         except asyncio.CancelledError:
             raise

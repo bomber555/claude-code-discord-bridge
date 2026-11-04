@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 
+from claude_code_core.account_pool import DEFAULT_PROFILE, AccountBinding
 from claude_code_core.approvals import (
     elicitation_form_prompt,
     elicitation_form_result,
@@ -61,6 +62,10 @@ def _backend_name_from_runner(runner: object) -> str:
         return "codex"
     if cls == "AgUiBackend":
         return "agui"
+    if cls == "PiRunner":
+        return "pi"
+    if cls == "AntigravityRunner":
+        return "antigravity"
     return "claude"
 
 
@@ -120,12 +125,29 @@ def _truncate_result(content: str) -> str:
     return content[:_TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
 
 
+def _execution_label_wanted(served: str) -> bool:
+    from claude_code_core.execution import HOST, ExecutionConfig
+
+    return served != HOST or len(ExecutionConfig.from_env().allowed_modes) > 1
+
+
 def _completion_fields(event: StreamEvent, runner: object) -> tuple[tuple[str, str], ...]:
     """Build frontend-neutral completion metadata from a terminal event."""
     fields: list[tuple[str, str]] = []
     backend = _backend_name_from_runner(runner)
     model = getattr(runner, "model", None)
     fields.append(("Backend", f"{backend}{f' · {model}' if model else ''}"))
+    account = getattr(runner, "account", None)
+    if isinstance(account, AccountBinding):
+        # Only set when an account pool is configured, so the footer is
+        # unchanged for a single-login deployment.
+        fields.append(("Account", account.profile))
+    # Which execution environment ran the turn. A deployment that only allows
+    # ``host`` (the default) has nothing to choose between, so it stays
+    # unlabelled there and existing deployments see no change.
+    served = getattr(runner, "execution_served", None)
+    if isinstance(served, str) and served and _execution_label_wanted(served):
+        fields.append(("Environment", served))
     if event.duration_ms is not None:
         fields.append(("Duration", f"{event.duration_ms / 1000:.1f}s"))
     if event.cost_usd is not None:
@@ -195,6 +217,9 @@ class EventProcessor:
 
         # Guards against duplicate embeds/messages in the same run.
         self._session_start_sent: bool = False
+        # True once the CLI confirmed a live session (a SYSTEM event with a
+        # session_id). A run that errors before that never opened a session.
+        self._session_opened: bool = False
         self._assistant_text_sent: bool = False
 
         # Outstanding approval/input prompts. Held so the garbage collector
@@ -288,6 +313,8 @@ class EventProcessor:
         elif event.message_type == MessageType.ASSISTANT:
             await self._on_assistant(event)
         elif event.message_type == MessageType.USER:
+            if event.injected_text is not None:
+                await self._on_injected_read()
             await self._on_tool_result(event)
         elif event.message_type == MessageType.PROGRESS:
             await self._on_progress(event)
@@ -404,6 +431,7 @@ class EventProcessor:
             return
 
         self._state.session_id = event.session_id
+        self._session_opened = True
         if self._config.repo:
             wd = getattr(self._config.runner, "working_dir", None)
             # For new sessions, save the prompt as the summary so /resume can display it.
@@ -571,10 +599,25 @@ class EventProcessor:
         await self._config.surface.set_status(StatusKind.THINKING)
 
     async def _on_rate_limit_event(self, event: StreamEvent) -> None:
-        """Handle RATE_LIMIT_EVENT — persist latest rate limit info to usage_stats."""
-        if self._config.usage_repo is None or event.rate_limit_info is None:
+        """Handle RATE_LIMIT_EVENT — persist every reported window to usage_stats.
+
+        Rows are attributed to the account-pool profile this turn runs as
+        (``default`` without a pool), and a rejected window is recorded on the
+        turn so the router can mark that profile exhausted afterwards.
+        """
+        if event.rate_limit_info is None:
             return
-        await self._config.usage_repo.upsert(event.rate_limit_info)
+        windows = event.rate_limit_windows or [event.rate_limit_info]
+        turn = self._config.account_turn
+        if turn is not None:
+            turn.rejections.extend(w for w in windows if w.status == "rejected")
+        if self._config.usage_repo is None:
+            return
+        account = getattr(self._config.runner, "account", None)
+        profile = account.profile if isinstance(account, AccountBinding) else DEFAULT_PROFILE
+        backend = account.backend if isinstance(account, AccountBinding) else "claude"
+        for window in windows:
+            await self._config.usage_repo.upsert(window, profile=profile, backend=backend)
 
     async def _on_complete(self, event: StreamEvent) -> None:
         """Handle RESULT events — finalize streaming and post a summary notice."""
@@ -603,6 +646,8 @@ class EventProcessor:
             # error field, not a raised exception). Capture it so result_sink
             # consumers report a real error instead of an empty "done".
             self._final_error = event.error
+            if self._config.account_turn is not None:
+                self._config.account_turn.error = event.error
             await self._config.surface.send_notice(_error_notice(event.error))
             await self._config.surface.set_status(StatusKind.ERROR)
         else:
@@ -625,7 +670,11 @@ class EventProcessor:
 
             # In chat_only mode, skip session_complete embed, statusline, and inbox.
             # Just set the done status emoji.
-            if self._chat_only:
+            if event.turn_continues:
+                # The agent goes on with a message the human sent meanwhile:
+                # this answer is not the end of the run, so nothing says "Done".
+                pass
+            elif self._chat_only:
                 await self._config.surface.set_status(StatusKind.DONE)
             else:
                 if self._compact_cli:
@@ -697,11 +746,17 @@ class EventProcessor:
                             inbox_repo=self._config.inbox_repo,
                             dashboard=self._config.inbox_dashboard,
                             claude_command=self._config.claude_command,
+                            request_text=self._config.prompt,
                         ),
                         name=f"inbox-classify-{self._config.surface.thread_key}",
                     )
 
-        if event.session_id:
+        # A resume the CLI rejected ("No conversation found") still echoes the
+        # requested ID in its error RESULT. Saving it would stamp this runner's
+        # backend onto another backend's session ID, and every later turn would
+        # then trust the wrong tag and fail the same way. Only persist IDs the
+        # CLI actually opened.
+        if event.session_id and (self._session_opened or not event.error):
             if self._config.repo:
                 await self._config.repo.save(
                     self._config.surface.thread_key,
@@ -726,6 +781,30 @@ class EventProcessor:
 
         # Reset for potential next streamer
         self._streamer = self._config.surface.open_stream()
+        if event.turn_continues:
+            # The next turn's answer is its own reply, not a repeat of this one:
+            # nothing of this turn may stand in for it if that turn says nothing.
+            self._assistant_text_sent = False
+            self._state.partial_text = ""
+            self._state.accumulated_text = ""
+            self._state.last_assistant_url = None
+            self._last_turn_input_tokens = None
+            self._last_turn_output_tokens = None
+            self._last_turn_cache_read_tokens = None
+            self._last_turn_cache_creation_tokens = None
+
+    async def _on_injected_read(self) -> None:
+        """The agent read a message the human sent mid-turn (issue #1129).
+
+        That message is already in the conversation, below whatever the agent
+        was streaming. Close the stream so the agent's reply to it is posted
+        under the message instead of growing the reply above it.
+        """
+        if self._streamer.has_content:
+            await self._streamer.finalize()
+            self._assistant_text_sent = True
+            self._streamer = self._config.surface.open_stream()
+        self._state.partial_text = ""
 
     # ------------------------------------------------------------------
     # Text streaming helpers
@@ -1241,7 +1320,10 @@ async def _post_engine_status_footer(
         fetch_claude_usage,
         usage_footer_enabled,
     )
-    from ..discord_ui.engine_status import get_codex_status_line
+    from ..discord_ui.engine_status import (
+        codex_status_unavailable_line,
+        get_codex_status_line,
+    )
 
     # Resolve the Codex-status mode (off when no settings resolver is wired,
     # e.g. headless flows).
@@ -1255,7 +1337,7 @@ async def _post_engine_status_footer(
     if show_codex:
         codex_line = await get_codex_status_line(codex_command)
         if codex_line is None and mode == "on":
-            codex_line = "\U0001f916 Codex: 残量取得失敗（codex login 済みか確認）"
+            codex_line = codex_status_unavailable_line()
 
     # Render Claude status only for Claude turns.
     render_claude_sl = backend == "claude"
@@ -1369,6 +1451,7 @@ async def _classify_and_update_inbox(
     inbox_repo: object,
     dashboard: object | None,
     claude_command: str,
+    request_text: str = "",
 ) -> None:
     """Classify the session's final message and persist the inbox entry.
 
@@ -1383,7 +1466,7 @@ async def _classify_and_update_inbox(
     assert isinstance(inbox_repo, ThreadInboxRepository)
 
     try:
-        result = await classify(last_text, claude_command=claude_command)
+        result = await classify(last_text, claude_command=claude_command, request_text=request_text)
         logger.debug("inbox classify thread_id=%d result=%s", thread_id, result)
 
         if result == "done":

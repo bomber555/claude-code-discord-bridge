@@ -7,8 +7,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 
 # Cancel any in-progress run for the same PR when a new commit is pushed
-# (synchronize event). This prevents stale polling loops from an earlier
-# commit competing with a fresh run while new CI checks are still pending.
+# (synchronize event). This prevents an earlier run from enabling auto-merge
+# for a commit that has since been replaced.
 concurrency:
   group: auto-approve-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -24,91 +24,25 @@ jobs:
       github.event.pull_request.user.login == 'ebibibi' &&
       github.event.pull_request.draft == false &&
       !contains(github.event.pull_request.labels.*.name, 'external-issue')
-    # This control-plane job polls for required checks. Running it on the same
-    # single-capacity JIT pool as CI can starve the checks it is waiting for.
+    # This is a control-plane job; do not occupy the single-capacity CI pool.
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-      contents: write
     steps:
       - name: Approve PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: gh pr review "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --approve
-      - name: Enable auto-merge
+      - name: Enable auto-merge as the repository owner
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The actor that enables auto-merge becomes the eventual merge actor.
+          # ADMIN_PAT therefore makes GitHub emit the main push event; #758
+          # measured the linked issue closing and push workflow end to end.
+          # See docs/merge-events.md.
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
-      - name: Wait for merge and notify EbiBot
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          WEBHOOK_URL: ${{ secrets.DOCS_SYNC_WEBHOOK_URL }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          # GITHUB_TOKEN merges don't trigger other workflows (push/PR events).
-          # So we poll for merge completion and send the webhooks directly.
-          # Poll for up to 15 minutes (90 × 10s) to accommodate CI runs that
-          # start after fix commits are pushed (synchronize event).
-          for i in $(seq 1 90); do
-            STATE=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state -q .state)
-            if [ "$STATE" = "MERGED" ]; then
-              # --- EbiBot upgrade webhook (skip for docs-sync and auto-bump PRs) ---
-              if [[ "$HEAD_REF" != docs-sync/* ]] && [[ "$PR_TITLE" != '[docs-sync]'* ]] && [[ "$HEAD_REF" != auto/bump-* ]]; then
-                echo "PR merged! Sending upgrade webhook..."
-                curl -s -o /dev/null -w "%{http_code}" \
-                  -H "Content-Type: application/json" \
-                  -d '{"content":"🔄 ebibot-upgrade"}' \
-                  "$WEBHOOK_URL"
-              else
-                echo "Skipping upgrade: docs-sync or auto-bump PR ($HEAD_REF)"
-              fi
-
-              # --- Docs-sync webhook (skip for docs-sync and auto-bump PRs) ---
-              if [[ "$HEAD_REF" != docs-sync/* ]] && [[ "$PR_TITLE" != '[docs-sync]'* ]] && [[ "$HEAD_REF" != auto/bump-* ]]; then
-                OPEN_PR=$(gh pr list \
-                  --repo "$GITHUB_REPOSITORY" \
-                  --state open \
-                  --search "head:docs-sync/" \
-                  --json number \
-                  --limit 1)
-                if [ "$(echo "$OPEN_PR" | jq length)" -eq 0 ]; then
-                  echo "Sending docs-sync webhook..."
-                  curl -s -o /dev/null -w "%{http_code}" \
-                    -H "Content-Type: application/json" \
-                    -d '{"content":"🔄 docs-sync"}' \
-                    "$WEBHOOK_URL"
-                else
-                  echo "Skipping docs-sync: docs-sync PR already open"
-                fi
-              else
-                echo "Skipping docs-sync: excluded branch ($HEAD_REF)"
-              fi
-
-              # --- Version bump dispatch (skip for docs-sync PRs) ---
-              if [[ "$HEAD_REF" != docs-sync/* ]] && [[ "$PR_TITLE" != '[docs-sync]'* ]]; then
-                echo "Dispatching pr-merged event for version bump..."
-                DISPATCH_PAYLOAD=$(jq -c -n \
-                  --arg event_type "pr-merged" \
-                  --arg pr_number "$PR_NUMBER" \
-                  --arg pr_title "$PR_TITLE" \
-                  '{event_type: $event_type, client_payload: {pr_number: $pr_number, pr_title: $pr_title}}')
-                echo "$DISPATCH_PAYLOAD" | gh api "repos/$GITHUB_REPOSITORY/dispatches" \
-                  --method POST \
-                  --input -
-              else
-                echo "Skipping version bump: docs-sync PR ($HEAD_REF)"
-              fi
-
-              exit 0
-            fi
-            echo "Waiting for merge... ($i/90)"
-            sleep 10
-          done
-          echo "PR not merged within 15 minutes, skipping webhook"
 
   auto-merge-dependabot:
     # Auto-merge Dependabot PRs once CI passes — but only patch/minor bumps.
@@ -116,14 +50,13 @@ jobs:
     # human (or Claude) to review instead of merging automatically.
     #
     # This is a SEPARATE job from auto-approve-and-merge on purpose: the owner
-    # job is gated on user.login == 'ebibibi' and carries the EbiBot-restart
-    # webhook + version-bump dispatch. Dependabot PRs must NOT trigger those —
-    # the lock change reaches the running bot on its next natural restart via
-    # pre-start.sh (uv sync), so no disruptive restart is needed here.
+    # job is gated on user.login == 'ebibibi'. Dependabot merges intentionally
+    # remain bot-attributed and do not trigger post-merge deployment or version
+    # bump work. The lock change reaches the running bot on its next natural
+    # restart via pre-start.sh, so no disruptive restart is needed here.
     #
     # Security: only non-major updates are merged, and the repository Ruleset's
-    # required status checks (CI on 3 Python versions) must pass before --auto
-    # completes the merge.
+    # required status checks must pass before --auto completes the merge.
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: [self-hosted, linux, x64]
     permissions:

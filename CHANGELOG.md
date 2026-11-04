@@ -1,6 +1,6 @@
 # Changelog
 
-Last updated: 2026-08-11
+Last updated: 2026-10-15
 
 All notable changes to this project will be documented in this file.
 
@@ -9,21 +9,564 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Ebi AI Console messages count toward attention metering** — starting an item, replying and
+  picking a skill from the Console now write `human_activity` rows (metadata only). They were
+  invisible before: Console replies into chat threads are bot posts, and Console conversations
+  never reached the chat frontends' hook. Relay-injected turns (waits, restarts, relays, the
+  Resume prompt, the Workspace brief) still do not count. `CCDB_ATTENTION_CONSOLE_AUTHOR` charges
+  them to your chat id so both frontends share one timeline, and
+  `ccdb attention-backfill-console` recovers past Console messages from their transcripts.
+
+### Changed
+
+- **Focus shows the milestone behind a project's rank** — a project ranked by a near milestone
+  now shows `🎯 <milestone>` under its next action, so a high rank no longer looks unrelated to
+  the task shown. Needs Ebi Workspace 2.4.0-dev.11 or later (`nearest_milestone`); older
+  plugins simply show no milestone line.
+
+## [5.2.0] - 2026-10-30
+
+### Security
+
+- **Entra ingest auth no longer refetches the JWKS for every forged token** (#1197) — a bearer
+  whose unverified header is not RS256 with a well-formed `kid` is rejected before any I/O, keys
+  are cached per tenant, the set is refetched at most once per 5 minutes (5 s timeout), and an
+  unknown `kid` inside that window is rejected without a network call.
+
 ### Added
 
-- **Merge a pull request by pressing a button in Discord** — `/merge <pr>` shows the PR, its checks
-  and a button; sessions can post the same button with
-  `POST /api/threads/{id}/merge-request`. Only `CCDB_MERGE_USER_IDS` can press it, and the merge is
-  pinned to the head SHA that was on screen. Off until `CCDB_MERGE_REPO` is set.
-- **The thread inbox can read the title instead of calling Claude** — `THREAD_INBOX_MODE=title`
-  lists a thread as waiting when its title contains a marker (`THREAD_INBOX_TITLE_MARKERS`,
-  default `待ち`), e.g. `#18 マージ待ち | …` set by the session through the title API. No
-  `claude -p` call per session end. Replying still removes the thread from the inbox.
-- **Running sessions stop buzzing your phone** — every bot message is now sent as Discord
-  `@silent` by default, so tool activity, interim text and the re-posted Stop button no longer
-  raise a push or an in-app banner. Completion cards, error notices, `/api/notify`, scheduled
-  notifications and any message that @mentions a user (questions, plan approval, permission
-  requests, the owner ping) still notify. Opt out with `CCDB_SILENT_BY_DEFAULT=false`.
+- **Saved views: a named rule that lists matching threads from every list** — the Console's filter
+  box reads rules (`tag:teams-exporter status:waiting,review -is:done p:<=1 backend:codex …`), and
+  🔖 Save as view puts the rule in the menu with its count, the same on every device. Items carry
+  tags (drawer, `PATCH /console/api/items/{id}`, or `"tags"` on `POST /api/ingest`); Teams Channel
+  Exporter threads are tagged `teams-exporter` automatically, older ones included. Board items also
+  report `origin`.
+- **Choose and see where a backend runs: subscription or provider** — the Console picker has a
+  connection row (💳 subscription, ☁️ Foundry, Bedrock, Vertex, API) and every summary line names it
+  (`Codex · ☁️ Foundry · gpt-5.4-mini`). Routes are discovered from the CLI environment and Codex's
+  `config.toml`; unchosen means the deployment default, so nothing changes until one is picked.
+  Applied in Discord, Console, Teams and scheduled tasks alike.
+- **Sign Claude Code and Codex in from the Console** (#1224) — a relay without a terminal (a
+  container) no longer dead-ends at `Not logged in`. The usage strip shows a 🔑 chip for a CLI that
+  is not signed in; its dialog runs the CLI's own sign-in (`codex login --device-auth`, `claude
+  auth login --claudeai`), shows the vendor link and device code, and forwards Claude's pasted code.
+  The relay never reads or stores the credential. `CCDB_CONSOLE_CLI_LOGIN=0` turns it off.
+- **Teams sync files new threads without a typed company** (#1217) — when neither `orgs.json` nor the
+  client names a company, a new thread follows another thread of the same team, or (for chats) the one
+  company its people are already filed under. Ambiguous cases stay at the root.
+
+- **Console transcript names the model** (#1207) — each agent message in a console conversation
+  shows the model that wrote it next to the author (`agent · gpt-5.5`; the backend name when no
+  model is configured). Older messages keep the plain `agent` label.
+
+- **Console focus modes and a time estimate per item** (#1209) — 🎯 Focus (`z`) shows one
+  conversation full screen with the navigation, list and usage strip hidden; Esc leaves it.
+  🔁 Work through runs everything that needs you one thread at a time, full screen: sending a
+  reply, finishing or skipping (`n`) moves straight to the next thread, threads that start
+  needing you join the end, and an emptied queue keeps watching. Triage now also estimates the
+  minutes your part takes before the agent can carry on (`ai.minutes`, `effort`: ⚡ quick ≤3 /
+  ⏱ short ≤20 / 🧘 deep); Focus rows show it and the Focus bar narrows the list, and the queue,
+  to one bucket.
+
+- **Entra ID access tokens on the external ingest listener** (#1195) — besides the static
+  `CCDB_INGEST_TOKEN`, `/api/ingest*` and `/api/teams/sync/*` accept an Entra ID v2 access token
+  for one app (`CCDB_INGEST_ENTRA_TENANT_ID`, `CCDB_INGEST_ENTRA_CLIENT_ID`), verified against the
+  tenant's signing keys, the required delegated scope (`CCDB_INGEST_ENTRA_SCOPE`, default
+  `access_as_user`) and an explicit allowlist of user object IDs (`CCDB_INGEST_ENTRA_ALLOWED_OIDS`,
+  required). The external listener starts with either method configured.
+- **Pin a request as you write it** (#1182) — the Console capture box has a one-shot "📌 Pin" tick, so
+  work handed over from there lands in "📌 Working on now" straight away; `POST /console/api/items`
+  accepts `pinned: true`, and the pin carries over when the request starts as a thread.
+- **A demo instance for screencasts** (#1179) — `python -m claude_discord.demo reset|seed` rebuilds a
+  separate, Console-only deployment from a versioned scenario (an Ebi Workspace vault plus Console
+  items, dated relative to the reset day), keeping the passkey sign-in. The reset refuses folders it
+  did not mark as demo data, follows a branch so new releases bring new demo items, and runs
+  instance-specific clean-up hooks. Ships a Japanese one-person-IT scenario and systemd templates.
+  See `docs/demo.md`.
+- **Google Antigravity CLI (`agy`) as a sixth backend** (#1153) — `/backend antigravity`,
+  `/model <id from agy models>` and `/effort low|medium|high|xhigh|max` work as they do for the
+  other backends, from Discord, Teams and the console picker. `CCDB_AGY_COMMAND` points at the
+  binary (default `agy`). The prompt goes over stdin as a stream-json message. Permissions map
+  onto agy's own flags (`--dangerously-skip-permissions`, `--mode`); because agy's headless default
+  auto-denies approval-gated tools, a denied tool is reported instead of rendering as a successful
+  empty answer, and `CCDB_ALLOWED_TOOLS` is refused in any mode where agy approves tools on its
+  own (skipped permissions, `acceptEdits`, `auto`), since agy cannot enforce it. The parser is built from
+  recorded agy 1.3.5 runs; per-turn usage is rebuilt from steps because `result.usage` is the
+  conversation's running total (ADR-0016).
+- Console: the usage strip shows Antigravity (`agy`) quota — one window per pool (Gemini and the
+  Claude/GPT partner models) with its reset time, read the same way the CLI's `/credits` panel
+  does. Shown only on hosts where `agy` is signed in.
+
+### Changed
+
+- **A child thread opens from the sidebar** (#1193) — clicking (or pressing Enter on) a child row in a parent/child group opens that child instead of the group's parent. The child view still starts read-only, with buttons back to the parent.
+- **Backend-neutral wording in agent- and user-facing text** (#1163) — the relay header is now `[MESSAGE FROM ANOTHER AI SESSION — thread …]`, and the concurrency notice, lounge invite, ask embed title, default thread name, help title and several slash-command descriptions no longer say "Claude" where every backend is meant. Claude-specific text (`/usage`, CLI session import, transcript search) is unchanged. The Console still classifies the old relay header as activity.
+
+### Fixed
+
+- **Console turns use the account pool** (#1207) — a conversation started from Ebi AI Console
+  now runs on the profile the account router chooses, like a Discord thread: it moves to another
+  profile with a notice, records quota rejections, retries once when `retry_on_exhaustion` is
+  set, and refreshes Codex usage after the turn. It used to run on the relay's own login. Readers
+  of a pooled session's transcript — the cross-backend handoff (console and Discord), Codex
+  `/compact`, Workspace record binding and the thread's changed notes — now look in the profile's
+  home instead of the relay's own.
+
+- **Teams sync stores attachments up to 100MB** (#1184) — the per-file cap was 25MB and the default
+  request body limit could not carry one larger file as base64, so diagnostic zips shared in Teams
+  stayed pending on every sync. The default body limit now fits one maximum-size attachment.
+- **Focus folds same-title threads into one row** (#1167) — a job that opens a fresh thread on
+  every run (`🔄 ebibot-upgrade`, docs sync) no longer fills Focus with identical idle rows. The
+  newest one stands for the series with a `×N` tag; older ones leave Focus and the guide but stay
+  in every other list. Pinned items are never folded.
+
+- Console: buttons on Discord messages (such as the restart approval in an upgrade thread) work
+  again. Message ids are now sent to the browser as strings; as JSON numbers they exceeded 2**53,
+  were rounded, and every press answered 404 (#1131).
+- Console: a long chat thread no longer hides files delivered a few turns earlier. The history
+  window is now counted in conversation messages instead of raw Discord messages, so hidden
+  activity (tool-call logs, footers) can no longer push them out; older history is read up to
+  500 messages and cached briefly so polling still costs one REST page (#1118).
+- Console: the Finish/Reopen button now keeps the header's top-right corner in every thread
+  (and leads the mobile tools panel) instead of moving with the thread's optional controls (#1120)
+- Reserved restart no longer reports failure — and drops the queued runs and the requesting
+  thread's resume — when the restart command is killed by the restart itself
+  (`sudo systemctl restart` from inside the service exits with -15) (#1107).
+
+### Added
+
+- Messages sent while a Claude turn is running now go into that turn, the way Claude Code's own
+  UI takes input mid-turn: the agent reads them at its next step and keeps working instead of
+  the message waiting for the turn to end. Works from Discord threads and Ebi AI Console.
+  A delivered Discord message gets 📥; the Console says "Sent into the running turn". Codex,
+  pi and anonymized runs keep queueing. `/stop` now stops the process that actually runs.
+  See [docs/mid-turn-messages.md](docs/mid-turn-messages.md) (#1129)
+- Console: message search also finds threads deleted from Discord, from their JSONL exports
+  (`CCDB_CONSOLE_THREAD_ARCHIVE`), and shows them read only inside the search dialog (#1116)
+- Console: a guide card on Focus — the next move with its reasons and whether answering lets
+  an agent resume, decisions in one family gathered together, an explicit "nothing needs you
+  now", and (with Ebi Workspace) finished threads whose task or records were not updated.
+  Deterministic, no extra model calls; works without a Workspace (#1077).
+
+### Changed
+
+- **Only a human finishes work.** An agent's `POST /api/threads/{id}/done` (and the new
+  `/candidate`) now marks a 🏁 completion candidate instead of ✅ Done. Candidates stay listed in
+  the console's new "Done?" view until a human confirms them; legacy ✅ titles without a human
+  verdict are treated as candidates too (#1048).
+- Console: every text box now behaves the same — `Enter` inserts a newline and `Ctrl+Enter`
+  (`Cmd+Enter` on macOS) sends. The capture box gains a Send button for touch devices (#1056).
+
+### Added
+
+- Console status chips: narrow any list to the statuses you pick (your reply, to review, your
+  task, completion candidates, …) (#1048).
+
+### Fixed
+
+- Console: repeated `Ctrl+Enter` or Send clicks no longer post the same reply or capture twice
+  while the first send is in flight (#1056).
+- Console: a new task shows "Adding task…" the moment it is sent and locks the capture box
+  (including attachment preparation) until it is created, so a slow phone connection no
+  longer looks unresponsive. A failed capture keeps the draft and attachments (#1045).
+
+## [5.1.0] - 2026-10-15
+
+**Ebi Workspace meets the Console.** Browse project context and Markdown tasks, update them,
+and start AI work from the GUI. See the [5.1.0 release notes](docs/releases/v5.1.0.md).
+
+### Added
+
+- Detect explicitly configured Ebi Workspace installations; browse contexts/projects, read
+  overviews, add/edit/complete tasks, run a task with AI and associate conversations with projects.
+  Markdown remains the source of truth, with revision checks protecting concurrent edits.
+- Search message bodies across available Console/chat history and local transcripts, with
+  excerpts and links back to the matching thread.
+- Copy supported text-file contents from both attachment rows and the preview screen.
+- Copy and open Console thread links, including navigation from agent replies.
+- Select multiple threads with Shift/Ctrl/checkboxes and complete them together.
+- Group parent/child threads in bordered cards. Normal list navigation opens the parent;
+  direct child replies require an explicit choice. Parent completion includes descendants.
+- Configure manager and child backend/model/effort independently before spawning child work.
+- Switch Japanese/English in place while retaining drafts and attachments.
+- Discover Ebi Workspace through Japanese and English product links.
+
+### Changed
+
+- Mobile layouts keep the composer accessible while the conversation scrolls independently;
+  secondary controls move into a menu, with compact headers and keyboard viewport handling.
+- Current selection is visually distinct from unread state; polling preserves the visible
+  list anchor. Stop buttons acknowledge a pending request immediately.
+- Automatic completion guidance distinguishes a prepared response from confirmed delivery.
+  Threads identified in the current Teams Channel Exporter prompt must not auto-complete.
+
+### Fixed
+
+- Long pasted messages and URLs reach the agent intact through the long-input attachment path.
+- Codex compaction accepts bounded large resume responses instead of failing at 64 KiB.
+- Parent/child bulk completion keeps ancestors open when descendant completion fails.
+
+## [5.0.0] - 2026-10-13
+
+> **Ebi AI Console — the GUI is here.** Ebi Agent Chat Relay now ships its own web GUI, the
+> **Ebi AI Console**: one screen to see every agent thread — chat threads and the console's own
+> conversations — decide what to do now (the Focus view, with automatic triage by the cheapest model of
+> your backend), reply with files, pin what you are working on, and pause, resume or stop running
+> work. It is optional: nothing starts unless `CCDB_CONSOLE_PORT` is set. See
+> [docs/console.md](docs/console.md) and the
+> [v5.0.0 release notes](docs/releases/v5.0.0.md).
+>
+> The GUI will be updated rapidly from here on. **Scheduler integration** — managing scheduled
+> tasks from the console — comes next.
+
+### Upgrade notes
+
+- The web GUI formerly called the Relay Console is now the **Ebi AI Console**. Only the name
+  changed: URLs (`/console/…`), `CCDB_CONSOLE_*` settings, the `[console]` extra and the API stay.
+- With the console enabled, **automatic triage is on by default**: one short, tool-less model call
+  per open thread with new activity (Haiku on Claude, the cheapest catalog model on Codex). Set
+  `CCDB_CONSOLE_TRIAGE=0` to turn it off.
+- The console's default view is now **Focus**.
+
+### Added
+
+- **Ebi AI Console: switch backend, model and effort with a picker** (#992) — click the
+  "🤖 backend · model · effort" line above the reply box, or the nav's default, and choose from
+  chips; `GET/POST /console/api/defaults` change the default for new conversations.
+- **The Relay Console is now the Ebi AI Console** — the web GUI of Ebi Agent Chat Relay has a
+  name of its own. Only the display name changed: URLs (`/console/…`), `CCDB_CONSOLE_*`
+  settings, the `[console]` extra and the API stay as they were.
+- **Ebi AI Console: Focus view and automatic triage** (#933) — a new default view answers "what
+  do I do now?". A fast model reads each open thread with new activity and fills in what nobody
+  set by hand: priority, a deadline the conversation names, why, the next step, whether that step
+  can be done now or must wait (for what, until when), and whether it is bound to a place or
+  device. Importance, readiness and place stay separate axes: only work you can do here and now
+  ranks under "Do this first"; waiting work returns on its own once its time comes. Triage uses
+  the cheapest model of the backend chosen with `/backend` (Haiku on Claude, the cheapest model in
+  Codex's catalog on Codex) as a one-shot, tool-less call. A value a person sets always wins and is
+  pinned. `CCDB_CONSOLE_TRIAGE=0` turns it off.
+- **Ebi AI Console: several places at once** (#961) — the Focus view's "I am at" bar takes more
+  than one place (home and the work PC); work bound to any of them counts as here.
+- **Ebi AI Console: places** (#933) — tag work that can only be done at home, at the office or on
+  the work PC with the 📍 button, say where you are, and work bound elsewhere moves out of the
+  way. Places are managed (add, rename, delete — every item follows) from the screen and
+  `/console/api/places`.
+- **Ebi AI Console: control running work** (#984) — the nav shows running / limit with − / + to
+  change the concurrent-session limit on the spot (kept across restarts); threads get one-click
+  ⏸ Pause, ■ Stop, ▶ Resume, and ⏫ First / ⏬ Later while waiting for a slot.
+- **Ebi AI Console: pin what you are working on** (#978) — 📌 (or `p`) pins a thread; pinned
+  threads lead every list under a highlighted "Working on now" strip, on every device.
+- **Ebi AI Console: hide finished items** (#972) — a header switch (or `h`) leaves done items out of
+  every list but Done, remembered per browser.
+- **Ebi AI Console: preview files in place** (#969) — text, Markdown, HTML (sandboxed, no
+  scripts), CSV, JSON, logs and code open in a viewer instead of downloading, for delivered files
+  and chat attachments alike. Files can also be attached when writing down new work.
+- **Ebi AI Console: attach any file** (#950) — paste, drop or pick (📎) any file into a reply, not
+  only images; up to 10 per reply, 50 MB each (images 10 MB, still checked by their bytes). The
+  agent gets each file by local path; the original name is kept, sanitised.
+- **Ebi AI Console: context usage per thread** (#946) — each row shows how full the thread's
+  context window was after its last turn ("🧠 45%", amber from 70%, red from 90%), and the
+  detail header shows used / window ("182k / 200k"), read from the session table.
+- **Ebi AI Console: due dates on every row** — "Due 10/14 18:00 (in 2d)", highlighted within a day,
+  "overdue" in red, "No due date" when none.
+- **Ebi AI Console: everyday use** (#938) — resizable columns; the conversation keeps its room and
+  scroll position; chime, toast, unread marks and desktop notifications when something comes to
+  you; images from chat threads and agents preview in place, and can be pasted into a reply;
+  slash commands, skills and CLI built-ins autocomplete in the reply box, with a real `/compact`
+  for Codex conversations through `codex app-server`; one guarded click finishes a thread, with
+  undo; tool calls of console conversations are kept as a log behind the "⚙ Activity" button
+  (#930).
+
+- **Ebi AI Console: Recent view** (#927) — every item, finished ones included, newest activity
+  first and grouped by day, with each row naming the list it lives in now. In the nav and on
+  `g u`. See [docs/console.md](docs/console.md).
+
+- **Reserved restart** (#915) — `POST /api/restart` holds the session queue: running turns
+  finish, every new request (chat, console, scheduler, spawn) queues instead of starting, and the
+  bot restarts as soon as nothing is running. Everything that was queued then runs after the
+  restart, in queue order. `GET /api/restart` shows the state, `DELETE /api/restart` cancels and
+  lets the queue go. Restarts with `CCDB_RESTART_COMMAND` when set, otherwise closes the bot for
+  its supervisor to start again. See [docs/session-queue.md](docs/session-queue.md).
+
+### Fixed
+
+- **A token sign-in can add passkeys again** — in a browser signed in with the console token,
+  **🔑 Passkeys → Add a device** answered 401 because the passkey screen did not send the token (#979)
+
+- **Windows: console triage and Codex `/compact` start npm `.cmd` CLIs** (#937) — they are
+  resolved to `node` + script (current cmd-shim wrappers included) and never run through
+  `cmd.exe` with untrusted arguments.
+- **Ebi AI Console conversations resume after a bot restart.**
+
+- **A turn queued at shutdown no longer loses the user's message** (#915) — it used to be resumed
+  with the generic "bot restarted" prompt; it now replays the message it was waiting to send,
+  in Discord threads and Ebi AI Console conversations alike.
+
+- **Ebi AI Console: sign in with Google, Entra ID or any OIDC provider** (#894) — optional, next
+  to passkeys and without Cloudflare in front. Set `CCDB_CONSOLE_OIDC_ISSUER`, `_CLIENT_ID`,
+  `_CLIENT_SECRET`, `CCDB_CONSOLE_ORIGIN` and `CCDB_CONSOLE_ALLOWED_EMAILS`. Authorization code
+  flow with PKCE, browser-bound `state`, `nonce`, and ID-token verification against the issuer's
+  keys. The provider must assert `email_verified: true`; taking an email off the allowlist ends
+  its sessions at once.
+
+- **Passkey sign-in for the Ebi AI Console** (#893) — the console now signs you in with a passkey
+  (WebAuthn, user verification required) by default, so setting `CCDB_CONSOLE_PORT` alone gives
+  phishing-resistant multi-factor sign-in with no third-party account. The first passkey is
+  registered with a single-use setup code that ccdb writes to its log; more devices are added
+  from a signed-in one. Sessions are server-side (`HttpOnly`, `SameSite=Strict`, only a hash is
+  stored). Cloudflare Access and `CCDB_CONSOLE_TOKEN` keep working unchanged. Requires the
+  `[console]` extra, which now includes `webauthn`. See ADR-0012.
+
+- **Live view, Stop and file downloads for Ebi AI Console conversations** — while a console
+  conversation runs, the detail view shows the tool calls, the answer as it streams and a Stop
+  button (`GET /console/api/items/{id}/live`, `POST …/stop`). Files the agent delivers are kept
+  next to the session database and downloadable from the conversation
+  (`GET /console/api/files/…`, authenticated, path-checked). The file-delivery guidance in the
+  system prompt now names the frontend the conversation is on instead of always saying Discord.
+
+- **Ebi AI Console: captured work starts right away** (#879) — quick capture hands the item
+  to an agent by default (`POST /console/api/items` with `start: true`). A checkbox next to
+  the input, remembered per browser, turns it back into "just write it down".
+
+- **Run ccdb without Discord** (#891) — `CCDB_FRONTENDS` accepts `console`, and a list without
+  `discord` (`console`, `console,teams`, `teams`) runs headless: no Discord login, no
+  `DISCORD_BOT_TOKEN` or `DISCORD_CHANNEL_ID`. The scheduler and the wait watcher still run (a
+  headless bot's `wait_until_ready()` returns at once), and the Ebi AI Console becomes the primary
+  frontend, so scheduled tasks open console conversations. A headless configuration nobody could
+  reach is refused at startup.
+
+- **The Ebi AI Console owns the conversations it starts** (#889) — starting written-down work from
+  the console used to open a Discord thread, so every console task also appeared in Discord and
+  the console could not start work without a chat platform. It now runs in a conversation the
+  console owns: a `ConsoleSurface` / `ConsoleFrontend` on the same frontend seam as Discord and
+  Teams, driven through the same session runner. The transcript is stored in the session database,
+  replies resume the same session (queued behind a running turn), and outcome markers — set by the
+  agent through `/api/threads/{id}/…` or by the runner on error and AskUserQuestion — show on the
+  board. Chat threads still appear and can be replied to as before. See ADR-0011.
+
+- **A scheduled task can pin its backend and model** — `POST /api/tasks` and
+  `PATCH /api/tasks/{id}` take an optional `backend` (validated against the same list `/backend`
+  accepts) and an optional `model`. Until now a task ran on whatever `/backend` resolved to when
+  the master loop fired it, which is the right default — switch the deployment to Codex and the
+  nightly jobs follow — but it makes the agent a task runs on an ambient property of the
+  deployment: a digest that belongs on a cheap model, or a task written against one agent's tool
+  vocabulary, moved silently with the humans. `model` is accepted **only together with**
+  `backend`, because a model id belongs to one backend; alone it would be handed to whichever
+  backend happened to be active and fail there every night rather than be refused once, at
+  registration. The pair is validated against the state the task ends up in, not the fields one
+  request carries, so clearing the backend out from under a stored model is refused too.
+  `/effort` is deliberately not pinned — it still resolves from the settings of the backend the
+  task runs on, so an effort change still reaches pinned tasks. `scheduled_tasks` gains nullable
+  `backend` and `model` columns (auto-migrated); an unpinned task behaves exactly as before, which
+  is what every task created before this does.
+
+- **Ebi AI Console** (#870) — an API-first triage screen on its own listener
+  (`CCDB_CONSOLE_PORT`, off by default). Inbox of threads waiting on the human, running work,
+  a project/parent tree, priority P0–P3, due dates, snooze, quick capture and "hand to an agent",
+  reply and done from desktop or phone. Status is derived from existing markers, running turns
+  and spawn lineage; only priority/due/snooze/project/parent live in the new `work_items` table.
+  Always authenticated (Cloudflare Access JWT with an email allowlist, and/or a bearer token);
+  refuses to start otherwise. See `docs/console.md` and ADR-0010.
+- **Ebi AI Console: readable threads** — messages render as Markdown, the relay's own activity
+  (tool calls, status lines, automatic prompts) is hidden unless asked for, each column scrolls on
+  its own, the reply box is larger, and quick capture takes a note under the title.
+- **Waits** (#854) — `POST /api/waits` lets a session end its turn (freeing its concurrency slot)
+  while CI/CD runs. ccdb re-runs the registered probe (`argv`, no shell, relay credentials
+  stripped) every `interval_seconds` and resumes the thread with a fixed
+  `[WAIT FINISHED — automatic continuation]` prompt when the probe says done
+  (`pending_exit_codes` / `done_values`), the wait times out, or the probe fails 5 times in a
+  row. Waits are stored in the session database and survive restarts (a resume cut off by a
+  restart or a failed delivery is retried); threads with one carry ⏰. Re-registering the same
+  probe returns the live wait. Disabled when execution modes other than `host` are allowed.
+  `GET` / `DELETE /api/waits` list and cancel. The system instructions and the PR completion gate
+  tell agents to register a wait instead of watching pipelines in the turn (only where waits
+  work), and the gate stays quiet while the thread has an active wait. On by default
+  (`enable_waits=False` to turn off). See `docs/waits.md`.
+- **Steerable session queue** — when every `MAX_CONCURRENT_SESSIONS` slot is busy, the waiting
+  message now carries **⏫ Run this next** / **⏬ Let others go first** buttons. `/queue` shows
+  running and waiting threads from any channel and can also **pause** a running thread: it is
+  interrupted to free its slot and resumes automatically (same session, via `--resume`) once the
+  threads it yielded to are through. Pausing is refused when nothing is waiting. The same
+  controls are on the REST API: `GET /api/slots`, `POST /api/slots/{thread_id}/{prioritize|defer|pause}`.
+  No configuration needed. See `docs/session-queue.md`.
+- **Account pools** (#821) — `CCDB_ACCOUNT_POOLS_FILE` names a TOML file of pre-logged-in Claude
+  Code / Codex profile directories per backend and a strategy (`priority`, `sticky`,
+  `round_robin`, `most_headroom`). Each session or turn runs as the chosen profile; a thread that
+  moves keeps its session by copying the transcript into the new profile; a quota rejection marks
+  the profile exhausted and names (or, with `retry_on_exhaustion`, retries on) the next one.
+  `/usage` lists every profile. Storage is additive (`usage_stats` is untouched and keeps the
+  relay's own login; named profiles go to `account_usage_stats`), so reverting is safe.
+  Model-scoped limits (Opus-only, per-model Codex) do not exhaust a profile unless listed in
+  `windows`. Credentials in the environment (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `OPENAI_API_KEY`, …) override profile logins; a startup warning says so. Discord chat turns
+  now record their rate-limit windows, so `/usage` has data without Teams. The relay never
+  handles tokens; complying with each vendor's terms is the operator's responsibility. See `docs/account-pools.md`.
+- **Execution environments** (#823) — the operator chooses where agent CLIs run (`bwrap`,
+  `container` and `ssh` are preview; use a dedicated `CLAUDE_CONFIG_DIR` / `CODEX_HOME` with them):
+  `host` (default, unchanged), `native` (Claude Code's sandbox via `--settings`, Codex
+  `--sandbox workspace-write`; pi refuses), `bwrap` (read-only host, writable working directory and
+  agent state, private `/tmp`, no `sudo`, the relay's `.env` / `~/.ssh` / Docker socket hidden),
+  `container` (`docker run --rm -i` with your image; sample `deploy/agent-container/Dockerfile`) or
+  `ssh` (a remote host). Under `bwrap`, `$HOME` is an empty tmpfs with only the working directory,
+  the agent's state and the CLI's install bound back, so `~/.config/gh`, `~/.aws`, other repositories
+  and the relay's `.env` are absent by construction. The agent's own hook/config files (`settings.json`,
+  `~/.claude.json`, `~/.codex/config.toml`, plugins, skills, a plain repository's `.git`) are read-only so a
+  sandboxed run cannot arm a later unsandboxed one, and the user runtime directory (systemd user
+  bus), the system D-Bus socket and agent sockets are hidden. `CCDB_EXECUTION_MODE` sets the default and `CCDB_EXECUTION_ALLOWED_MODES`
+  the allowlist; `/sandbox` (limited to `allowed_user_ids`, like `/skill`; `/backend`, `/model`, `/effort`,
+  `/engine-status` and `/ollama pull|rm|use` now are too) picks a mode per thread
+  from that list only. Preflight failures and
+  misconfiguration fail the turn with one sentence and start no process; the completion notice
+  shows the environment that served the turn. See `docs/execution-environments.md` and ADR-0008.
+
+- **Bundled manager skill** (#807) — `skills/relay-thread-manager/SKILL.md` teaches an agent to
+  run worker threads on top of `/api/spawn`, `/api/sessions` lineage and the relay: self-contained
+  briefs, tracking children, relaying within the limits, verifying reports, escalating, and
+  closing with `✅`. Plain `curl`, so Claude Code and Codex can both use it.
+
+- **"Your move" is split by what is expected** (#801) — `❓` now means a reply is enough; `👀`
+  (new, `POST /api/threads/{thread_id}/review`) means a deliverable is waiting for the human to
+  look over, and `📋` (new, `POST /api/threads/{thread_id}/action`) means a task the human has to
+  do outside the chat — a todo. Exclusive with `✅` / `⚠️` like the others, cleared on the next
+  human reply. `CCDB_REVIEW_THREAD_MARKER` / `CCDB_ACTION_THREAD_MARKER` change or disable them.
+
+- **Thread titles show whose move it is** (#787) — besides `✅` (done), a thread whose turn ended
+  on a question only the human can answer gets `❓` (an open AskUserQuestion, or the agent calling
+  the new `POST /api/threads/{thread_id}/waiting`), and one whose turn failed gets `⚠️`. These
+  three are exclusive, sit in front of `⏰`, and a human reply clears them. Per-message states such
+  as "running" stay on the reactions: Discord allows two renames per ten minutes per thread.
+  `CCDB_WAITING_THREAD_MARKER` / `CCDB_ERROR_THREAD_MARKER` change or disable them.
+- **Threads waiting on a scheduled task are marked** (#783) — while an enabled task will post into
+  a thread (`POST /api/tasks` with `thread_id`, or a `ScheduleWakeup` bridged to one), the
+  scheduler prefixes its title with `⏰`, and removes it when a one-shot fires or the task is
+  disabled or deleted. The title is reconciled from the task table, so every way of registering a
+  task is covered. `CCDB_SCHEDULED_THREAD_MARKER` changes the marker (empty disables it).
+- **Threads can be marked ready to close** (#769) — when a thread's work is fully finished, the
+  agent tells the user the thread can be closed and calls `POST /api/threads/{thread_id}/done`,
+  which prefixes the title with `✅`. A new human reply removes the marker; a retitle never carries
+  it forward. `CCDB_DONE_THREAD_MARKER` changes the marker (empty disables it and the instruction).
+- **pi threads can use Claude Code plugin skills** — pi does not read Claude Code plugins, so a
+  thread switched to pi lost every plugin skill. The pi runner now passes the `skills/` directory
+  of each enabled, user-scope plugin as `--skill`, resolved per turn so plugin updates are picked
+  up. A user's own skill still wins a name collision. `CCDB_PI_CLAUDE_PLUGIN_SKILLS=0` turns it off.
+
+### Fixed
+
+- **Teams sync no longer files an unchanged message as an edit** (#790) — a hash with a different
+  scheme prefix (`fnv1a:` → `fnv1a2:`) re-keys the stored message without writing `_history`, an
+  attachment already on disk keeps its `📎` link when a later push does not declare it (Teams
+  lazy-loads images), and a duplicated attachment name renders once.
+- **`/rewind` no longer wipes non-Claude sessions** — rewind only understands Claude session JSONL,
+  so on a Codex/local/pi/AG-UI thread the history lookup missed and fell through to a full reset.
+  It now replies that rewind is unsupported for that backend and leaves the session untouched.
+
+## [4.2.0] - 2026-09-22
+
+### Fixed
+
+- **Post-merge automation no longer races a polling timeout** (#752) — owner PRs now enable
+  auto-merge with `ADMIN_PAT`, making the eventual merge user-attributed. GitHub therefore emits a
+  `main` push event and closes linked issues natively. A new lightweight `post-merge.yml` workflow
+  reacts to that event to trigger the EbiBot upgrade, docs sync, and patch-version dispatch; the
+  40-minute polling loop and its explicit issue-closing workaround are gone. PR #758 verified the
+  exact auto-merge path end to end. CI and CodeQL continue to run on pull requests and schedules,
+  but not again on the resulting push, avoiding duplicate work on the single-capacity runner.
+
+- **Merging a PR closes the issue it links again** (#739, #747, #753) — `Closes #123` did nothing
+  when the merge was completed by `github-actions`, and said nothing either. Measured across the
+  last 25 merges: a PR merged by the repository owner closed its issue in 1-2 seconds, and not one
+  merged by `github-actions` ever did; the ones that looked closed had been closed by hand, minutes
+  to hours later. `auto-approve.yml` now closes the PR's `closingIssuesReferences` itself once it
+  sees the merge. That loop is the fix, not a safety net for the `issues: write` it was first
+  credited to — measured on the merge that shipped it, the permission was present and both linked
+  issues were still open eight seconds later, until the loop closed them. Auto-merge is completed by
+  GitHub afterwards and does not carry the permissions of the job that enabled it; `issues: write`
+  is there so the loop can run. The README example said the reverse in both languages, which would
+  have handed the same silent loss to anyone who copied it, and now carries the measurement and the
+  loop.
+
+- **Waiting for the merge no longer gives up before CI finishes** (#742) — the post-merge poll ran
+  for 15 minutes and then reported success, while the required checks now queue for 20 to 40 minutes
+  on the single-capacity self-hosted pool. Everything downstream of that loop — the upgrade webhook,
+  the docs-sync webhook and the version-bump dispatch — was skipped in silence whenever it timed out,
+  which it did twice on the day #725 was fixed. The window is 40 minutes, a PR closed without merging
+  ends the wait quietly, and a genuine timeout now fails the job instead of hiding.
+
+- **A drifted `uv.lock` no longer wedges the bump** (#731) — the bump rewrote the editable entry
+  with a substitution keyed on the version that entry was expected to hold, so once a manual release
+  updated `pyproject.toml` alone the substitution matched nothing and the guard stopped every bump
+  that followed. The version is now matched by its position inside the entry, which repairs the
+  drift instead of stalling on it, and `uv.lock` is brought back in step with `pyproject.toml`. The
+  bump issue is also created only after the branch is pushed, so a failed push leaves no orphan.
+
+- **Automatic patch bumps work again** (#725) — `auto-version-bump.yml` pushed the bump straight to
+  `main` with an admin PAT, on the assumption that an admin bypasses the branch ruleset. The
+  `issue-driven-main` ruleset is created with an empty bypass list on purpose, so every run since
+  2026-09-17 was rejected with `GH013` and the version stayed at 4.0.27 until it was raised by hand.
+  The workflow now opens an `auto/bump-vX.Y.Z` pull request instead, with an issue of its own so the
+  required `require-linked-issue` check passes, and `auto-approve.yml` merges it once CI is green.
+  The PAT authors the branch, issue and PR as a real user — the two earlier PR-based attempts were
+  reverted because a `GITHUB_TOKEN`-authored PR fires no `pull_request` events and its required
+  checks never run. Merges that land while a bump PR is open collapse into that one bump, and the
+  bump PR's own merge no longer dispatches a bump for itself.
+- **`/model` now suggests pi models, and a pi deployment can pin a default** (#729) — the pi
+  backend shipped with no entry in the autocomplete's suggestion table, so `/model set` offered an
+  empty dropdown and the model behind pi was effectively unreachable from Discord. Suggestions are
+  now discovered from pi's own on-disk catalog (`~/.pi/agent/models-store.json`) merged with the
+  operator's hand-declared providers (`~/.pi/agent/models.json`) — the same read-a-local-file stance
+  as Codex, no extra vendor call — and are offered fully qualified (`anthropic/claude-opus-5`),
+  because pi's bare `--model` is a fuzzy pattern whose resolution is not ccdb's choice to make.
+  `CCDB_PI_HOME` points at a non-default pi config directory; `CCDB_MODEL_DISCOVERY=0` still opts
+  out. Leaving the model unset is not neutral either: pi then picks its catalog's own first-ranked
+  model, which on pi 0.85.1 is `anthropic/claude-opus-4-8` — an account without that entitlement got
+  a `400` on every turn with no way to change it. `CCDB_PI_MODEL` pins a deployment default, and
+  `/model set` overrides it per thread or globally.
+
+## [4.1.0] - 2026-09-22
+
+### Added
+
+- **pi as a fifth backend** (#719) — [pi](https://github.com/earendil-works/pi) normalises many
+  providers behind one CLI, reads `AGENTS.md` and skills on its own, and runs a subscription the
+  operator already pays for, so it is a CLI-spawn backend like Claude Code and Codex rather than
+  something to reach through AG-UI. `/backend pi`, `/model <provider>/<id>` and `/effort` (pi's
+  thinking level, which includes `off`) work the same way they do elsewhere; `--append-system-prompt`
+  is native, so the lounge and concurrency notice need no config-override workaround. **The backend
+  refuses to spawn until `CCDB_PI_ALLOW_UNSANDBOXED=1` is set**: pi documents that it has no sandbox
+  and no approval loop in the non-interactive modes ccdb uses, so there is no `permission_mode` to
+  map, and a control ccdb cannot provide is surfaced rather than quietly dropped (ADR-0007). The
+  parser is built from recorded runs of pi 0.85.1, because three behaviours differ from the
+  published event list — the terminal event is `agent_settled`, usage is per assistant message, and
+  a failed turn arrives as an ordinary `message_end` with `stopReason: "error"` and exit code 0,
+  which a trusting parser would render as a successful empty answer. See `docs/pi-backend.md`.
+
+- **Spawn lineage: parent and child titles now match** (#700) — the `🤖` marker said a thread was
+  started by an agent but not by *which* agent, so several concurrent fan-outs read as one flat pile
+  of identical titles. `POST /api/spawn` takes `parent_thread_id`; both ends then carry the same
+  two-character family code (`🤖K2` on the child, `🌳K2` on the parent, `🤖K2 🌳P9` on a child that
+  spawns in turn). The code is *derived* from the parent's thread ID rather than allocated, so any
+  component holding the ID recomputes it — a lost database costs the lineage records, never the
+  lineage display. The link is recorded in a new `thread_lineage` table and surfaced in
+  `GET /api/sessions` as `parent_thread_id` / `family` / `children`, so a session managing a fan-out
+  reads its own tree instead of parsing titles, and both threads get a one-line cross-link. The
+  parent is renamed once, not per child: Discord allows two renames per ten minutes, and retagging
+  per spawn would fail partway through a fan-out. Renaming, cross-linking and recording are each
+  best-effort — none of them can fail a spawn that already succeeded. Omitting `parent_thread_id`
+  keeps the previous behaviour. `CCDB_SPAWN_PARENT_MARKER` mirrors `CCDB_SPAWN_THREAD_MARKER`.
+
+- **Agent-spawned threads are recognisable in the channel list** (#691) — a thread created through
+  `POST /api/spawn` (one session starting another) was indistinguishable from a thread a person
+  opened by posting in the channel, and Discord exposes no per-thread colour, badge or icon, so the
+  title is the only surface available. The name the spawning agent chose is now prefixed with a
+  marker (`🤖 Nightly Triage`) rather than replaced, applied where the final name is assembled
+  instead of asked of the caller — an agent that has to remember a convention will eventually
+  forget it, and the one thread that then looks human-authored is exactly the one worth noticing.
+  Marking is idempotent and survives the 100-character limit by trimming the tail, never the head.
+  `CCDB_SPAWN_THREAD_MARKER` changes the marker; an *empty* value disables it and is honoured as an
+  explicit opt-out rather than folded back into the default. `/fork` and session resume are
+  unmarked: they carry their own prefixes and a human asked for them.
 
 - **GPT-6 is selectable, and the Codex model list stops going stale** — `/model`'s Codex suggestions
   were a hardcoded quartet (`gpt-5.6-sol`, `gpt-5.5`, `gpt-5.5-codex`, `o4-mini`), two of which no
@@ -649,7 +1192,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI pipeline: Python 3.10/3.11/3.12, ruff, pytest
 - Branch protection and PR workflow
 
-[Unreleased]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v4.2.0...HEAD
+[4.2.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v4.1.0...v4.2.0
+[4.1.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v4.0.0...v4.1.0
+[4.0.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v3.4.0...v4.0.0
+[3.4.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v3.3.0...v3.4.0
+[3.3.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v3.2.0...v3.3.0
+[3.2.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v3.1.0...v3.2.0
+[3.1.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v3.0.0...v3.1.0
+[3.0.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v2.2.0...v3.0.0
+[2.2.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v2.1.24...v2.2.0
+[2.1.24]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v2.1.0...v2.1.24
 [2.1.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v2.0.5...v2.1.0
 [2.0.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v1.9.0...v2.0.5
 [1.9.0]: https://github.com/ebibibi/ebi-agent-chat-relay/compare/v1.8.0...v1.9.0

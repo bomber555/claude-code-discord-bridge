@@ -17,16 +17,20 @@ import logging
 import os
 from dataclasses import dataclass
 
+from claude_code_core.attention_repo import HumanActivityRepository
+
 from .database.ask_repo import PendingAskRepository
 from .database.claims_repo import ClaimRepository
 from .database.frontend_thread_repo import FrontendThreadRepository
 from .database.ingest_repo import IngestResultRepository
+from .database.lineage_repo import ThreadLineageRepository
 from .database.lounge_repo import LoungeRepository
 from .database.models import init_db
 from .database.repository import SessionRepository, UsageStatsRepository
 from .database.resume_repo import PendingResumeRepository
 from .database.settings_repo import SettingsRepository
 from .database.summary_repo import ThreadSummaryRepository
+from .database.wait_repo import WaitRepository
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,11 @@ class SessionStores:
     ingest: IngestResultRepository
     summaries: ThreadSummaryRepository
     frontend_threads: FrontendThreadRepository
+    lineage: ThreadLineageRepository
+    #: Human messages that reached a session — the input of the attention estimate.
+    attention: HumanActivityRepository
+    #: Waits a session registered before ending its turn (``/api/waits``).
+    waits: WaitRepository
 
 
 async def build_session_stores(session_db_path: str) -> SessionStores:
@@ -67,6 +76,8 @@ async def build_session_stores(session_db_path: str) -> SessionStores:
     await ingest.init_db()
     summaries = ThreadSummaryRepository(session_db_path)
     await summaries.init_db()
+    attention = HumanActivityRepository(session_db_path)
+    await attention.init_db()
 
     # Adopt every thread this deployment already has, so the ledger answers for
     # all of its conversations rather than only the ones opened from now on.
@@ -87,4 +98,7 @@ async def build_session_stores(session_db_path: str) -> SessionStores:
         ingest=ingest,
         summaries=summaries,
         frontend_threads=frontend_threads,
+        lineage=ThreadLineageRepository(session_db_path),
+        attention=attention,
+        waits=WaitRepository(session_db_path),
     )

@@ -3,20 +3,96 @@
 > **참고:** 이 문서는 원본 영어 문서의 자동 번역본입니다.
 > 내용이 다를 경우 [영어 버전](../../README.md)이 우선합니다.
 
-# Claude & Codex Discord Bridge
+# Ebi Agent Chat Relay
 
-*패키지명: `claude-code-discord-bridge` (케밥 케이스)*
+*이전 이름은 Claude Code Discord Bridge, 그다음은 Claude & Codex Discord Bridge입니다.
+기존 식별자는 모두 그대로 동작합니다. 패키지명은 `claude-code-discord-bridge`(케밥 케이스),
+명령어는 `ccdb`이며, 이 문서에서도 약칭으로 `ccdb`를 사용합니다.*
 
 [![CI](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/codeql.yml/badge.svg)](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/codeql.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**스마트폰에서 Claude Code _또는_ OpenAI Codex를 사용하세요. 멀티 스레드, 동시 진행, 실전 개발까지 모두 가능합니다.**
+**Discord 또는 Microsoft Teams에서 코딩 에이전트를 실행하세요. 같은 대화 뒤에서
+Claude Code, OpenAI Codex, 로컬 모델, 또는 호환되는 AG-UI 에이전트를 선택할 수 있습니다.**
 
-스마트폰 Discord 앱에서 Claude Code 또는 OpenAI Codex를 실행하고, 여러 스레드를 열어 개발 세션을 병렬로 진행하세요 — 키보드를 만지지 않고도 가능합니다. 각 Discord 스레드는 완전히 격리된 AI 세션이 됩니다. 한 스레드에서 기능 개발, 다른 스레드에서 PR 리뷰, 세 번째 스레드에서 백그라운드 작업 — 동시에, 심지어 스레드마다 다른 백엔드를 섞어서 사용할 수도 있습니다. 브리지가 모든 조율을 처리하여 세션들이 서로를 덮어쓰는 일이 없습니다.
+Ebi Agent Chat Relay는 각 Discord 스레드 또는 Teams 대화를 격리된 영속 에이전트 세션으로
+바꿉니다. 한 대화에서 기능을 개발하고, 다른 대화에서 PR을 리뷰하고, 세 번째 대화에서
+백그라운드 작업을 돌리는 일을 동시에 할 수 있습니다. Discord는 스레드마다 백엔드를 섞어 쓸 수
+있고, v4의 Teams는 설정된 전역 백엔드를 사용합니다. 세션끼리 서로의 작업을 망가뜨리지 않도록
+릴레이가 조율을 담당합니다.
 
-**기존 구독을 그대로 활용하세요. API 키 씨름은 불필요합니다.** ccdb는 공식 CLI 위에서 실행됩니다 — Claude Code([Claude Pro/Max 구독](https://claude.ai/pricing)에 포함)와 OpenAI Codex([ChatGPT Plus/Pro/Business](https://chatgpt.com)에 포함). `/backend`로 백엔드를 전환하거나 스레드별 오버라이드를 설정하세요 — 팀 전체가 예측 가능한 비용으로 Discord를 통해 두 AI를 모두 사용할 수 있습니다.
+**이름을 바꾼 이유.** 이 프로젝트는 하나의 AI와 하나의 채팅 앱을 잇는 브리지로 시작했습니다.
+지금은 두 개의 프로덕션 프런트엔드와 다섯 가지 백엔드 선택지를 가진 릴레이입니다. 옛 이름을
+이루던 네 단어 중 세 단어가 더 이상 사실이 아니게 되었습니다. 결정 배경은
+[ADR-0001](../adr/0001-adopt-ebi-agent-chat-relay.md)을, 호환성을 지킨 전환 방법은
+[이름 변경 계획](../RENAME_PLAN.md)을 참고하세요.
+
+**기존 구독, 직접 운영하는 인프라, 또는 원격 에이전트를 쓸 수 있습니다.** ccdb는 공식
+Claude Code 및 Codex CLI, Codex 호환 로컬 엔드포인트, AG-UI HTTP/SSE 에이전트, 또는
+pi CLI를 실행할 수 있습니다. Discord에서는 런타임에 `/backend`로 전환할 수 있고, v4의
+Teams는 동일한 팩토리를 통해 설정된 백엔드를 사용합니다.
+
+## v5의 새로운 점
+
+버전 5는 릴레이에 **자체 GUI인 Ebi AI Console**을 더합니다. 데스크톱이나 휴대폰에서 쓰는 웹 화면으로,
+모든 에이전트 스레드를 한눈에 보고, 지금 할 일을 정하고, 바로 처리할 수 있습니다.
+
+- **Focus 뷰**(기본값)는 "지금 무엇을 해야 하나?"에 답합니다. 사용 중인 백엔드에서 가장 저렴한 모델을
+  도구 없이 한 번 호출해 우선순위, 마감일, 다음 단계, 지금 할 수 있는지, 장소에 묶여 있는지를 채웁니다.
+  사람이 설정한 값이 항상 우선합니다.
+- **화면을 떠나지 않고 처리**: 어떤 파일이든 첨부해 답장하고, 파일을 그 자리에서 미리 보고, 선택기로 백엔드·모델·effort를
+  전환하고, 동시 세션 한도를 바꾸고, 실행 중인 작업을 일시 정지·재개·중지할 수 있습니다.
+- **위임한 작업을 부모 대화 옆에 두기**: 접을 수 있는 패널에 자식·손자 작업의 상태, 최신 보고, 완료 수가 표시됩니다.
+  자식을 살펴본 뒤 부모로 돌아가 결정하며, 자식에게 직접 답장하려면 명시적으로 선택해야 합니다.
+- **선택 사항이며 추가만 함**: `CCDB_CONSOLE_PORT`를 설정하지 않으면 아무것도 시작되지 않으며, Discord, Teams,
+  백엔드, REST API, 스케줄러는 바뀌지 않습니다. 콘솔을 켜면 자동 분류가 기본으로 켜지며 `CCDB_CONSOLE_TRIAGE=0`으로 끌 수 있습니다.
+
+**버전 5.1은 Workspace 연동과 대화를 관리하는 더 많은 방법을 추가합니다:**
+
+- **Ebi Workspace 작업**: 컨텍스트와 프로젝트를 둘러보고, 개요를 읽고, 작업을 추가·편집·완료하며,
+  작업에서 바로 AI 작업을 시작합니다. 프로젝트의 `status.md`와 컨텍스트의 `single-actions.md`가
+  계속 원본이며, 리비전 검사로 오래된 편집을 거부합니다.
+- **메시지 검색**: 사용 가능한 대화 기록과 로컬 트랜스크립트에서 텍스트를 찾아, 발췌와 해당 스레드로 가는
+  링크를 보여 줍니다. AI 호출은 없습니다.
+- **스레드 패밀리 관리**: 매니저와 자식의 백엔드·모델·effort를 따로 설정하고, 여러 스레드를 골라 한꺼번에
+  완료합니다. 부모를 완료하면 하위 스레드도 함께 완료됩니다.
+- **데스크톱·모바일 조작**: 텍스트 파일 내용과 스레드 링크를 복사하고, 초안이나 첨부를 잃지 않고
+  일본어/영어를 전환하며, 모바일 입력창을 항상 쓸 수 있게 유지합니다.
+
+자세한 내용은 [v5.1.0 릴리스 노트](../releases/v5.1.0.md), [콘솔 가이드](../console.md),
+[ADR-0014](../adr/0014-publish-the-ebi-ai-console-as-v5.md)(영어)를 참고하세요. 다음은 **스케줄러 연동**입니다.
+
+## v4의 새로운 점
+
+버전 4는 서로 독립적인 두 가지 선택을 명시적으로 분리합니다. **사람이 어디서 대화하는가**와
+**어떤 에이전트가 일을 하는가**입니다. 지원되는 어떤 프런트엔드도 지원되는 어떤 백엔드와
+조합할 수 있습니다.
+
+### 프런트엔드 × 백엔드
+
+| | Claude Code | OpenAI Codex | Local | AG-UI | pi |
+|---|---:|---:|---:|---:|---:|
+| Discord | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Microsoft Teams | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+- **Discord**는 여전히 마이그레이션이 필요 없는 기본값입니다. 기존 배포는 이전과 완전히
+  동일하게 시작됩니다.
+- **Microsoft Teams**는 작은 공개 리시버와, 비공개 세션 호스트에서 아웃바운드로만 연결하는
+  `ActivityPuller`를 통해 프로덕션에서 사용할 수 있습니다. `CCDB_FRONTENDS=discord,teams`를
+  설정하면 Discord와 Teams를 한 프로세스에서 함께 실행할 수 있습니다.
+- **AG-UI**는 Agent–User Interaction Protocol을 구현한 HTTP/SSE 에이전트에 두 채팅 표면
+  어느 쪽에서든 연결합니다. Claude Code, Codex, 보호 장치가 붙은 로컬 백엔드도 계속 사용할 수
+  있습니다.
+- **pi**는 [pi](https://github.com/earendil-works/pi) CLI를 실행합니다. 하나의 에이전트로
+  Anthropic, OpenAI, Google, GitHub Copilot 및 OpenAI 호환 로컬 서버에 접근합니다. ccdb가
+  사용하는 비대화형 모드에는 샌드박스가 없으므로, 호스트 자체의 격리를 신뢰한다고
+  `CCDB_PI_ALLOW_UNSANDBOXED=1`로 밝히기 전까지는 실행을 거부합니다.
+
+먼저 [백엔드 가이드](../backends.md)를 읽어 보세요. Teams는 완전판
+[Microsoft Teams 설정 가이드](../teams-setup.md)를 따라 구축한 뒤, 더 깊은 내용은
+[표면 동작](../teams.md)과 [릴레이 보안 모델](../teams-relay.md)을 참고하세요.
 
 **[English](../../README.md)** | **[日本語](../ja/README.md)** | **[简体中文](../zh-CN/README.md)** | **[Español](../es/README.md)** | **[Português](../pt-BR/README.md)** | **[Français](../fr/README.md)**
 
@@ -277,7 +353,7 @@ ccdb는 각 `embedded` 항목을 실제 전달된 파일과 **sha256 우선**, �
 
 ccdb 3.0은 봇 재시작 없이 다음 세션을 처리할 AI를 변경하는 세 가지 슬래시 명령을 도입합니다:
 
-- `/backend [name] [scope]` — 백엔드 표시 또는 전환. `name`은 `claude` 또는 `codex`. `scope`는 `thread`(이 스레드만) 또는 `global`(서버 전역 기본값). `scope`를 생략하면 명령이 자동 해석합니다: 스레드 안에서는 그 스레드로 범위가 지정되고, 그렇지 않으면 전역 기본값을 설정합니다.
+- `/backend [name] [scope]` — 백엔드 표시 또는 전환. `name`은 `claude`, `codex`, `local`, `agui`, `pi`, `antigravity` 중 하나. `scope`는 `thread`(이 스레드만) 또는 `global`(서버 전역 기본값). `scope`를 생략하면 명령이 자동 해석합니다: 스레드 안에서는 그 스레드로 범위가 지정되고, 그렇지 않으면 전역 기본값을 설정합니다.
 - `/model [name] [scope]` — **현재** 백엔드가 사용하는 모델 표시 또는 전환. 각 백엔드는 자신의 모델 선호를 기억하므로, 백엔드를 앞뒤로 전환해도 선호하는 모델이 그대로 유지됩니다. 백엔드의 모델을 설정하지 않은 채로 두면 해당 CLI 자체의 기본값을 따릅니다(예: Codex는 `~/.codex/config.toml`의 `model`을 사용하므로, ccdb는 버전을 고정하는 대신 콘솔 기본값을 추적합니다).
 - `/effort [level] [scope]` — 현재 백엔드가 사용하는 **추론 노력(reasoning effort)** 표시 또는 전환. 유효한 레벨은 백엔드별로 다릅니다: Claude는 `low/medium/high/max`를 허용하고, Codex는 `low/medium/high/xhigh/max/ultra`를 허용합니다(CLI의 `model_reasoning_effort`에 매핑됨). 설정하지 않은 채로 두면 CLI 기본값을 따릅니다.
 
@@ -580,7 +656,6 @@ async def setup(bot, runner, components):
 | Cog | 목적 |
 |-----|---------|
 | `ReminderCog` | Discord 기반 리마인더 예약 |
-| `WatchdogCog` | Todoist / 외부 서비스 워치독 |
 | `AutoUpgradeCog` | Webhook 트리거 패키지 업그레이드 |
 | `DocsSyncCog` | 푸시 시 자동 문서 동기화 |
 | `AlertResponderCog` | 범용 알림 모니터링 — 모니터링 시스템의 알림을 Discord로 전달하고 Claude Code 조사 세션을 트리거 |
@@ -1128,7 +1203,6 @@ examples/
   ebibot/                  # Real-world example: personal bot with custom Cogs
     cogs/
       reminder.py          # /remind slash command + scheduled notifications
-      watchdog.py          # Todoist overdue task monitor
       auto_upgrade.py      # Self-update via GitHub webhook
       docs_sync.py         # Auto-translate docs on push
 ```
@@ -1174,7 +1248,6 @@ uv run pytest tests/ -v --cov=claude_discord
 **[`examples/ebibot/`](examples/ebibot/)** — 이 프레임워크 위에 구축되어 바로 이 저장소에 포함된 개인 Discord 봇. 커스텀 Cog 로더를 다음과 함께 시연합니다:
 
 - **ReminderCog** — `/remind HH:MM "message"` 슬래시 명령 + 30초 전송 루프
-- **WatchdogCog** — Todoist 기한 초과 작업 모니터(30분 확인, 일일 중복 제거, 심각도 기반 경보)
 - **AutoUpgradeCog** — GitHub webhook + systemctl restart를 통한 자가 업데이트
 - **DocsSyncCog** — 푸시 시 webhook을 통한 자동 문서 번역
 - **AlertResponderCog** — 범용 알림 모니터링 Cog; 구성 가능한 소스를 감시하고 심각도가 주석된 알림을 Discord에 게시

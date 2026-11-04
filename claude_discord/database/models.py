@@ -7,6 +7,8 @@ import logging
 
 import aiosqlite
 
+from claude_code_core.account_pool_repo import ensure_account_schema
+
 logger = logging.getLogger(__name__)
 
 SCHEMA = """
@@ -113,6 +115,47 @@ CREATE TABLE IF NOT EXISTS frontend_threads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_frontend_threads_frontend ON frontend_threads(frontend);
+
+-- Which thread spawned which. Written at spawn time (before any session row
+-- exists, so an auto_start=false thread is not an orphan) and read back to
+-- answer "what did I start?" without parsing thread titles.
+CREATE TABLE IF NOT EXISTS thread_lineage (
+    thread_id INTEGER PRIMARY KEY,
+    parent_thread_id INTEGER NOT NULL,
+    family_code TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_thread_lineage_parent ON thread_lineage(parent_thread_id);
+
+-- Waits (claude_discord/waits.py): a probe ccdb re-runs until it says done,
+-- then resumes the thread. Lets a session end its turn while CI runs instead
+-- of holding a concurrency slot. Times are Unix seconds.
+CREATE TABLE IF NOT EXISTS pending_waits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    argv TEXT NOT NULL,
+    pending_exit_codes TEXT NOT NULL,
+    done_values TEXT NOT NULL,
+    interval_seconds INTEGER NOT NULL,
+    timeout_seconds INTEGER NOT NULL,
+    note TEXT,
+    cwd TEXT,
+    status TEXT NOT NULL,
+    outcome TEXT,
+    created_at REAL NOT NULL,
+    deadline REAL NOT NULL,
+    next_check_at REAL NOT NULL,
+    consecutive_errors INTEGER NOT NULL DEFAULT 0,
+    delivery_failures INTEGER NOT NULL DEFAULT 0,
+    last_exit_code INTEGER,
+    last_output TEXT,
+    last_error TEXT,
+    finished_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_waits_status ON pending_waits(status, next_check_at);
 """
 
 # Migrations for existing databases that lack new columns.
@@ -180,6 +223,15 @@ _MIGRATIONS = [
         "expires_at TEXT NOT NULL)"
     ),
     "CREATE INDEX IF NOT EXISTS idx_resource_claims_thread ON resource_claims(thread_id)",
+    # thread_lineage added in v4.1 — spawn parent/child links
+    (
+        "CREATE TABLE IF NOT EXISTS thread_lineage ("
+        "thread_id INTEGER PRIMARY KEY, "
+        "parent_thread_id INTEGER NOT NULL, "
+        "family_code TEXT NOT NULL, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_thread_lineage_parent ON thread_lineage(parent_thread_id)",
 ]
 
 
@@ -197,5 +249,9 @@ async def init_db(db_path: str) -> None:
         for stmt in _MIGRATIONS:
             with contextlib.suppress(Exception):
                 await db.execute(stmt)
+        await db.commit()
+        # Account-pool tables. Additive only: usage_stats keeps its original shape
+        # (and the implicit login's rows), so an older release can still run here.
+        await ensure_account_schema(db)
         await db.commit()
     logger.info("Database initialized at %s", db_path)

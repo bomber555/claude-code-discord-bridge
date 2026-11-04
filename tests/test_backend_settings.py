@@ -227,3 +227,68 @@ class TestEffort:
         s = await self._settings()
         with pytest.raises(ValueError):
             await s.set_effort("gpt4", "high")  # type: ignore[arg-type]
+
+
+class TestPiEnvModel:
+    """Without CCDB_PI_MODEL, pi picks its own default — possibly one the
+    account's credentials cannot call, with no way out from Discord."""
+
+    async def test_pi_env_default_is_resolved(self) -> None:
+        repo, _ = await _new_repo()
+        s = BackendSettings(
+            repo,
+            env_backend="pi",
+            env_model_for_claude="sonnet",
+            env_model_for_codex="",
+            env_model_for_pi="anthropic/claude-opus-5",
+        )
+        assert await s.current_model("pi") == "anthropic/claude-opus-5"
+        # It is a pi default only; the other backends keep their own.
+        assert await s.current_model("claude") == "sonnet"
+
+    async def test_unset_pi_env_still_defers_to_pi(self) -> None:
+        repo, _ = await _new_repo()
+        s = BackendSettings(
+            repo,
+            env_backend="pi",
+            env_model_for_claude="sonnet",
+            env_model_for_codex="",
+        )
+        assert await s.current_model("pi") is None
+
+    async def test_model_set_overrides_the_pi_env_default(self) -> None:
+        repo, _ = await _new_repo()
+        s = BackendSettings(
+            repo,
+            env_backend="pi",
+            env_model_for_claude="sonnet",
+            env_model_for_codex="",
+            env_model_for_pi="anthropic/claude-opus-5",
+        )
+        await s.set_model("pi", "ollama/gpt-oss:120b", thread_id=42)
+        assert await s.current_model("pi", 42) == "ollama/gpt-oss:120b"
+        assert await s.current_model("pi") == "anthropic/claude-opus-5"
+
+
+async def test_child_preferences_are_independent_persistent_and_scoped():
+    repo, _ = await _new_repo()
+    settings = BackendSettings(
+        repo, env_backend="claude", env_model_for_claude="opus", env_model_for_codex=""
+    )
+    child = settings.for_children()
+    assert await child.current_backend(10) == "claude"
+    await settings.set_backend("codex", thread_id=10)
+    await child.set_backend("pi")
+    await child.set_model("pi", "provider/gpt-6.1-sol")
+    await child.set_effort("pi", "high")
+    await child.set_backend("claude", thread_id=20)
+    await child.set_model("claude", "sonnet", thread_id=20)
+    restored = settings.for_children()
+    assert await settings.current_backend(10) == "codex"
+    assert await settings.current_backend() == "claude"
+    assert await restored.current_backend(10) == "pi"
+    assert await restored.current_model("pi", 10) == "provider/gpt-6.1-sol"
+    assert await restored.current_effort("pi", 10) == "high"
+    assert await restored.current_backend(20) == "claude"
+    assert await restored.current_model("claude", 20) == "sonnet"
+    assert await settings.current_model("claude", 20) == "opus"

@@ -1,0 +1,41 @@
+.live-slot:empty { display: none; }
+.live { margin: 0 16px 8px; padding: 4px 8px; border: 1px dashed var(--ai); border-radius: var(--radius); background: var(--panel); }
+.live-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.live-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; background: none; border: 0; padding: 2px 0; text-align: left; }
+.live-caret { color: var(--dim); width: 1em; }
+.live-status { color: var(--ai); white-space: nowrap; }
+.live-latest { flex: 1; min-width: 0; color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-stop { padding: 2px 10px; }
+.live-acts { list-style: none; margin: 6px 0 0; padding: 0; color: var(--dim); font-size: 12px; }
+.live-acts li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-acts li.done { opacity: 0.7; }
+.live-draft { margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20vh; overflow-y: auto; }
+.live-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.file-thumb { display: block; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--raise);
+  cursor: zoom-in; overflow: hidden; max-width: 100%; }
+.file-thumb img { display: block; max-width: min(100%, 360px); max-height: 240px; object-fit: contain; }
+.file-thumb-wait { display: grid; place-items: center; width: 120px; height: 80px; font-size: 22px; }
+.lightbox { position: fixed; inset: 0; z-index: 30; background: rgb(0 0 0 / .85); display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px; padding: 16px; cursor: zoom-out; }
+.pv-shade { position: fixed; inset: 0; z-index: 30; background: rgb(0 0 0 / .7); display: grid; place-items: center; padding: 16px; }
+.pv-panel { width: min(1100px, 100%); height: min(88vh, 100%); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; }
+.pv-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.pv-name { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-size { flex: none; font-size: 12px; }
+.pv-body { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+.pv-note { margin: 0; padding: 6px 12px; font-size: 12px; color: var(--p1); border-bottom: 1px solid var(--line); }
+.pv-doc { padding: 16px 22px; max-width: 900px; }
+.pv-pre { margin: 0; padding: 12px 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.5; }
+.pv-frame { flex: 1; width: 100%; border: 0; background: #fff; }
+.pv-scroll { overflow: auto; padding: 8px 12px; }
+.pv-table { border-collapse: collapse; font-size: 12.5px; }
+.pv-table th, .pv-table td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; vertical-align: top; }
+.pv-table th { background: var(--raise); position: sticky; top: 0; }
+.file-look { margin-left: 8px; font-size: 12px; padding: 1px 8px; }
+.capture .attach-wrap .btn.attach { padding: 4px 8px; font-size: 14px; }
+.lightbox-bar { display: flex; align-items: center; gap: 8px; max-width: 100%; }
+.lightbox-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lightbox-img { max-width: 100%; max-height: calc(100% - 56px); object-fit: contain; cursor: default; border-radius: 4px; }
+
+.pv-bar { flex-wrap: wrap; }

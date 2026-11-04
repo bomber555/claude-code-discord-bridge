@@ -14,16 +14,25 @@ import re
 import signal
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from .account_pool import AccountBinding
 from .child_env import STRIPPED_ENV_KEYS
+from .codex_transcript import codex_message_from_line
+from .connections import Connection, codex_args
+from .execution import ExecutionRefusedError, carry_execution_mode, prepare_launch, refusal_event
 from .types import (
     ImageData,
+    InjectedMessage,
     MessageType,
     StreamEvent,
     ToolCategory,
     ToolUseEvent,
 )
+
+if TYPE_CHECKING:
+    from .codex_app_server import AppServerSession
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +195,15 @@ _RESUME_STREAM_DISCONNECT_PATTERN = re.compile(
     r"websocket closed by server before response\.completed",
     re.IGNORECASE,
 )
+# Once Codex has emitted a terminal event, the turn's output is complete and the
+# remaining stdout is just the CLI winding down. Draining it lets Codex release
+# its thread-store writer before a queued resume starts, but a CLI that never
+# closes stdout must not hold the per-thread run slot for the whole turn
+# timeout, so the post-completion read is bounded separately and falls back to
+# terminating the process.
+POST_COMPLETION_DRAIN_SECONDS = 10.0
+# Bound on the natural exit once stdout has reached EOF, for the same reason.
+PROCESS_EXIT_TIMEOUT_SECONDS = 10.0
 _RECOVERY_MESSAGE_LIMIT = 12
 _RECOVERY_MESSAGE_CHARS = 4_000
 _RECOVERY_TRANSCRIPT_CHARS = 24_000
@@ -283,25 +301,13 @@ def _text_transcript_from_rollout(session_id: str, env: dict[str, str]) -> str:
     try:
         with rollout.open(encoding="utf-8") as stream:
             for line in stream:
-                # Image/tool records can be several megabytes. Reject them
-                # before JSON parsing and retain only lightweight event_msg text.
-                if '"event_msg"' not in line:
+                # Image/tool records can be several megabytes; the parser
+                # rejects them before JSON parsing.
+                message = codex_message_from_line(line)
+                if message is None:
                     continue
-                if '"user_message"' not in line and '"agent_message"' not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = record.get("payload", {})
-                event_type = payload.get("type")
-                message = payload.get("message")
-                if event_type not in {"user_message", "agent_message"} or not isinstance(
-                    message, str
-                ):
-                    continue
-                role = "User" if event_type == "user_message" else "Assistant"
-                messages.append((role, message[:_RECOVERY_MESSAGE_CHARS]))
+                role, text = message
+                messages.append((role, text[:_RECOVERY_MESSAGE_CHARS]))
                 if role == "Assistant":
                     last_assistant_index = len(messages) - 1
     except OSError:
@@ -331,6 +337,13 @@ def _build_resume_recovery_prompt(prompt: str, session_id: str, env: dict[str, s
 
 class CodexRunner:
     """Manages OpenAI Codex CLI subprocess."""
+
+    # Execution environment (claude_code_core.execution). ``None`` = deployment
+    # default; ``execution_served`` records which one ran the last spawn.
+    execution_mode: str | None = None
+    execution_served: str | None = None
+    # ``local`` reuses this runner; the environment needs to know which it is.
+    _execution_backend = "codex"
 
     def __init__(
         self,
@@ -368,8 +381,15 @@ class CodexRunner:
         self.thread_id = thread_id
         self.append_system_prompt = append_system_prompt
         self.images = images
+        # Account-pool profile this runner spawns as (CODEX_HOME). None means
+        # the relay's own environment — the behaviour without a pool.
+        self.account: AccountBinding | None = None
+        #: ChatGPT subscription or a config.toml provider (see :mod:`.connections`).
+        self.connection: Connection | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._interrupt_requested = False
+        self._app_server: AppServerSession | None = None
+        self._unconsumed_app_messages: list[InjectedMessage] = []
 
     async def run(
         self,
@@ -377,6 +397,23 @@ class CodexRunner:
         session_id: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Run Codex CLI and yield stream events."""
+        self._unconsumed_app_messages = []
+        if self._use_app_server():
+            from .codex_app_server import AppServerSession
+
+            self._interrupt_requested = False
+            self._app_server = AppServerSession(self)
+            stream = self._app_server.run(prompt, session_id)
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                try:
+                    await stream.aclose()
+                finally:
+                    self._unconsumed_app_messages = list(self._app_server.outstanding.values())
+                    self._app_server = None
+            return
         attempt_session_id = session_id
         attempt_prompt = prompt
         retried_without_resume = False
@@ -391,13 +428,26 @@ class CodexRunner:
 
             logger.info("Starting Codex CLI: %s (cwd=%s)", " ".join(args[:6]) + " ...", cwd)
 
+            try:
+                launch = await prepare_launch(
+                    backend=self._execution_backend,
+                    requested_mode=self.execution_mode,
+                    argv=args,
+                    env=env,
+                    cwd=cwd,
+                )
+            except ExecutionRefusedError as exc:
+                yield refusal_event(exc)
+                return
+            self.execution_served = launch.mode
+
             self._process = await asyncio.create_subprocess_exec(
-                *args,
+                *launch.argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                env=env,
+                cwd=launch.cwd,
+                env=launch.env,
                 limit=10 * 1024 * 1024,
             )
 
@@ -467,7 +517,7 @@ class CodexRunner:
         **_kwargs: object,
     ) -> CodexRunner:
         """Create a fresh runner with the same configuration but no active process."""
-        return CodexRunner(
+        cloned = CodexRunner(
             command=self.command,
             model=model if model is not None else self.model,
             permission_mode=self.permission_mode,
@@ -488,9 +538,37 @@ class CodexRunner:
             images=self.images,
             effort=self.effort if effort is _UNSET else effort,  # type: ignore[arg-type]
         )
+        cloned.account = self.account
+        cloned.connection = self.connection
+        return carry_execution_mode(self, cloned)
+
+    def _use_app_server(self) -> bool:
+        # Local transport needs a separate vendor-egress measurement (decision 13).
+        return (
+            self._execution_backend == "codex"
+            and os.environ.get("CCDB_CODEX_TRANSPORT", "exec") == "app-server"
+        )
+
+    async def inject_user_message(self, text: str, images: list[ImageData] | None = None) -> bool:
+        """Use the shared live-input ownership and acknowledgement contract."""
+        if self._app_server is None:
+            return False
+        return await self._app_server.inject_user_message(text, images)
+
+    def unconsumed_messages(self) -> list[InjectedMessage]:
+        if self._app_server is not None:
+            return list(self._app_server.outstanding.values())
+        return list(self._unconsumed_app_messages)
 
     async def interrupt(self) -> None:
-        """Interrupt the subprocess with SIGINT."""
+        """Interrupt the subprocess with SIGINT, or the active app-server turn."""
+        if self._app_server is not None:
+            self._interrupt_requested = True
+            try:
+                if await self._app_server.interrupt():
+                    return
+            except (TimeoutError, ConnectionError, RuntimeError):
+                logger.warning("Codex app-server interrupt failed; terminating process")
         if self._process and self._process.returncode is None:
             self._interrupt_requested = True
             if os.name == "nt":
@@ -572,6 +650,7 @@ class CodexRunner:
         args.append("--skip-git-repo-check")
         if self.model:
             args.extend(["--model", self.model])
+        args.extend(codex_args(self.connection))
         if self.effort:
             if self.effort not in VALID_CODEX_EFFORTS:
                 raise ValueError(
@@ -608,6 +687,8 @@ class CodexRunner:
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the subprocess."""
         env = {k: v for k, v in os.environ.items() if k not in self._STRIPPED_ENV_KEYS}
+        if self.account is not None:
+            env.update(self.account.env)
         if self.api_port is not None:
             env["CCDB_API_URL"] = f"http://127.0.0.1:{self.api_port}"
         if self.api_secret is not None:
@@ -640,10 +721,26 @@ class CodexRunner:
         if self._process is None or self._process.stdout is None:
             raise RuntimeError("Process not started")
 
+        saw_terminal_event = False
+
         while True:
-            line = await asyncio.wait_for(
-                self._process.stdout.readline(), timeout=self.timeout_seconds or None
+            read_timeout = (
+                POST_COMPLETION_DRAIN_SECONDS
+                if saw_terminal_event
+                else (self.timeout_seconds or None)
             )
+            try:
+                line = await asyncio.wait_for(self._process.stdout.readline(), timeout=read_timeout)
+            except TimeoutError:
+                if not saw_terminal_event:
+                    raise
+                # The turn already reported its result; _cleanup() terminates
+                # the stuck CLI rather than leaving the thread waiting.
+                logger.warning(
+                    "Codex CLI kept stdout open %.0fs after the terminal event; terminating",
+                    POST_COMPLETION_DRAIN_SECONDS,
+                )
+                return
             if not line:
                 break
             decoded = line.decode("utf-8", errors="replace")
@@ -654,6 +751,8 @@ class CodexRunner:
                 # Keep draining stdout so ``wait()`` below observes the natural
                 # exit and Codex releases its thread-store writer before a
                 # queued resume starts.
+                if event.is_complete:
+                    saw_terminal_event = True
                 # Atomic tools (e.g. file_changes) have no completion event of
                 # their own; pair them with a synthetic result so the live
                 # elapsed timer is cancelled instead of accumulating forever.
@@ -662,7 +761,18 @@ class CodexRunner:
                     yield completion
 
         if self._process.returncode is None:
-            await asyncio.wait_for(self._process.wait(), timeout=10)
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=PROCESS_EXIT_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning(
+                    "Codex CLI did not exit %.0fs after stdout closed; terminating",
+                    PROCESS_EXIT_TIMEOUT_SECONDS,
+                )
+                if saw_terminal_event:
+                    # Reporting a turn timeout here would contradict the result
+                    # the thread already received.
+                    return
+                raise
 
         if self._process.returncode is not None and self._process.returncode > 0:
             if self._interrupt_requested:

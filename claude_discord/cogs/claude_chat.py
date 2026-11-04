@@ -12,46 +12,79 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import logging
 import os
 import tempfile
-from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from claude_code_core.account_pool import AccountTurn
+from claude_code_core.attention_repo import AttentionRecorder
 from claude_code_core.backend import SessionBackend
 
+from .. import live_runs
+from ..account_turns import (
+    failover_notice,
+    history_reader_at,
+    plan_account_turn,
+    plan_notice,
+    refresh_codex_usage,
+    session_home,
+)
+from ..attention_capture import activity_from_message, is_human_message
 from ..backend_factory import BackendFactory
 from ..backend_settings import BackendSettings, session_is_resumable
 from ..claude.rewind import find_session_jsonl, parse_user_turns
 from ..claude.types import ImageData
 from ..concurrency import SessionRegistry
-from ..cross_backend_handoff import ConversationHistoryReader, build_handoff_prompt
+from ..connection_choice import apply_connection
+from ..cross_backend_handoff import ConversationHistoryReader, carry_history_across_backends
 from ..database.ask_repo import PendingAskRepository
 from ..database.lounge_repo import LoungeRepository
 from ..database.repository import SessionRecord, SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
-from ..discord_ui.chunker import chunk_message
+from ..discord_ui.chunker import DISCORD_MAX_CHARS, chunk_message
 from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.file_sender import send_file_blobs
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_context import DEFAULT_DAYS, build_recent_transcript
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
-from ..discord_ui.thread_renamer import suggest_title
+from ..discord_ui.thread_renamer import suggest_retitle, suggest_title
+from ..discord_ui.thread_retitle import RetitleTracker
 from ..discord_ui.views import RewindSelectView, StopView
-from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
+from ..execution_settings import apply_thread_execution_mode, thread_execution_mode
+from ..restart_reservation import QUEUED_RESTART_REASON, persist_queued_runs
+from ..session_slots import get_session_slots
+from ..thread_marker import (
+    MAX_THREAD_NAME_LENGTH,
+    family_code,
+    mark_parent_thread_name,
+    mark_spawned_thread_name,
+    retag_thread_name,
+    set_outcome_thread_name,
+)
+from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES, initial_thread_name
+from ..thread_status import schedule_thread_outcome
 from ._run_helper import run_claude_with_config
 from .prompt_builder import build_prompt_and_images, wants_file_attachment
 from .run_config import RunConfig
 
 if TYPE_CHECKING:
+    from claude_code_core.account_router import AccountRouter, Failover, TurnPlan
+
     from ..bot import ClaudeDiscordBot
+    from ..database.repository import UsageStatsRepository
 
 logger = logging.getLogger(__name__)
+
+# Reacted on a message that went into the turn already running (issue #1129).
+INJECTED_REACTION = "📥"
 
 # How many messages to scan when recovering an ``auto_start=false`` seed.
 # A seed is chunked at Discord's per-message limit, so this bounds the seed at
@@ -77,7 +110,9 @@ _HELP_CATEGORY: dict[str, str | None] = {
     "fork": "📌 Session",
     "context": "📌 Session",
     "usage": "📌 Session",
+    "attention": "📌 Session",
     "sessions": "📌 Session",
+    "queue": "📌 Session",  # reorder / pause sessions waiting for a slot
     "search": "📌 Session",
     "resume": "📌 Session",
     "resume-info": "📌 Session",
@@ -88,6 +123,7 @@ _HELP_CATEGORY: dict[str, str | None] = {
     "engine-status": "🤖 Model",
     "ollama": "🤖 Model",  # manage the runtime behind the `local` backend
     "merge": "🔧 Advanced",  # show a pull request with a merge button
+    "sandbox": "🤖 Model",  # where the agent runs (execution environment)
     "ask": "🤖 Model",  # one anonymized question to an external model
     "effort": "⚡ Effort",
     "tools-show": "🔧 Advanced",
@@ -101,6 +137,16 @@ _HELP_CATEGORY: dict[str, str | None] = {
 
 # Section display order in the embed.
 _HELP_SECTION_ORDER: list[str] = ["📌 Session", "🤖 Model", "⚡ Effort", "🔧 Advanced"]
+
+
+_DEFAULT_RESUME_PROMPT = (
+    "The bot restarted. "
+    "Please report what you were working on before resuming. "
+    "⚠️ Context may have been compressed, which means the approval status of "
+    "planned tasks could be lost. "
+    "Before making any code changes, commits, or PRs, "
+    "re-confirm with the user that they want you to proceed."
+)
 
 
 class ClaudeChatCog(commands.Cog):
@@ -130,8 +176,14 @@ class ClaudeChatCog(commands.Cog):
         factory: BackendFactory | None = None,
         backend_settings: BackendSettings | None = None,
         conversation_history: ConversationHistoryReader | None = None,
+        usage_repo: UsageStatsRepository | None = None,
+        account_router: AccountRouter | None = None,
+        attention_recorder: AttentionRecorder | None = None,
     ) -> None:
         self.bot = bot
+        # Human-activity metering (docs/attention.md). Optional: when absent,
+        # nothing is recorded and the chat path is unchanged.
+        self._attention_recorder = attention_recorder
         self.repo = repo
         self.runner = runner
         # Optional backend factory + settings: when both are present,
@@ -140,6 +192,13 @@ class ClaudeChatCog(commands.Cog):
         self._factory = factory
         self._backend_settings = backend_settings
         self._conversation_history = conversation_history or ConversationHistoryReader()
+        # Rate-limit windows from each turn land here so /usage has data.
+        self._usage_repo = usage_repo
+        # Account pools (CCDB_ACCOUNT_POOLS_FILE). None = one implicit login.
+        self._account_router = account_router
+        # Strong references to fire-and-forget tasks (asyncio keeps only weak
+        # ones, so an unreferenced task can be garbage-collected mid-run).
+        self._background_tasks: set[asyncio.Task] = set()
         self._max_concurrent = max_concurrent
         self._allowed_user_ids = allowed_user_ids
         # When True, skip channel-ID filtering and accept all guild channels.
@@ -184,6 +243,8 @@ class ClaudeChatCog(commands.Cog):
         self._settings_repo = settings_repo or getattr(bot, "settings_repo", None)
         # When True, rename the thread after creation using a claude -p title suggestion
         self._auto_rename_threads = auto_rename_threads
+        # Drift accounting for keeping that title true as the thread's work moves on
+        self._retitle_tracker = RetitleTracker()
 
     @property
     def active_session_count(self) -> int:
@@ -266,13 +327,19 @@ class ClaudeChatCog(commands.Cog):
         # thread, a thread message continues that thread's session.
         if self._is_no_mention_scope(message.channel):
             if isinstance(message.channel, discord.Thread):
+                await self._record_attention(message, opens_thread=False)
                 await self._handle_thread_reply(message)
             else:
+                await self._record_attention(
+                    message,
+                    opens_thread=message.channel.id not in self._inline_reply_channel_ids,
+                )
                 await self._handle_new_conversation(message)
             return
 
         # Everywhere else: answer only when summoned, and answer *there*.
         if self._is_summoned(message):
+            await self._record_attention(message, opens_thread=False)
             await self._handle_mention(message)
 
     def _is_for_another_bot(self, message: discord.Message) -> bool:
@@ -281,6 +348,18 @@ class ClaudeChatCog(commands.Cog):
         if me is not None and me in message.mentions:
             return False
         return any(user.bot and user != me for user in message.mentions)
+
+    async def _record_attention(self, message: discord.Message, *, opens_thread: bool) -> None:
+        """Meter a human turn that is about to reach a session (metadata only)."""
+        recorder = self._attention_recorder
+        if recorder is None or not recorder.enabled or not is_human_message(message):
+            return
+        try:
+            activity = activity_from_message(message, opens_thread=opens_thread)
+        except Exception:
+            logger.exception("Could not describe message %s for attention metering", message.id)
+            return
+        await recorder.record(activity)
 
     def _is_no_mention_scope(self, channel: discord.abc.MessageableChannel) -> bool:
         """Return whether *channel* is one ccdb was invited to speak in freely.
@@ -397,6 +476,10 @@ class ClaudeChatCog(commands.Cog):
         if fork_session and hasattr(runner, "fork_session"):
             runner.fork_session = True  # type: ignore[attr-defined]
 
+        # Per-thread execution environment (/sandbox), bounded by the allowlist.
+        await apply_thread_execution_mode(runner, self._backend_settings.repo, thread_id)
+        await apply_connection(runner, self._backend_settings, backend, thread_id)
+
         return runner
 
     @app_commands.command(name="help", description="Show available commands and how to use the bot")
@@ -417,7 +500,7 @@ class ClaudeChatCog(commands.Cog):
             sections.setdefault(section, []).append(f"`/{cmd.name}` — {cmd.description}")
 
         embed = discord.Embed(
-            title="🤖 Claude & Codex Bot — Help",
+            title="🤖 AI Agent Bot — Help",
             description=(
                 "**Getting started**: type a message in the configured channel.\n"
                 "A new thread is created and your selected AI backend begins working.\n\n"
@@ -442,11 +525,16 @@ class ClaudeChatCog(commands.Cog):
         """
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in an agent chat thread.", ephemeral=True
             )
             return
 
-        runner = self._active_runners.get(interaction.channel.id)
+        # The live run holds the runner that owns the process; the registered
+        # one may be the template it was cloned from, which has none.
+        live = live_runs.get(interaction.channel.id)
+        runner = (
+            live.runner if live is not None else self._active_runners.get(interaction.channel.id)
+        )
         if not runner:
             await interaction.response.send_message(
                 "No active session is running in this thread.", ephemeral=True
@@ -466,7 +554,7 @@ class ClaudeChatCog(commands.Cog):
         """Trigger manual context compaction via the CLI's /compact command."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in an agent chat thread.", ephemeral=True
             )
             return
 
@@ -500,7 +588,7 @@ class ClaudeChatCog(commands.Cog):
 
     @app_commands.command(
         name="goal",
-        description="Set a completion condition — Claude keeps working until it's met",
+        description="Set a completion condition — the agent keeps working until it's met",
     )
     @app_commands.describe(condition="Goal condition (omit to check status, 'clear' to cancel)")
     async def goal_session(
@@ -511,7 +599,7 @@ class ClaudeChatCog(commands.Cog):
         """Set, check, or clear a goal via the CLI's /goal command."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in an agent chat thread.", ephemeral=True
             )
             return
 
@@ -558,12 +646,12 @@ class ClaudeChatCog(commands.Cog):
             working_dir_override=record.working_dir,
         )
 
-    @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
+    @app_commands.command(name="clear", description="Reset the agent session for this thread")
     async def clear_session(self, interaction: discord.Interaction) -> None:
         """Reset the session for the current thread."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in an agent chat thread.", ephemeral=True
             )
             return
 
@@ -572,6 +660,11 @@ class ClaudeChatCog(commands.Cog):
         if runner:
             await runner.kill()
             del self._active_runners[interaction.channel.id]
+
+        # The thread starts over, so its drift history is about a conversation
+        # that no longer exists — keeping it would judge the new subject against
+        # the old one's messages.
+        self._retitle_tracker.forget(interaction.channel.id)
 
         deleted = await self.repo.delete(interaction.channel.id)
         if deleted:
@@ -602,7 +695,7 @@ class ClaudeChatCog(commands.Cog):
         """
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in an agent chat thread.", ephemeral=True
             )
             return
 
@@ -611,6 +704,17 @@ class ClaudeChatCog(commands.Cog):
         if record is None:
             await interaction.response.send_message(
                 "No active session found for this thread.", ephemeral=True
+            )
+            return
+
+        # Rewind truncates a Claude session JSONL. Other backends keep their
+        # history elsewhere, so the lookup below would miss and fall through to
+        # the full reset — refuse instead of silently wiping the session.
+        if record.backend and record.backend != "claude":
+            await interaction.response.send_message(
+                f"⏪ `/rewind` is not supported for `{record.backend}` sessions yet. "
+                "The conversation was left unchanged — use `/clear` to start over.",
+                ephemeral=True,
             )
             return
 
@@ -665,7 +769,7 @@ class ClaudeChatCog(commands.Cog):
         """
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
+                "This command can only be used in an agent chat thread.", ephemeral=True
             )
             return
 
@@ -774,7 +878,7 @@ class ClaudeChatCog(commands.Cog):
                 chat_only=chat_only,
             )
         else:
-            thread_name = message.content[:100] if message.content else "Claude Chat"
+            thread_name = initial_thread_name(message.content)
             thread = await message.create_thread(
                 name=thread_name,
                 auto_archive_duration=THREAD_AUTO_ARCHIVE_MINUTES,
@@ -812,6 +916,105 @@ class ClaudeChatCog(commands.Cog):
             except Exception:
                 logger.warning("Failed to rename thread %d to %r", thread.id, title, exc_info=True)
 
+    def _schedule_clear_done_marker(self, thread: discord.Thread) -> None:
+        """Drop the outcome marker (✅/❓/⚠️) once a human talks in the thread again.
+
+        Backgrounded: discord.py sleeps through a rename rate limit (two per ten
+        minutes per thread), and the human's reply must not wait on that.
+        Shares the per-thread queue with the outcome marks, so a clear still
+        waiting out the limit is overtaken by the turn's next outcome.
+        """
+        current = thread.name or ""
+        if set_outcome_thread_name(current, None) == current.strip():
+            return
+        schedule_thread_outcome(thread, None)
+
+    def _schedule_retitle(self, thread: discord.Thread, text: str) -> None:
+        """Note a reply, and start a re-title when the thread has drifted enough.
+
+        Synchronous on purpose: the tracker's claim has to happen before any
+        await, or two fast replies both see the same slot as free and each
+        start a rename. Only threads ccdb opened are renamed — a thread a human
+        started is theirs, and quietly retitling it is the sort of "help" nobody
+        asked for.
+        """
+        if not self._auto_rename_threads or not text.strip():
+            return
+        bot_user = self.bot.user
+        if bot_user is None or thread.owner_id != bot_user.id:
+            return
+        self._retitle_tracker.record(thread.id, text)
+        messages = self._retitle_tracker.claim(thread.id)
+        if messages is None:
+            return
+        asyncio.create_task(self._background_retitle_thread(thread, messages))
+
+    async def _background_retitle_thread(
+        self,
+        thread: discord.Thread,
+        recent_messages: tuple[str, ...],
+    ) -> None:
+        """Replace *thread*'s title when its subject has moved on.
+
+        Every outcome that is not a confident new title leaves the thread
+        untouched, so a slow CLI, a rate-limited rename or a model that answered
+        KEEP all look the same from Discord: nothing happened.
+        """
+        current = thread.name or ""
+        title = await suggest_retitle(
+            current,
+            recent_messages,
+            claude_command=self.runner.command,
+            env=self.runner._build_env(),
+        )
+        if not title:
+            return
+        new_name = retag_thread_name(current, title)
+        if new_name == current:
+            return
+        try:
+            await thread.edit(name=new_name)
+            logger.info("thread %d retitled %r -> %r", thread.id, current, new_name)
+        except Exception:
+            # Discord allows two renames per ten minutes; losing one is fine.
+            logger.warning("Failed to retitle thread %d to %r", thread.id, new_name, exc_info=True)
+
+    async def _link_to_parent_thread(
+        self,
+        thread: discord.Thread,
+        parent_thread_id: int,
+    ) -> None:
+        """Tag the spawning thread and cross-link the two, best-effort.
+
+        Three separate favours, each suppressed on its own: tagging the parent,
+        telling the parent what it started, and telling the child where it came
+        from. None of them is worth failing a spawn that already succeeded, and
+        a parent thread that was archived, deleted or renamed past the limit
+        must not take the fan-out down with it.
+
+        The rename is skipped when the tag is already there, which keeps a
+        ten-child fan-out at one rename rather than ten — Discord allows a
+        thread two renames per ten minutes, so retagging per spawn would start
+        failing partway through and leave the parent untagged exactly when it
+        has the most children to account for.
+        """
+        parent = self.bot.get_channel(parent_thread_id)
+        if parent is None:
+            with contextlib.suppress(Exception):
+                parent = await self.bot.fetch_channel(parent_thread_id)
+        if not isinstance(parent, discord.Thread):
+            return
+
+        tagged = mark_parent_thread_name(parent.name, parent_thread_id)
+        if tagged != parent.name:
+            with contextlib.suppress(Exception):
+                await parent.edit(name=tagged)
+        code = family_code(parent_thread_id)
+        with contextlib.suppress(Exception):
+            await parent.send(f"-# \u2937 spawned {thread.mention}")
+        with contextlib.suppress(Exception):
+            await thread.send(f"-# \u21b3 {code} \u2014 spawned by {parent.mention}")
+
     async def spawn_session(
         self,
         channel: discord.TextChannel,
@@ -823,6 +1026,8 @@ class ClaudeChatCog(commands.Cog):
         result_sink: Callable[[str | None, str | None], Awaitable[None]] | None = None,
         attachments: list[tuple[str, bytes]] | None = None,
         invite_user_id: int | None = None,
+        agent_spawned: bool = False,
+        parent_thread_id: int | None = None,
     ) -> discord.Thread:
         """Create a new thread and optionally start a Claude Code session.
 
@@ -860,21 +1065,59 @@ class ClaudeChatCog(commands.Cog):
                         a thread nobody was watching still lands in their joined
                         list. Best-effort: a failure here is a visibility miss,
                         never a reason to fail a spawn that already succeeded.
+            agent_spawned: Whether this thread was started by an agent rather
+                        than by a person writing in Discord. When ``True`` the
+                        title is prefixed with the spawn marker so the thread is
+                        recognisable in the channel list without opening it.
+                        ``/fork`` and session resume leave this ``False``: they
+                        carry their own prefixes and a human asked for them.
+            parent_thread_id: The thread that asked for this spawn, when the
+                        caller knows it. Both titles then carry that thread's
+                        family code (``🤖K2`` here, ``🌳K2`` there), which is
+                        what turns several concurrent fan-outs from one pile of
+                        markers into readable trees. Best-effort in every
+                        respect: an unreachable or unrenameable parent costs the
+                        cross-link, never the spawn.
 
         Returns:
             The newly created :class:`discord.Thread`.
         """
-        name = (thread_name or prompt)[:100]
+        # Resolve before creating the thread and persist before scheduling its first turn.
+        # A manager's own backend is independent from its child preferences.
+        child_ai = None
+        if parent_thread_id is not None and self._backend_settings is not None:
+            settings = self._backend_settings.for_children()
+            backend = await settings.current_backend(parent_thread_id)
+            child_ai = (
+                backend,
+                await settings.current_model(backend, parent_thread_id),
+                await settings.current_effort(backend, parent_thread_id),
+            )
+        raw_name = thread_name or prompt
+        name = (
+            mark_spawned_thread_name(raw_name, parent_thread_id=parent_thread_id)
+            if agent_spawned
+            else raw_name[:MAX_THREAD_NAME_LENGTH]
+        )
         thread = await channel.create_thread(
             name=name,
             type=discord.ChannelType.public_thread,
             auto_archive_duration=THREAD_AUTO_ARCHIVE_MINUTES,
         )
+        if child_ai is not None and self._backend_settings is not None:
+            backend, model, effort = child_ai
+            await self._backend_settings.set_backend(backend, thread_id=thread.id)
+            if model:
+                await self._backend_settings.set_model(backend, model, thread_id=thread.id)
+            if effort:
+                await self._backend_settings.set_effort(backend, effort, thread_id=thread.id)
         # Added before the seed message so the requester sees the thread from its
         # first line, not after Claude has already been talking to itself.
         if invite_user_id:
             with contextlib.suppress(Exception):
                 await thread.add_user(discord.Object(id=invite_user_id))
+        if agent_spawned and parent_thread_id:
+            await self._link_to_parent_thread(thread, parent_thread_id)
         # Post the prompt so StatusManager has a Message to add reactions to.
         # Long prompts (e.g. an ingested Teams thread) exceed Discord's
         # per-message limit, so chunk the seed for display. The full prompt is
@@ -910,6 +1153,8 @@ class ClaudeChatCog(commands.Cog):
         text: str,
         *,
         interrupt: bool,
+        into_running_turn: bool = False,
+        brief: str | None = None,
     ) -> None:
         """Feed a message from another session into this thread's Claude session.
 
@@ -922,16 +1167,49 @@ class ClaudeChatCog(commands.Cog):
 
         Args:
             thread: The receiving thread.
-            text: Already-wrapped message (see ``relay.build_relay_prompt``).
+            text: Already-wrapped message (``relay.build_relay_prompt``, or a
+                finished wait's ``waits.build_wait_prompt``).
             interrupt: When True, SIGINT the turn in flight so a "stop, I have
                 this" reaches Claude within seconds. When False, wait for the
                 current turn to finish — the right default, because a message
                 that preempts a turn can cost the receiver uncommitted work.
+            into_running_turn: Hand the message to the turn in flight, if it can
+                take input, instead of waiting for it — what a human replying
+                from Ebi AI Console expects. Falls back to waiting.
+            brief: Instructions for the agent only (Ebi Workspace context). Posted
+                as a message of its own after *text*, which the Console files under
+                activity, and appended to what the agent receives.
         """
-        chunks = chunk_message(text) or [text]
-        seed_message = await thread.send(chunks[0])
-        for chunk in chunks[1:]:
-            seed_message = await thread.send(chunk)
+        try:
+            if len(text) > DISCORD_MAX_CHARS:
+                # A long URL must remain a single value, including in the visible transcript.
+                # The agent still receives the original text below, not the attachment notice.
+                seed_message = await thread.send(
+                    "📎 Full message attached as message.txt (kept intact).",
+                    file=discord.File(io.BytesIO(text.encode("utf-8")), filename="message.txt"),
+                )
+            else:
+                seed_message = await thread.send(text)
+        except discord.NotFound:
+            # api_server.py fires this via asyncio.create_task with nothing
+            # awaiting the result, so an uncaught NotFound here would surface
+            # only as "Task exception was never retrieved" with no thread
+            # context. The relay source already got a 202; there's no request
+            # left to fail, so log and drop it.
+            logger.warning(
+                "deliver_relayed_message: thread %d no longer exists, dropping relay",
+                thread.id,
+            )
+            return
+        if brief:
+            text = f"{text}\n\n{brief}"
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(brief[:DISCORD_MAX_CHARS])
+
+        if into_running_turn and await self._inject_into_running_turn(thread.id, text):
+            with contextlib.suppress(discord.HTTPException):
+                await seed_message.add_reaction(INJECTED_REACTION)
+            return
 
         record = await self.repo.get(thread.id)
         session_id = record.session_id if record else None
@@ -968,16 +1246,26 @@ class ClaudeChatCog(commands.Cog):
         marked — they resume naturally via message-triggered resume when the user
         sends their next message.
 
+        Runs still *queued* for a session slot are saved with the prompt they
+        were about to send (``persist_queued_runs``), so the user's message
+        runs after the restart instead of a generic "bot restarted" turn.
+
         No-op when ``_resume_repo`` is not configured.
         """
-        if not self._active_runners or self._resume_repo is None:
+        if self._resume_repo is None:
+            return
+        slots = get_session_slots()
+        if slots is not None:
+            await persist_queued_runs(slots, self._resume_repo)
+        running = [t for t in self._active_runners if slots is None or not slots.is_waiting(t)]
+        if not running:
             return
 
         logger.info(
             "Shutdown detected: marking %d active session(s) for restart-resume",
-            len(self._active_runners),
+            len(running),
         )
-        for thread_id in list(self._active_runners):
+        for thread_id in running:
             try:
                 session_id: str | None = None
                 record = await self.repo.get(thread_id)
@@ -1034,7 +1322,14 @@ class ClaudeChatCog(commands.Cog):
             # Delete FIRST — prevents double-resume even if spawn fails
             await self._resume_repo.delete(entry.id)
 
+            if entry.reason == QUEUED_RESTART_REASON and entry.resume_prompt:
+                await self._replay_queued_run(entry.thread_id, entry.resume_prompt)
+                continue
+
             thread_id = entry.thread_id
+            resume_prompt = entry.resume_prompt or _DEFAULT_RESUME_PROMPT
+            if await self._resume_in_console(thread_id, resume_prompt):
+                continue
             try:
                 raw = self.bot.get_channel(thread_id)
                 if raw is None:
@@ -1057,15 +1352,6 @@ class ClaudeChatCog(commands.Cog):
                 )
                 continue
 
-            resume_prompt = entry.resume_prompt or (
-                "The bot restarted. "
-                "Please report what you were working on before resuming. "
-                "⚠️ Context may have been compressed, which means the approval status of "
-                "planned tasks could be lost. "
-                "Before making any code changes, commits, or PRs, "
-                "re-confirm with the user that they want you to proceed."
-            )
-
             logger.info(
                 "Resuming session in thread %d (session_id=%s, reason=%s)",
                 thread_id,
@@ -1075,16 +1361,85 @@ class ClaudeChatCog(commands.Cog):
             try:
                 # Post directly into the existing thread — no new thread needed
                 seed_message = await thread.send(f"🔄 **Bot restarted.**\n{resume_prompt}")
-                asyncio.create_task(
+                self._spawn_background(
                     self._run_claude(
                         seed_message,
                         thread,
                         resume_prompt,
                         session_id=entry.session_id,
+                        chat_only=(thread.parent_id or 0) in self._chat_only_channel_ids,
                     )
                 )
             except Exception:
                 logger.error("Failed to resume session in thread %d", thread_id, exc_info=True)
+
+    async def _resume_in_console(self, thread_id: int, prompt: str) -> bool:
+        """Resume a Ebi AI Console conversation, which has no Discord thread to fetch.
+
+        Returns False when the console does not own *thread_id*, so the caller
+        goes on to resume it in Discord.
+        """
+        from ..console.host import ConsoleSessionHost
+
+        console = getattr(self.bot, "console_sessions", None)
+        if not isinstance(console, ConsoleSessionHost):
+            return False
+        try:
+            if not await console.owns(thread_id):
+                return False
+            logger.info("Resuming console conversation %d after restart", thread_id)
+            await console.reply(thread_id, f"🔄 Bot restarted.\n{prompt}", "restart")
+        except Exception:
+            logger.error("Failed to resume console conversation %d", thread_id, exc_info=True)
+        return True
+
+    def _spawn_background(self, coro: Coroutine[Any, Any, None]) -> None:
+        """Run *coro* as a task the cog keeps alive (the loop holds only weak refs)."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _replay_queued_run(self, thread_id: int, prompt: str) -> None:
+        """Run a turn that was queued when the bot restarted.
+
+        The prompt is the one the run was about to send, so it is not posted
+        again: a short notice says why the turn is starting now.
+        """
+        console = getattr(self.bot, "console_sessions", None)
+        try:
+            if console is not None and await console.owns(thread_id):
+                await console.resume_queued(thread_id, prompt)
+                return
+            raw = self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
+        except Exception:
+            logger.warning("Queued run: thread %d not found, skipping", thread_id, exc_info=True)
+            return
+        if not isinstance(raw, discord.Thread):
+            logger.warning("Queued run: channel %d is not a Thread, skipping", thread_id)
+            return
+        thread = raw
+        try:
+            notice = await thread.send(
+                "🔄 **Bot restarted.** Running the message that was queued before the restart."
+            )
+            record = await self.repo.get(thread.id)
+            session_id = record.session_id if record else None
+            if record is not None and session_id:
+                session_id = await self._session_id_for_current_backend(thread, record)
+            logger.info("Replaying queued run in thread %d", thread.id)
+            self._spawn_background(
+                self._run_claude(
+                    notice,
+                    thread,
+                    prompt,
+                    session_id=session_id,
+                    working_dir_override=record.working_dir if record else None,
+                    # Keep the channel's chat-only display, as a live reply would.
+                    chat_only=(thread.parent_id or 0) in self._chat_only_channel_ids,
+                )
+            )
+        except Exception:
+            logger.error("Failed to replay queued run in thread %d", thread.id, exc_info=True)
 
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
@@ -1102,6 +1457,8 @@ class ClaudeChatCog(commands.Cog):
         if record is not None and session_id:
             session_id = await self._session_id_for_current_backend(thread, record)
         prompt, images = await self._build_prompt_and_images(message)
+        # What the human typed, before any context is prepended for a new turn.
+        typed_prompt = prompt
 
         # Threads ccdb did not create are conversations it has only partly seen:
         # a mention wakes it into the middle of a discussion whose earlier turns
@@ -1143,6 +1500,21 @@ class ClaudeChatCog(commands.Cog):
                 _dashboard = getattr(self.bot, "thread_dashboard", None)
                 if isinstance(_dashboard, ThreadStatusDashboard):
                     await _dashboard.refresh_inbox(_inbox_repo)
+
+        # A thread someone is talking in again has moved past its last outcome.
+        self._schedule_clear_done_marker(thread)
+
+        # The title was written from the first message; the work has moved since.
+        # Scheduled here — on the human's turn — so the budget is spent on what
+        # someone actually asked for, not on Claude's own commentary.
+        self._schedule_retitle(thread, message.content or "")
+
+        # Claude Code takes input while it works; so does a thread. A reply to a
+        # running turn goes into that turn instead of waiting for it to end.
+        if await self._inject_into_running_turn(thread.id, typed_prompt, images or None):
+            with contextlib.suppress(discord.HTTPException):
+                await message.add_reaction(INJECTED_REACTION)
+            return
 
         # Determine chat_only from the parent channel of this thread.
         chat_only = (thread.parent_id or 0) in self._chat_only_channel_ids
@@ -1198,6 +1570,56 @@ class ClaudeChatCog(commands.Cog):
             )
         return None
 
+    async def _inject_into_running_turn(
+        self, thread_id: int, text: str, images: list[ImageData] | None = None
+    ) -> bool:
+        """Deliver into the running turn, if it runs under this thread's current settings.
+
+        After ``/backend local`` or ``/sandbox`` the message must reach the run
+        those settings start, not the process still running under the old ones.
+        """
+        repo = self._backend_settings.repo if self._backend_settings is not None else None
+        return await live_runs.try_inject(
+            thread_id,
+            text,
+            images,
+            backend=await self._current_backend_name(thread_id),
+            execution_mode=await thread_execution_mode(repo, thread_id),
+        )
+
+    async def _current_backend_name(self, thread_id: int) -> str:
+        """Backend the next turn in *thread_id* runs on (for account pools)."""
+        if self._backend_settings is not None:
+            return await self._backend_settings.current_backend(thread_id)
+        return self.runner.__class__.__name__.replace("Runner", "").lower()
+
+    async def _finish_account_turn(
+        self,
+        thread: discord.Thread | discord.TextChannel,
+        turn: AccountTurn | None,
+    ) -> Failover | None:
+        """Record a quota rejection, tell the thread, refresh Codex usage."""
+        if turn is None or self._account_router is None:
+            return None
+        if turn.binding.backend == "codex" and self._factory is not None:
+            task = asyncio.create_task(
+                refresh_codex_usage(
+                    self._account_router, turn.binding, self._factory.codex_command
+                ),
+                name=f"codex-usage-{turn.binding.profile}",
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        try:
+            failover = await self._account_router.finish_turn(turn)
+        except Exception:
+            logger.exception("Account pool: could not record the outcome of a turn")
+            return None
+        if failover is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(failover_notice(failover))
+        return failover
+
     async def _prepare_cross_backend_handoff(
         self,
         thread: discord.Thread | discord.TextChannel,
@@ -1215,34 +1637,13 @@ class ClaudeChatCog(commands.Cog):
         if session_is_resumable(record.backend, current):
             return session_id, prompt
 
-        transcript = await asyncio.to_thread(
-            self._conversation_history.read,
-            record.backend,
-            record.session_id,
-        )
-        if not transcript:
-            logger.warning(
-                "No file-backed transcript found for cross-backend handoff: "
-                "thread=%d backend=%s session=%s",
-                thread.id,
-                record.backend,
-                record.session_id,
-            )
-            return None, prompt
-
-        logger.info(
-            "Injecting cross-backend transcript: thread=%d %s->%s chars=%d",
-            thread.id,
-            record.backend,
-            current,
-            len(transcript),
-        )
-        return None, build_handoff_prompt(
-            source_backend=record.backend,
-            target_backend=current,
-            transcript=transcript,
-            current_prompt=prompt,
-        )
+        # Read the transcript where it was written (a pool profile's home).
+        reader = self._conversation_history
+        home = await session_home(self._account_router, thread.id, record.backend)
+        if home is not None:
+            reader = history_reader_at(home)
+        handoff = await carry_history_across_backends(reader, record, current, prompt)
+        return None, handoff
 
     async def _build_prompt_and_images(
         self, message: discord.Message
@@ -1338,6 +1739,7 @@ class ClaudeChatCog(commands.Cog):
         result_sink: Callable[[str | None, str | None], Awaitable[None]] | None = None,
         interrupt_existing: bool = False,
         interrupt_notice: str = "-# ⚡ Interrupted. Starting with new instruction...",
+        _account_retry: bool = False,
     ) -> None:
         """Execute Claude Code CLI and stream results to the thread.
 
@@ -1355,6 +1757,7 @@ class ClaudeChatCog(commands.Cog):
         thread. The subprocess itself runs *outside* the lock so a later message
         can still interrupt this run.
         """
+        user_prompt = prompt
         session_id, prompt = await self._prepare_cross_backend_handoff(
             thread,
             prompt,
@@ -1370,64 +1773,108 @@ class ClaudeChatCog(commands.Cog):
         # Everything from evicting the previous run through registering this one
         # happens under the lock, so no concurrent _run_claude can observe an
         # empty slot and spawn a parallel process.
-        async with lock:
-            await self._evict_active_run(
-                thread, interrupt=interrupt_existing, notice=interrupt_notice
-            )
-
-            # Mark thread as PROCESSING when Claude starts
-            if dashboard is not None:
-                await dashboard.set_state(
-                    thread.id,
-                    ThreadState.PROCESSING,
-                    description,
-                    thread=thread,
+        # A message waiting here keeps later ones from overtaking it into the
+        # running turn (issue #1129) until the turn before it is over.
+        with live_runs.queued(thread.id) as release_queue:
+            async with lock:
+                await self._evict_active_run(
+                    thread, interrupt=interrupt_existing, notice=interrupt_notice
                 )
+                release_queue()
 
-            model_override = await self._get_current_model()
-            effective_model = model_override or self.runner.model
+                # Mark thread as PROCESSING when Claude starts
+                if dashboard is not None:
+                    await dashboard.set_state(
+                        thread.id,
+                        ThreadState.PROCESSING,
+                        description,
+                        thread=thread,
+                    )
 
-            async def _notify_stall() -> None:
-                threshold = status._stall_hard
-                await thread.send(
-                    f"-# ⚠️ No activity for {threshold}s — could be extended thinking "
-                    "or context compression. Will resume automatically."
+                model_override = await self._get_current_model()
+                effective_model = model_override or self.runner.model
+
+                async def _notify_stall() -> None:
+                    threshold = status._stall_hard
+                    await thread.send(
+                        f"-# ⚠️ No activity for {threshold}s — could be extended thinking "
+                        "or context compression. Will resume automatically."
+                    )
+
+                status = StatusManager(
+                    user_message,
+                    on_hard_stall=_notify_stall,
+                    model=effective_model,
                 )
+                await status.set_thinking()
 
-            status = StatusManager(
-                user_message,
-                on_hard_stall=_notify_stall,
-                model=effective_model,
-            )
-            await status.set_thinking()
+                tools_override = await self._get_allowed_tools()
+                effort_override = await self._get_current_effort()
 
-            tools_override = await self._get_allowed_tools()
-            effort_override = await self._get_current_effort()
+                # Account pool: choose the login for this turn. Under the lock and
+                # after eviction, so a queued run's transcript is complete before
+                # it is copied to another profile.
+                account_plan: TurnPlan | None = None
+                if self._account_router is not None:
+                    try:
+                        account_plan, session_id, prompt = await plan_account_turn(
+                            self._account_router,
+                            backend=await self._current_backend_name(thread.id),
+                            thread_id=thread.id,
+                            session_id=session_id,
+                            prompt=prompt,
+                        )
+                    except Exception:
+                        # Never lose the user's turn to pool bookkeeping: run on
+                        # the relay's own login and say so in the log.
+                        logger.exception("Account pool: planning failed for thread %d", thread.id)
 
-            runner = await self._build_runner_for_thread(
-                thread_id=thread.id,
-                model_override=model_override,
-                tools_override=tools_override,
-                fork_session=fork,
-                working_dir_override=working_dir_override,
-                effort_override=effort_override,
-            )
-            # Register as the sole active run BEFORE releasing the lock. Track
-            # the task too so a later eviction can await our cleanup.
-            self._active_runners[thread.id] = runner
-            if current_task is not None:
-                self._active_tasks[thread.id] = current_task
+                runner = await self._build_runner_for_thread(
+                    thread_id=thread.id,
+                    model_override=model_override,
+                    tools_override=tools_override,
+                    fork_session=fork,
+                    working_dir_override=working_dir_override,
+                    effort_override=effort_override,
+                )
+                account_turn: AccountTurn | None = None
+                if account_plan is not None and hasattr(runner, "account"):
+                    runner.account = account_plan.binding  # type: ignore[attr-defined]
+                    account_turn = AccountTurn(binding=account_plan.binding)
+                    notice = plan_notice(account_plan)
+                    if notice:
+                        with contextlib.suppress(discord.HTTPException):
+                            await thread.send(notice)
 
-            # In chat_only mode, skip the "Session running" message and stop button.
-            stop_view: StopView | None = None
-            if not chat_only:
-                stop_view = StopView(runner)
-                stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)
-                stop_view.set_message(stop_msg)
+                # A turn that may be retried on another profile must not report
+                # its rejected attempt as the terminal outcome: hold the sink's
+                # result and deliver it only if no retry follows.
+                sink_outcome: list[tuple[str | None, str | None]] = []
+
+                async def _hold_sink(text: str | None, error: str | None) -> None:
+                    sink_outcome.append((text, error))
+
+                run_sink: Callable[[str | None, str | None], Awaitable[None]] | None = result_sink
+                if account_turn is not None and result_sink is not None and not _account_retry:
+                    run_sink = _hold_sink
+
+                # Register as the sole active run BEFORE releasing the lock. Track
+                # the task too so a later eviction can await our cleanup.
+                self._active_runners[thread.id] = runner
+                if current_task is not None:
+                    self._active_tasks[thread.id] = current_task
+
+                # In chat_only mode, skip the "Session running" message and stop button.
+                stop_view: StopView | None = None
+                if not chat_only:
+                    stop_view = StopView(runner)
+                    stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)
+                    stop_view.set_message(stop_msg)
 
         # --- Phase 2: run the subprocess OUTSIDE the lock --------------------
         # The lock is released so a later message can interrupt this run. The
         # runner is already registered, so that message will find and evict it.
+        failover: Failover | None = None
         try:
             await run_claude_with_config(
                 RunConfig(
@@ -1450,13 +1897,16 @@ class ClaudeChatCog(commands.Cog):
                     claude_command=runner.command,
                     chat_only=chat_only,
                     notify_user_id=user_message.author.id,
-                    result_sink=result_sink,
+                    result_sink=run_sink,
                     backend_settings=self._backend_settings,
                     codex_command=(
                         self._factory.codex_command if self._factory is not None else "codex"
                     ),
+                    usage_repo=self._usage_repo,
+                    account_turn=account_turn,
                 )
             )
+            failover = await self._finish_account_turn(thread, account_turn)
         finally:
             if stop_view is not None:
                 await stop_view.disable()
@@ -1479,3 +1929,23 @@ class ClaudeChatCog(commands.Cog):
                     description,
                     thread=thread,
                 )
+
+        # Opt-in failover (retry_on_exhaustion): rerun the same message once on
+        # the next profile. Once only — a second rejection just reports.
+        retrying = failover is not None and failover.retry and not _account_retry
+        if result_sink is not None and run_sink is not result_sink and not retrying:
+            for text, error in sink_outcome:
+                await result_sink(text, error)
+        if retrying:
+            record = await self.repo.get(thread.id)
+            await self._run_claude(
+                user_message,
+                thread,
+                user_prompt,
+                record.session_id if record is not None else None,
+                images=images,
+                working_dir_override=working_dir_override,
+                chat_only=chat_only,
+                result_sink=result_sink,
+                _account_retry=True,
+            )

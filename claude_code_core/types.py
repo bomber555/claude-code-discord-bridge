@@ -231,5 +231,26 @@ class StreamEvent:
     context_window: int | None = None
     error: str | None = None
     rate_limit_info: RateLimitInfo | None = None
+    # Every window a rate_limit_event reported (``unifiedWindows``), including
+    # the one in ``rate_limit_info``. Empty for CLIs that report a single window.
+    rate_limit_windows: list[RateLimitInfo] = field(default_factory=list)
     hook_event: HookEvent | None = None
     stop_hook_has_output: bool = False
+    # Set on the CLI's echo (``isReplay``) of a top-level user line; the uuid it
+    # was sent with. Subagent prompts carry a parent_tool_use_id and are not echoes.
+    replay_uuid: str | None = None
+    # Set by ClaudeRunner when the echo is a message injected into the running
+    # turn: the human's text, now read by the agent.
+    injected_text: str | None = None
+    # A RESULT after which the same process keeps going, because a message
+    # injected into it has not been read yet. Not the end of the run.
+    turn_continues: bool = False
+
+
+@dataclass(frozen=True)
+class InjectedMessage:
+    """A message written into a running turn's stdin, awaiting the CLI's echo."""
+
+    uuid: str
+    text: str
+    images: tuple[ImageData, ...] = ()

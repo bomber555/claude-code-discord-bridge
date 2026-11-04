@@ -17,14 +17,18 @@ import re
 import shutil
 import signal
 import sys
+import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from .account_info import describe_auth, read_account_info
+from .account_pool import AccountBinding
 from .api_provider import detect_api_provider
 from .child_env import STRIPPED_ENV_KEYS, strip_transport_credentials
+from .connections import Connection, apply_claude_env
+from .execution import ExecutionRefusedError, carry_execution_mode, prepare_launch, refusal_event
 from .parser import parse_line
-from .types import ImageData, MessageType, StreamEvent
+from .types import ImageData, InjectedMessage, MessageType, StreamEvent
 
 # Re-export for backward compatibility
 __all__ = ["ClaudeRunner", "ImageData"]
@@ -49,9 +53,10 @@ def _resolve_windows_cmd(cmd_path: Path) -> list[str] | None:
     """
     try:
         content = cmd_path.read_text(encoding="utf-8", errors="ignore")
-        match = re.search(r'"%~dp0\\([^"]+\.js)"', content)
+        # Older npm writes "%~dp0\x.js", current cmd-shim "%dp0%\x.js".
+        match = re.search(r'"(?:%~dp0|%dp0%)\\([^"]+\.js)"', content)
         if match:
-            cli_js = cmd_path.parent / match.group(1)
+            cli_js = cmd_path.parent.joinpath(*match.group(1).split("\\"))
             if cli_js.exists():
                 node = shutil.which("node") or "node"
                 return [node, str(cli_js)]
@@ -71,8 +76,33 @@ def _resolve_windows_cmd(cmd_path: Path) -> list[str] | None:
     return None
 
 
+def resolve_cli_argv(command: str) -> list[str] | None:
+    """The argv prefix that starts the CLI *command*, or None when it cannot be run safely.
+
+    On Windows a CLI installed by npm is a ``.cmd`` wrapper, which
+    ``create_subprocess_exec`` cannot start, and which must not be started
+    through ``cmd.exe`` with untrusted arguments (they would be re-parsed by the
+    batch interpreter). It is resolved to ``[node, cli.js]`` instead; a wrapper
+    that cannot be resolved yields None. Elsewhere the command is used as is.
+    """
+    found = shutil.which(command) or command
+    if sys.platform == "win32" and found.lower().endswith((".cmd", ".bat")):
+        return _resolve_windows_cmd(Path(found))
+    return [found]
+
+
+# How long the reader waits, after a RESULT, for the CLI to read a message that
+# was delivered into the turn. Measured: it starts the next turn within ~1s.
+_ACK_AFTER_RESULT_SECONDS = 60
+
+
 class ClaudeRunner:
     """Manages Claude Code CLI subprocess execution."""
+
+    # Execution environment (claude_code_core.execution). ``None`` = deployment
+    # default; ``execution_served`` records which one ran the last spawn.
+    execution_mode: str | None = None
+    execution_served: str | None = None
 
     def __init__(
         self,
@@ -107,7 +137,17 @@ class ClaudeRunner:
         self.images = images
         self.fork_session = fork_session
         self.effort = effort
+        # Account-pool profile this runner spawns as (CLAUDE_CONFIG_DIR). None
+        # means the relay's own environment — the behaviour without a pool.
+        self.account: AccountBinding | None = None
+        #: Subscription or a third-party provider (see :mod:`.connections`); None = as configured.
+        self.connection: Connection | None = None
         self._process: asyncio.subprocess.Process | None = None
+        # Messages delivered into the running turn (issue #1129). Admission is
+        # open only between the first prompt and the final RESULT; a message
+        # stays in _outstanding until the CLI echoes its uuid back.
+        self._accepting = False
+        self._outstanding: dict[str, InjectedMessage] = {}
 
     async def run(
         self,
@@ -138,20 +178,31 @@ class ClaudeRunner:
 
         stdin_mode = asyncio.subprocess.PIPE
 
+        try:
+            launch = await prepare_launch(
+                backend="claude", requested_mode=self.execution_mode, argv=args, env=env, cwd=cwd
+            )
+        except ExecutionRefusedError as exc:
+            yield refusal_event(exc)
+            return
+        self.execution_served = launch.mode
+
         self._process = await asyncio.create_subprocess_exec(
-            *args,
+            *launch.argv,
             stdin=stdin_mode,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=env,
+            cwd=launch.cwd,
+            env=launch.env,
             limit=10 * 1024 * 1024,
         )
 
         logger.info("Claude CLI started: pid=%s", self._process.pid)
 
+        self._outstanding = {}
         if self._process.stdin is not None:
             await self._send_stream_json_message(prompt)
+            self._accepting = True
 
         try:
             async for event in self._read_stream():
@@ -165,7 +216,36 @@ class ClaudeRunner:
                 error=f"Timed out after {self.timeout_seconds} seconds",
             )
         finally:
+            self._accepting = False
             await self._cleanup()
+
+    async def inject_user_message(self, text: str, images: list[ImageData] | None = None) -> bool:
+        """Deliver *text* into the running turn, as the CLI's own UI does mid-turn.
+
+        Returns False when the turn cannot take it (not started, finishing,
+        stopped) — the caller then runs it as the next turn. True hands the
+        message to this runner: it is either read by the agent or reported by
+        :meth:`unconsumed_messages` once the run ends, never both.
+        """
+        process = self._process
+        if not self._accepting or process is None or process.returncode is not None:
+            return False
+        if process.stdin is None:
+            return False
+        message = InjectedMessage(uuid=str(uuid.uuid4()), text=text, images=tuple(images or ()))
+        # No await between the admission check and this: the reader cannot
+        # finish the run in between, so an accepted message is always tracked.
+        self._outstanding[message.uuid] = message
+        try:
+            process.stdin.write(self._user_line(text, list(message.images), message.uuid))
+            await process.stdin.drain()
+        except Exception:
+            logger.warning("inject_user_message: failed to write to stdin", exc_info=True)
+        return True
+
+    def unconsumed_messages(self) -> list[InjectedMessage]:
+        """Injected messages the CLI never read, in the order they were sent."""
+        return list(self._outstanding.values())
 
     def clone(
         self,
@@ -178,7 +258,7 @@ class ClaudeRunner:
         effort: str | None | object = _UNSET,
     ) -> ClaudeRunner:
         """Create a fresh runner with the same configuration but no active process."""
-        return ClaudeRunner(
+        cloned = ClaudeRunner(
             command=self.command,
             model=model if model is not None else self.model,
             permission_mode=self.permission_mode,
@@ -204,6 +284,9 @@ class ClaudeRunner:
                 self.effort if effort is _UNSET else effort  # type: ignore[arg-type]
             ),
         )
+        cloned.account = self.account
+        cloned.connection = self.connection
+        return carry_execution_mode(self, cloned)
 
     async def inject_tool_result(self, request_id: str, data: dict) -> None:
         """Send a tool result or permission/elicitation response via stdin."""
@@ -222,9 +305,19 @@ class ClaudeRunner:
     async def _send_stream_json_message(self, prompt: str) -> None:
         """Write the initial user message to stdin in stream-json format."""
         assert self._process is not None and self._process.stdin is not None
+        line = self._user_line(prompt, self.images or [], str(uuid.uuid4()))
+        try:
+            self._process.stdin.write(line)
+            await self._process.stdin.drain()
+            logger.debug("Sent stream-json user message (%d image(s))", len(self.images or []))
+        except Exception:
+            logger.warning("_send_stream_json_message: failed to write to stdin", exc_info=True)
 
+    @staticmethod
+    def _user_line(prompt: str, images: list[ImageData], message_uuid: str) -> bytes:
+        """One stream-json user line. The CLI echoes *message_uuid* when it reads it."""
         content: list[dict] = []
-        for img in self.images or []:
+        for img in images:
             content.append(
                 {
                     "type": "image",
@@ -242,18 +335,14 @@ class ClaudeRunner:
 
         message = {
             "type": "user",
+            "uuid": message_uuid,
             "message": {"role": "user", "content": content},
         }
-        line = json.dumps(message) + "\n"
-        try:
-            self._process.stdin.write(line.encode())
-            await self._process.stdin.drain()
-            logger.debug("Sent stream-json user message (%d image(s))", len(content) - 1)
-        except Exception:
-            logger.warning("_send_stream_json_message: failed to write to stdin", exc_info=True)
+        return (json.dumps(message) + "\n").encode()
 
     async def interrupt(self) -> None:
         """Interrupt the subprocess with SIGINT (graceful stop)."""
+        self._accepting = False
         if self._process and self._process.returncode is None:
             if os.name == "nt":
                 self._process.terminate()
@@ -266,6 +355,7 @@ class ClaudeRunner:
 
     async def kill(self) -> None:
         """Terminate the subprocess, force-killing if it doesn't stop in time."""
+        self._accepting = False
         if self._process and self._process.returncode is None:
             self._process.terminate()
             try:
@@ -320,6 +410,9 @@ class ClaudeRunner:
             args.extend(["--append-system-prompt", self.append_system_prompt])
 
         args.extend(["--input-format", "stream-json"])
+        # Echo each user line as the CLI reads it: how ccdb learns that a
+        # message delivered into the running turn was picked up.
+        args.append("--replay-user-messages")
 
         if sys.platform == "win32" and args[0].lower().endswith((".cmd", ".bat")):
             resolved = _resolve_windows_cmd(Path(args[0]))
@@ -348,6 +441,12 @@ class ClaudeRunner:
             except OSError:
                 logger.debug("CLI env overlay file not found: %s", overlay_path)
         env = strip_transport_credentials(env)
+        if self.account is not None:
+            # After the overlay: the profile chosen for this turn is more
+            # specific than a deployment-wide CLAUDE_CONFIG_DIR.
+            env.update(self.account.env)
+        # The subscription route drops provider variables the overlay may set.
+        env = apply_claude_env(self.connection, env)
         if self.api_port is not None:
             env["CCDB_API_URL"] = f"http://127.0.0.1:{self.api_port}"
         if self.api_secret is not None:
@@ -382,12 +481,25 @@ class ClaudeRunner:
             raise RuntimeError("Process not started")
 
         line_count = 0
+        after_result = False
         while True:
             # Each line is progress, not a fresh total runtime budget. Long
             # active sessions may run indefinitely; silent streams cannot.
-            line = await asyncio.wait_for(
-                self._process.stdout.readline(), timeout=self.timeout_seconds or None
-            )
+            timeout: float | None = self.timeout_seconds or None
+            if after_result:
+                # The CLI starts the next turn at once when it has unread
+                # input; silence means it never will.
+                timeout = min(timeout or _ACK_AFTER_RESULT_SECONDS, _ACK_AFTER_RESULT_SECONDS)
+            try:
+                line = await asyncio.wait_for(self._process.stdout.readline(), timeout=timeout)
+            except TimeoutError:
+                if not after_result:
+                    raise
+                logger.warning(
+                    "Claude CLI left %d injected message(s) unread", len(self._outstanding)
+                )
+                self._accepting = False
+                return
             if not line:
                 logger.info("Claude CLI stdout EOF after %d lines", line_count)
                 break
@@ -397,8 +509,22 @@ class ClaudeRunner:
                 logger.info("Claude CLI stdout line %d: %.100s", line_count, decoded.strip())
             event = parse_line(decoded)
             if event:
-                yield event
+                if event.replay_uuid is not None:
+                    acked = self._outstanding.pop(event.replay_uuid, None)
+                    if acked is not None:
+                        event.injected_text = acked.text
+                        after_result = False
                 if event.is_complete:
+                    if self._outstanding and not event.error:
+                        event.turn_continues = True
+                        after_result = True
+                    else:
+                        # Closed before the consumer sees the result, with no
+                        # await in between: a later message is never accepted
+                        # by a run that has stopped reading.
+                        self._accepting = False
+                yield event
+                if event.is_complete and not event.turn_continues:
                     return
 
         if self._process.returncode is None:

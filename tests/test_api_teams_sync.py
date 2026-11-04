@@ -25,7 +25,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from claude_discord.database.notification_repo import NotificationRepository
-from claude_discord.ext import teams_sync
+from claude_discord.ext import teams_store, teams_sync
 from claude_discord.ext.api_server import ApiServer
 from claude_discord.ext.teams_store import TeamsVaultStore
 
@@ -69,7 +69,7 @@ def thread_body(**over) -> dict:
         "thread": {
             "team": TEAM,
             "root_mid": ROOT,
-            "title": "MEHJ後のIntune登録に関して",
+            "title": "ACME後のIntune登録に関して",
             "url": "https://teams.cloud.microsoft/x",
         },
         "messages": [],
@@ -264,6 +264,69 @@ async def test_embedded_attachment_lands_next_to_its_message(
     assert body["attachments_saved"] == 1
     assert body["pending"] == []
     assert (folder / "messages" / ROOT / "admin.evtx").read_bytes() == b"evtx-bytes"
+
+
+async def test_a_33mb_attachment_is_stored_through_the_default_body_limit(
+    client: TestClient,
+) -> None:
+    # Diagnostic zips shared in Teams are routinely 30MB+. At 25MB per file
+    # (and a ~68MB body limit) they stayed pending on every sync.
+    blob = os.urandom(33 * 1024 * 1024)
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(
+            messages=[
+                msg(
+                    ROOT,
+                    "ログを添付します",
+                    "h1",
+                    attachments=[
+                        {
+                            "name": "device.zip",
+                            "status": "embedded",
+                            "data": base64.b64encode(blob).decode(),
+                        }
+                    ],
+                )
+            ]
+        ),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["attachments_saved"] == 1
+    assert body["pending"] == []
+    assert (Path(body["folder"]) / "messages" / ROOT / "device.zip").read_bytes() == blob
+
+
+async def test_an_attachment_over_the_cap_is_pending_not_dropped(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(teams_store, "MAX_ATTACHMENT_BYTES", 1024)
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(
+            messages=[
+                msg(
+                    ROOT,
+                    "大きいファイル",
+                    "h1",
+                    attachments=[
+                        {
+                            "name": "big.zip",
+                            "status": "embedded",
+                            "data": base64.b64encode(b"x" * 2048).decode(),
+                        }
+                    ],
+                )
+            ]
+        ),
+    )
+    body = await resp.json()
+    assert body["attachments_saved"] == 0
+    assert [p["name"] for p in body["pending"]] == ["big.zip"]
+    assert "サイズ上限超過" in body["pending"][0]["reason"]
 
 
 async def test_unfetched_attachment_is_reported_and_asked_for_again(
@@ -646,8 +709,8 @@ async def test_sync_requires_the_ingest_token(client: TestClient) -> None:
 
 
 def test_thread_dirname_is_readable_and_unique() -> None:
-    name = teams_sync.thread_dirname("MEHJ後のIntune登録に関して", ROOT)
-    assert name == f"MEHJ後のIntune登録に関して--{ROOT}"
+    name = teams_sync.thread_dirname("ACME後のIntune登録に関して", ROOT)
+    assert name == f"ACME後のIntune登録に関して--{ROOT}"
     # Path- and Obsidian-hostile characters never reach the filesystem.
     assert "/" not in teams_sync.thread_dirname("a/b:c*d?[e]", ROOT)
 
@@ -709,13 +772,13 @@ async def test_thread_lands_in_its_company_folder(client: TestClient, vault: Pat
         "/api/teams/sync/push",
         headers=AUTH,
         json=thread_body(
-            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "日本工営"},
+            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "Contoso"},
             messages=[msg(ROOT, "本文", "h1")],
         ),
     )
     folder = Path((await resp.json())["folder"])
-    assert folder.parent == vault / "日本工営"
-    assert json.loads((folder / "thread.json").read_text())["org"] == "日本工営"
+    assert folder.parent == vault / "Contoso"
+    assert json.loads((folder / "thread.json").read_text())["org"] == "Contoso"
 
 
 async def test_unlabelled_thread_stays_at_the_root(client: TestClient, vault: Path) -> None:
@@ -749,7 +812,7 @@ async def test_a_thread_already_filed_flat_is_reused_not_duplicated(
         "/api/teams/sync/push",
         headers=AUTH,
         json=thread_body(
-            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "日本工営"},
+            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "Contoso"},
             messages=[msg(ROOT, "本文", "h1")],
         ),
     )
@@ -765,7 +828,7 @@ async def test_a_thread_moved_into_a_company_folder_by_hand_keeps_syncing(
         "/api/teams/sync/push", headers=AUTH, json=thread_body(messages=[msg(ROOT, "本文", "h1")])
     )
     flat = Path((await first.json())["folder"])
-    moved = vault / "日本工営" / flat.name
+    moved = vault / "Contoso" / flat.name
     moved.parent.mkdir()
     flat.rename(moved)
 
@@ -789,7 +852,7 @@ async def test_the_orgs_file_is_authoritative_over_the_client(
     would last exactly until the next sync.
     """
     (vault / "orgs.json").write_text(
-        json.dumps({"teams": {TEAM: "日本工営"}}, ensure_ascii=False), encoding="utf-8"
+        json.dumps({"teams": {TEAM: "Contoso"}}, ensure_ascii=False), encoding="utf-8"
     )
     resp = await client.post(
         "/api/teams/sync/push",
@@ -799,7 +862,7 @@ async def test_the_orgs_file_is_authoritative_over_the_client(
             messages=[msg(ROOT, "本文", "h1")],
         ),
     )
-    assert Path((await resp.json())["folder"]).parent == vault / "日本工営"
+    assert Path((await resp.json())["folder"]).parent == vault / "Contoso"
 
 
 async def test_a_new_company_label_is_remembered_for_the_team(
@@ -814,11 +877,11 @@ async def test_a_new_company_label_is_remembered_for_the_team(
         "/api/teams/sync/push",
         headers=AUTH,
         json=thread_body(
-            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "日本工営"},
+            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "Contoso"},
             messages=[msg(ROOT, "本文", "h1")],
         ),
     )
-    assert json.loads((vault / "orgs.json").read_text())["teams"][TEAM] == "日本工営"
+    assert json.loads((vault / "orgs.json").read_text())["teams"][TEAM] == "Contoso"
 
     other = await client.post(
         "/api/teams/sync/push",
@@ -828,7 +891,136 @@ async def test_a_new_company_label_is_remembered_for_the_team(
             messages=[msg("1784110000999", "本文", "h9")],
         ),
     )
-    assert Path((await other.json())["folder"]).parent == vault / "日本工営"
+    assert Path((await other.json())["folder"]).parent == vault / "Contoso"
+
+
+# Inferring the company when nobody typed one ---------------------------------
+
+TEAM_A = "aaaaaaaa-0000-4000-8000-000000000001"
+TEAM_B = "bbbbbbbb-0000-4000-8000-000000000002"
+TEAM_NEW = "cccccccc-0000-4000-8000-000000000003"
+OPERATOR = "胡田 昌彦"
+
+
+async def _file(client: TestClient, team: str, root: str, org: str, authors: list[str]) -> Path:
+    """Sync one thread under ``org`` with one message per author."""
+    messages = [
+        msg(str(int(root) + i), "本文", f"h{i}", author=author) for i, author in enumerate(authors)
+    ]
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(
+            thread={"team": team, "root_mid": root, "title": "件名", "org": org},
+            messages=messages,
+        ),
+    )
+    return Path((await resp.json())["folder"])
+
+
+async def _push_unlabelled(
+    client: TestClient, team: str, root: str, authors: list[str], org: str = ""
+) -> Path:
+    messages = [
+        msg(str(int(root) + i), "本文", f"n{i}", author=author) for i, author in enumerate(authors)
+    ]
+    thread = {"team": team, "root_mid": root, "title": "新しい会話"}
+    if org:
+        thread["org"] = org
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(thread=thread, messages=messages),
+    )
+    return Path((await resp.json())["folder"])
+
+
+async def test_a_team_filed_by_hand_files_its_next_thread_too(
+    client: TestClient, vault: Path
+) -> None:
+    """Dragging one thread into a company folder is a filing decision for its team.
+
+    The operator never typed a label, so orgs.json knows nothing — but the vault
+    does. The next thread of that team must follow it instead of landing at the
+    root and waiting to be dragged again.
+    """
+    first = await client.post(
+        "/api/teams/sync/push", headers=AUTH, json=thread_body(messages=[msg(ROOT, "本文", "h1")])
+    )
+    flat = Path((await first.json())["folder"])
+    (vault / "Contoso").mkdir()
+    flat.rename(vault / "Contoso" / flat.name)
+
+    other = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(
+            thread={"team": TEAM, "root_mid": "1784110000999", "title": "別件"},
+            messages=[msg("1784110000999", "本文", "h9")],
+        ),
+    )
+    assert Path((await other.json())["folder"]).parent == vault / "Contoso"
+    assert json.loads((vault / "orgs.json").read_text())["teams"][TEAM] == "Contoso"
+
+
+async def test_a_new_chat_follows_the_people_already_filed_under_one_company(
+    client: TestClient, vault: Path
+) -> None:
+    """A chat has its own derived team, so only its people can say where it goes.
+
+    The operator is in every company's threads and therefore says nothing; the
+    customer contact appears under exactly one company and decides it.
+    """
+    await _file(client, TEAM_A, "1784110000100", "Contoso", [OPERATOR, "高橋 太郎"])
+    await _file(client, TEAM_B, "1784110000200", "Fabrikam", [OPERATOR, "鈴木 花子"])
+
+    folder = await _push_unlabelled(client, TEAM_NEW, "1784110000300", [OPERATOR, "高橋 太郎"])
+    assert folder.parent == vault / "Contoso"
+    assert json.loads((folder / "thread.json").read_text())["org"] == "Contoso"
+    assert json.loads((vault / "orgs.json").read_text())["teams"][TEAM_NEW] == "Contoso"
+
+
+async def test_people_from_two_companies_leave_the_chat_unfiled(
+    client: TestClient, vault: Path
+) -> None:
+    """Conflicting evidence is not a vote: a wrong company is worse than none."""
+    await _file(client, TEAM_A, "1784110000100", "Contoso", [OPERATOR, "高橋 太郎"])
+    await _file(client, TEAM_B, "1784110000200", "Fabrikam", [OPERATOR, "鈴木 花子"])
+
+    folder = await _push_unlabelled(client, TEAM_NEW, "1784110000300", ["高橋 太郎", "鈴木 花子"])
+    assert folder.parent == vault
+
+
+async def test_only_people_shared_across_companies_leave_the_chat_unfiled(
+    client: TestClient, vault: Path
+) -> None:
+    await _file(client, TEAM_A, "1784110000100", "Contoso", [OPERATOR, "高橋 太郎"])
+    await _file(client, TEAM_B, "1784110000200", "Fabrikam", [OPERATOR, "鈴木 花子"])
+
+    folder = await _push_unlabelled(client, TEAM_NEW, "1784110000300", [OPERATOR, "新顔 一郎"])
+    assert folder.parent == vault
+
+
+async def test_with_a_single_company_nobody_is_distinctive(client: TestClient, vault: Path) -> None:
+    """With one company filed, the operator looks unique to it.
+
+    Inferring then would file every new conversation under the first company the
+    operator ever labelled, so inference waits until two companies exist.
+    """
+    await _file(client, TEAM_A, "1784110000100", "Contoso", [OPERATOR, "高橋 太郎"])
+
+    folder = await _push_unlabelled(client, TEAM_NEW, "1784110000300", [OPERATOR])
+    assert folder.parent == vault
+
+
+async def test_a_typed_label_beats_the_inference(client: TestClient, vault: Path) -> None:
+    await _file(client, TEAM_A, "1784110000100", "Contoso", [OPERATOR, "高橋 太郎"])
+    await _file(client, TEAM_B, "1784110000200", "Fabrikam", [OPERATOR, "鈴木 花子"])
+
+    folder = await _push_unlabelled(
+        client, TEAM_NEW, "1784110000300", [OPERATOR, "高橋 太郎"], org="Northwind"
+    )
+    assert folder.parent == vault / "Northwind"
 
 
 async def test_a_hostile_company_name_cannot_escape_the_vault(
@@ -849,7 +1041,7 @@ async def test_a_hostile_company_name_cannot_escape_the_vault(
 
 
 def test_org_dirname_keeps_a_readable_japanese_name() -> None:
-    assert teams_sync.org_dirname("日本工営") == "日本工営"
+    assert teams_sync.org_dirname("Contoso") == "Contoso"
     assert teams_sync.org_dirname("  ") == ""
     assert "/" not in teams_sync.org_dirname("a/b:c")
     assert teams_sync.org_dirname("..") == ""
@@ -861,12 +1053,12 @@ async def test_readme_names_the_company(client: TestClient) -> None:
         "/api/teams/sync/push",
         headers=AUTH,
         json=thread_body(
-            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "日本工営"},
+            thread={"team": TEAM, "root_mid": ROOT, "title": "件名", "org": "Contoso"},
             messages=[msg(ROOT, "本文", "h1")],
         ),
     )
     readme = (Path((await resp.json())["folder"]) / "README.md").read_text()
-    assert "- 会社: 日本工営" in readme
+    assert "- 会社: Contoso" in readme
 
 
 # ---------------------------------------------------------------------------
@@ -997,3 +1189,106 @@ async def test_plan_advertises_conversation_scope_support(client: TestClient) ->
     plan = await client.post("/api/teams/sync/plan", json=thread_body(), headers=AUTH)
     body = await plan.json()
     assert body.get("capabilities", {}).get("conversation_scope") is True
+
+
+# ---------------------------------------------------------------------------
+# re-sync of an unchanged message — #790
+# ---------------------------------------------------------------------------
+
+
+async def test_a_new_hash_scheme_is_not_an_edit(client: TestClient) -> None:
+    """A client that changes its hash formula must not archive the whole thread."""
+    await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(messages=[msg(ROOT, "同じ本文", "fnv1a:aaaa1111")]),
+    )
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(messages=[msg(ROOT, "同じ本文", "fnv1a2:bbbb2222")]),
+    )
+    body = await resp.json()
+    folder = Path(body["folder"])
+    note = (folder / "messages" / f"{ROOT}.md").read_text()
+    assert 'hash: "fnv1a2:bbbb2222"' in note
+    assert "edited: false" in note
+    assert not list((folder / "_history").glob("*.md"))
+
+    plan = await client.post(
+        "/api/teams/sync/plan",
+        headers=AUTH,
+        json=thread_body(messages=[{"mid": ROOT, "hash": "fnv1a2:bbbb2222"}]),
+    )
+    assert (await plan.json())["want_messages"] == []
+
+
+async def test_an_edit_within_the_same_scheme_is_still_archived(client: TestClient) -> None:
+    await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(messages=[msg(ROOT, "旧本文", "fnv1a2:aaaa1111")]),
+    )
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(messages=[msg(ROOT, "新本文", "fnv1a2:bbbb2222")]),
+    )
+    folder = Path((await resp.json())["folder"])
+    assert "edited: true" in (folder / "messages" / f"{ROOT}.md").read_text()
+    assert len(list((folder / "_history").glob(f"{ROOT}.*.md"))) == 1
+
+
+async def test_a_stored_attachment_stays_linked_when_a_later_push_misses_it(
+    client: TestClient,
+) -> None:
+    """Teams lazy-loads images; a pass that did not see one must not unlink it."""
+    payload = base64.b64encode(b"png-bytes").decode()
+    await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(
+            messages=[
+                msg(
+                    ROOT,
+                    "スクショです",
+                    "h1",
+                    attachments=[{"name": "画像.png", "status": "embedded", "data": payload}],
+                )
+            ]
+        ),
+    )
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(messages=[msg(ROOT, "スクショです", "h1")]),
+    )
+    folder = Path((await resp.json())["folder"])
+    note = (folder / "messages" / f"{ROOT}.md").read_text()
+    assert f"- 📎 [[{ROOT}/画像.png]]" in note
+    assert 'attachments: ["画像.png"]' in note
+    assert (folder / "messages" / ROOT / "画像.png").read_bytes() == b"png-bytes"
+
+
+async def test_a_duplicate_attachment_name_renders_once(client: TestClient) -> None:
+    resp = await client.post(
+        "/api/teams/sync/push",
+        headers=AUTH,
+        json=thread_body(
+            messages=[
+                msg(
+                    ROOT,
+                    "仕様調査を添付します",
+                    "h1",
+                    attachments=[
+                        {"name": "仕様調査.pdf", "status": "unavailable", "reason": "HTTP 404"},
+                        {"name": "仕様調査.pdf", "status": "unavailable", "reason": "言及のみ"},
+                    ],
+                )
+            ]
+        ),
+    )
+    folder = Path((await resp.json())["folder"])
+    note = (folder / "messages" / f"{ROOT}.md").read_text()
+    assert note.count("添付未取得: 仕様調査.pdf") == 1
+    assert 'attachments: ["仕様調査.pdf"]' in note

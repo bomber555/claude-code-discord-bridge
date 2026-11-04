@@ -40,6 +40,21 @@ async def test_system_context_is_built_without_a_discord_thread() -> None:
     assert str(surface.thread_key) in context
 
 
+async def test_file_delivery_guidance_forbids_local_path_links() -> None:
+    surface = MemorySurface()
+    config = RunConfig(
+        surface=surface,
+        runner=_runner(),
+        prompt="send me the report",
+    )
+
+    context = await _build_system_context(config)
+
+    assert "Discord cannot open local filesystem paths" in context
+    assert "Never describe a local path as a clickable link" in context
+    assert f".ccdb-attachments-{surface.thread_key}" in context
+
+
 async def test_the_session_is_registered_under_the_surface_key() -> None:
     """The registry is how two sessions notice each other — a wrong key is a silent collision."""
     surface = MemorySurface()
@@ -66,3 +81,48 @@ async def test_lounge_context_is_built_without_a_discord_thread() -> None:
     await _build_system_context(config)
 
     lounge_repo.get_recent.assert_awaited_once()
+
+
+async def test_wait_guidance_appears_only_while_a_watcher_runs() -> None:
+    from claude_discord import waits
+
+    runner = _runner()
+    runner.api_port = 8099
+    config = RunConfig(surface=MemorySurface(), runner=runner, prompt="push and wait for CI")
+
+    waits.register_watcher(None)
+    assert "/api/waits" not in (await _build_system_context(config) or "")
+
+    waits.register_watcher(MagicMock())
+    try:
+        assert "/api/waits" in (await _build_system_context(config) or "")
+    finally:
+        waits.register_watcher(None)
+
+
+async def test_file_delivery_guidance_names_the_console() -> None:
+    """A console conversation must not be told its files go to Discord."""
+    surface = MemorySurface(frontend="console")
+    config = RunConfig(surface=surface, runner=_runner(), prompt="send me the report")
+
+    context = await _build_system_context(config)
+
+    assert "Ebi AI Console cannot open local filesystem paths" in context
+    assert "send files to Discord" not in context
+
+
+async def test_console_thread_link_guidance_uses_verified_search_ids() -> None:
+    config = RunConfig(surface=MemorySurface(), runner=_runner(), prompt="find earlier work")
+    context = await _build_system_context(config)
+    assert "[thread title](/#focus/t<thread_id>)" in context
+    assert "[note title](/#note/<vault-relative path>)" in context
+    assert "/api/search?q=" in context
+    assert "Never invent thread IDs" in context
+
+
+async def test_delegation_guidance_preserves_preselected_child_ai() -> None:
+    config = RunConfig(surface=MemorySurface(), runner=_runner(), prompt="delegate work")
+    context = await _build_system_context(config)
+    assert "parent_thread_id" in context
+    assert "child AI preferences" in context
+    assert "native subagents" in context

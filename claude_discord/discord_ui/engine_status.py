@@ -40,10 +40,52 @@ _DEFAULT_TTL = 90.0
 # do not hammer a broken setup on every message, but still recover quickly.
 _FAIL_TTL = 30.0
 
+# Status-line labels. The bot's other surfaces are English, so deployments
+# outside Japan end up with one mixed-language line. `CCDB_STATUS_LANG=en`
+# switches just these labels; the default keeps the existing Japanese output so
+# no current deployment changes behaviour.
+#
+# "weekly" is a label, not a translation: `en` reports `7d`, which matches the
+# `5h` / `1d` / `30m` forms `_window_label()` already produces for every other
+# duration.
+_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "ja": {
+        "weekly": "週次",
+        "credits": "クレジット",
+        "unlimited": "無制限",
+        "limit_reached": "上限到達",
+        "usage_unavailable": "残量取得失敗（codex login 済みか確認）",
+    },
+    "en": {
+        "weekly": "7d",
+        "credits": "credits",
+        "unlimited": "unlimited",
+        "limit_reached": "limit reached",
+        "usage_unavailable": "usage unavailable (check that codex is logged in)",
+    },
+}
+_DEFAULT_STATUS_LANG = "ja"
+
+
+def _labels() -> dict[str, str]:
+    """Return the status-line label set selected by ``CCDB_STATUS_LANG``.
+
+    An unset or unrecognised value falls back to the existing Japanese labels,
+    so a typo degrades to today's behaviour rather than to empty strings.
+    """
+    lang = os.getenv("CCDB_STATUS_LANG", _DEFAULT_STATUS_LANG).strip().lower()
+    return _STATUS_LABELS.get(lang, _STATUS_LABELS[_DEFAULT_STATUS_LANG])
+
+
+def codex_status_unavailable_line() -> str:
+    """The line shown when Codex usage cannot be read but the mode is ``on``."""
+    return f"\U0001f916 Codex: {_labels()['usage_unavailable']}"
+
 
 async def fetch_codex_rate_limits(
     codex_command: str = "codex",
     timeout: float = _DEFAULT_TIMEOUT,
+    env: dict[str, str] | None = None,
 ) -> dict | None:
     """Return rate limits enriched with the current account, or ``None``.
 
@@ -53,6 +95,9 @@ async def fetch_codex_rate_limits(
     supplies one. Account lookup failure does not hide otherwise valid usage
     data. Any process/protocol failure yields ``None`` — callers treat that as
     "Codex status unavailable".
+
+    ``env`` replaces the child's environment; account pools pass one with the
+    profile's ``CODEX_HOME`` so each login is read separately.
 
     Security: always ``create_subprocess_exec`` (never a shell). ``codex_command``
     comes from trusted configuration, not user input, but is still split with
@@ -69,6 +114,7 @@ async def fetch_codex_rate_limits(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except (OSError, ValueError):
         logger.debug("Failed to spawn codex app-server", exc_info=True)

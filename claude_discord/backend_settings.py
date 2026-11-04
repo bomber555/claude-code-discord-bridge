@@ -1,6 +1,6 @@
 """Persistent, runtime-mutable backend/model selection.
 
-Reads and writes the current backend (claude/codex/local/agui) and per-backend
+Reads and writes the current backend (claude/codex/local/agui/pi/antigravity) and per-backend
 model preference to ``SettingsRepository`` (sqlite key-value store).
 
 Resolution order for any field:
@@ -12,15 +12,13 @@ Resolution order for any field:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from .database.settings_repo import SettingsRepository
+from .database.settings_repo import SettingsRepository
 
 logger = logging.getLogger(__name__)
 
 # Valid backend names. Keep in sync with claude_code_core.backend.create_backend().
-ALL_BACKENDS = ("claude", "codex", "local", "agui")
+ALL_BACKENDS = ("claude", "codex", "local", "agui", "pi", "antigravity")
 
 # Settings keys
 BACKEND_GLOBAL = "backend.global"
@@ -29,6 +27,8 @@ MODEL_GLOBAL_PREFIX = "model.global."  # + backend
 MODEL_THREAD_PREFIX = "model.thread."  # + thread_id + "." + backend
 EFFORT_GLOBAL_PREFIX = "effort.global."  # + backend
 EFFORT_THREAD_PREFIX = "effort.thread."  # + thread_id + "." + backend
+CONNECTION_GLOBAL_PREFIX = "connection.global."  # + backend
+CONNECTION_THREAD_PREFIX = "connection.thread."  # + thread_id + "." + backend
 
 # Codex status footer toggle (2-layer: global default + per-thread override).
 #   "auto" — show the Codex status line only when it can actually be fetched
@@ -54,6 +54,22 @@ def session_is_resumable(stored_backend: str | None, current_backend: str) -> bo
     return stored_backend == current_backend
 
 
+class _ChildSettingsRepository(SettingsRepository):
+    """Separate preferences for future children; ordinary global defaults are fallback."""
+
+    async def get(self, key: str, *, default: str | None = None) -> str | None:
+        value = await super().get("children." + key)
+        if value is None and ".global" in key:
+            value = await super().get(key)
+        return value if value is not None else default
+
+    async def set(self, key: str, value: str) -> None:
+        await super().set("children." + key, value)
+
+    async def delete(self, key: str) -> bool:
+        return await super().delete("children." + key)
+
+
 class BackendSettings:
     """Thin wrapper around SettingsRepository that resolves backend/model."""
 
@@ -64,6 +80,7 @@ class BackendSettings:
         env_backend: str,
         env_model_for_claude: str,
         env_model_for_codex: str,
+        env_model_for_pi: str = "",
     ) -> None:
         self.repo = repo
         self._env_backend = env_backend if env_backend in ALL_BACKENDS else "claude"
@@ -76,7 +93,25 @@ class BackendSettings:
             "local": "",
             # AG-UI identifies the model on the remote agent, not in ccdb.
             "agui": "",
+            # pi picks its own default when --model is omitted, and that
+            # default is whatever its catalog ranks first — not necessarily a
+            # model this account can call. CCDB_PI_MODEL lets an operator pin
+            # one (fully qualified, "provider/id") without the pi TUI; empty
+            # still means "let pi decide".
+            "pi": env_model_for_pi or "",
+            # agy uses its own configured default when --model is omitted.
+            "antigravity": "",
         }
+
+    def for_children(self) -> BackendSettings:
+        """Preferences for future children, scoped by the manager's thread ID."""
+        return BackendSettings(
+            _ChildSettingsRepository(self.repo.db_path),
+            env_backend=self._env_backend,
+            env_model_for_claude=self._env_model["claude"],
+            env_model_for_codex=self._env_model["codex"],
+            env_model_for_pi=self._env_model["pi"],
+        )
 
     # ── Resolution ──────────────────────────────────────────
 
@@ -143,6 +178,17 @@ class BackendSettings:
         v = await self.repo.get(f"{EFFORT_GLOBAL_PREFIX}{backend}")
         return v if v else None
 
+    async def chosen_connection(self, backend: str, thread_id: int | None = None) -> str | None:
+        """The connection id chosen for ``backend`` (thread > global), or None = as deployed."""
+        if backend not in ALL_BACKENDS:
+            return None
+        if thread_id is not None:
+            v = await self.repo.get(f"{CONNECTION_THREAD_PREFIX}{thread_id}.{backend}")
+            if v:
+                return v
+        v = await self.repo.get(f"{CONNECTION_GLOBAL_PREFIX}{backend}")
+        return v if v else None
+
     async def codex_status_mode(self, thread_id: int | None = None) -> str:
         """Return the Codex status footer mode for this thread (or globally).
 
@@ -203,6 +249,22 @@ class BackendSettings:
             await self.repo.set(f"{EFFORT_GLOBAL_PREFIX}{backend}", effort)
             logger.info("effort set: global backend=%s -> %s", backend, effort)
 
+    async def set_connection(
+        self, backend: str, connection: str, *, thread_id: int | None = None
+    ) -> None:
+        if backend not in ALL_BACKENDS:
+            raise ValueError(f"unknown backend {backend!r}")
+        if not connection:
+            raise ValueError("connection must not be empty")
+        if thread_id is not None:
+            await self.repo.set(f"{CONNECTION_THREAD_PREFIX}{thread_id}.{backend}", connection)
+            logger.info(
+                "connection set: thread=%d backend=%s -> %s", thread_id, backend, connection
+            )
+        else:
+            await self.repo.set(f"{CONNECTION_GLOBAL_PREFIX}{backend}", connection)
+            logger.info("connection set: global backend=%s -> %s", backend, connection)
+
     async def clear_effort(self, backend: str, *, thread_id: int | None = None) -> bool:
         """Remove a stored effort override. Returns True if something was deleted."""
         if backend not in ALL_BACKENDS:
@@ -220,6 +282,8 @@ class BackendSettings:
             if await self.repo.delete(f"{MODEL_THREAD_PREFIX}{thread_id}.{b}"):
                 deleted += 1
             if await self.repo.delete(f"{EFFORT_THREAD_PREFIX}{thread_id}.{b}"):
+                deleted += 1
+            if await self.repo.delete(f"{CONNECTION_THREAD_PREFIX}{thread_id}.{b}"):
                 deleted += 1
         if await self.repo.delete(f"{CODEX_STATUS_THREAD_PREFIX}{thread_id}"):
             deleted += 1

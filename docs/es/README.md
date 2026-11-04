@@ -3,20 +3,109 @@
 > **Nota:** Esta es una versión autotraducida de la documentación original en inglés.
 > En caso de discrepancias, la [versión en inglés](../../README.md) prevalece.
 
-# Claude & Codex Discord Bridge
+# Ebi Agent Chat Relay
 
-*Nombre del paquete: `claude-code-discord-bridge` (kebab-case)*
+*Antes Claude Code Discord Bridge y luego Claude & Codex Discord Bridge. Todos los
+identificadores existentes siguen funcionando: el paquete es `claude-code-discord-bridge`
+(kebab-case), el comando es `ccdb`, y `ccdb` sigue siendo el nombre corto usado en todo
+este documento.*
 
 [![CI](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/codeql.yml/badge.svg)](https://github.com/ebibibi/ebi-agent-chat-relay/actions/workflows/codeql.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Usa Claude Code _o_ OpenAI Codex desde tu teléfono. Múltiples hilos. Todo a la vez. Desarrollo real incluido.**
+**Ejecuta agentes de programación desde Discord o Microsoft Teams. Elige Claude Code,
+OpenAI Codex, un modelo local o cualquier agente AG-UI compatible detrás de la misma
+conversación.**
 
-Abre Claude Code o OpenAI Codex desde la aplicación Discord de tu smartphone, inicia múltiples hilos y ejecuta sesiones de desarrollo en paralelo — todo sin tocar un teclado. Cada hilo de Discord se convierte en una sesión de IA completamente aislada. Trabaja en una función en un hilo, revisa un PR en otro y ejecuta una tarea en segundo plano en un tercero — simultáneamente, incluso mezclando backends por hilo. El bridge gestiona toda la coordinación para que las sesiones nunca se pisen entre sí.
+Ebi Agent Chat Relay convierte cada hilo de Discord o conversación de Teams en una sesión
+de agente aislada y persistente. Desarrolla una funcionalidad en una conversación, revisa
+un PR en otra y ejecuta una tarea en segundo plano en una tercera, todo a la vez. Discord
+puede mezclar backends por hilo; en v4, Teams usa el backend global configurado. El relay
+se encarga de la coordinación para que las sesiones no se pisen entre sí.
 
-**Usa tus suscripciones existentes. Sin lidiar con API keys.** ccdb funciona sobre las CLIs oficiales — Claude Code (incluida en tu [suscripción Claude Pro/Max](https://claude.ai/pricing)) y OpenAI Codex (incluida en [ChatGPT Plus/Pro/Business](https://chatgpt.com)). Cambia de backend con `/backend` o define una anulación por hilo — tu equipo obtiene ambas IAs a través de Discord a un costo predecible.
+**Por qué cambió el nombre.** Esto empezó como un puente entre una IA y una aplicación de
+chat. Hoy es un relay con dos frontends en producción y cinco opciones de backend. Tres de
+las cuatro palabras del nombre anterior habían dejado de ser ciertas. Consulta
+[ADR-0001](../adr/0001-adopt-ebi-agent-chat-relay.md) para la decisión y el
+[plan de renombrado](../RENAME_PLAN.md) para la transición que preserva la compatibilidad.
+
+**Usa tus suscripciones actuales, tu propia infraestructura o un agente remoto.** ccdb puede
+ejecutar las CLI oficiales de Claude Code y Codex, un endpoint local compatible con Codex,
+un agente AG-UI por HTTP/SSE, o la CLI de pi. Discord expone el cambio de `/backend` en
+tiempo de ejecución; en v4, Teams usa el backend configurado a través de la misma factoría.
+
+## Novedades de v5
+
+La versión 5 le da al relay **una GUI propia: Ebi AI Console**, una pantalla web, en escritorio o
+móvil, donde ves todos los hilos de agentes a la vez, decides qué hacer ahora y actúas.
+
+- **Vista Focus** (la predeterminada) responde "¿qué hago ahora?". Un modelo rápido —el más barato
+  del backend que usas, en una sola llamada y sin herramientas— rellena prioridad, fecha límite,
+  siguiente paso, si se puede hacer ya y si depende de un lugar. Un valor fijado por una persona
+  siempre gana.
+- **Actúa sin salir de la pantalla**: responde adjuntando cualquier archivo, previsualiza archivos
+  en el sitio, cambia backend, modelo y effort con un selector, ajusta el límite de sesiones
+  concurrentes y pausa, reanuda o detén el trabajo en curso.
+- **Mantén el trabajo delegado junto a la conversación principal**: un panel plegable muestra el
+  estado de hijos y nietos, los últimos informes y los recuentos de tareas completadas. Revisa un
+  hijo y vuelve a la conversación padre para decidir; responder directamente a un hijo requiere
+  elegirlo de forma explícita.
+- **Opcional y aditiva**: no arranca nada salvo que se defina `CCDB_CONSOLE_PORT`, y Discord, Teams,
+  los backends, la API REST y el planificador no cambian. Con la consola activada, el triaje
+  automático está activo por defecto; `CCDB_CONSOLE_TRIAGE=0` lo desactiva.
+
+**La versión 5.1 añade la integración con Workspace y más formas de gestionar conversaciones:**
+
+- **Tareas de Ebi Workspace**: explora contextos y proyectos, lee resúmenes, añade, edita y
+  completa tareas, e inicia trabajo de IA desde una tarea. El `status.md` del proyecto y el
+  `single-actions.md` del contexto siguen siendo la fuente de verdad; las comprobaciones de
+  revisión rechazan ediciones obsoletas.
+- **Búsqueda de mensajes**: encuentra texto en el historial de conversaciones disponible y en las
+  transcripciones locales, con extractos y enlaces al hilo correspondiente, sin llamadas a la IA.
+- **Gestión de familias de hilos**: configura por separado el backend, el modelo y el effort del
+  gestor y de los hijos, y selecciona varios hilos para completarlos a la vez. Completar un padre
+  incluye a sus descendientes.
+- **Controles de escritorio y móvil**: copia el contenido de archivos de texto y los enlaces de los
+  hilos, cambia entre japonés e inglés sin perder borradores ni adjuntos, y mantén accesible el
+  editor en el móvil.
+
+Consulta las [notas de la versión 5.1.0](../releases/v5.1.0.md), la [guía de la consola](../console.md)
+y el [ADR-0014](../adr/0014-publish-the-ebi-ai-console-as-v5.md) (en inglés). Lo siguiente es la
+**integración con el planificador**.
+
+## Novedades de v4
+
+La versión 4 hace explícitas dos decisiones independientes: **dónde habla la gente** y
+**qué agente hace el trabajo**. Cualquier frontend compatible puede usar cualquier backend
+compatible.
+
+### Frontend × backend
+
+| | Claude Code | OpenAI Codex | Local | AG-UI | pi |
+|---|---:|---:|---:|---:|---:|
+| Discord | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Microsoft Teams | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+- **Discord** sigue siendo el valor por defecto sin migración. Los despliegues existentes
+  arrancan exactamente igual que antes.
+- **Microsoft Teams** está listo para producción mediante un pequeño receptor público y un
+  `ActivityPuller` de solo salida en el host privado de sesiones. Discord y Teams pueden
+  convivir en un mismo proceso con `CCDB_FRONTENDS=discord,teams`.
+- **AG-UI** conecta cualquiera de las dos superficies de chat con un agente HTTP/SSE que
+  implemente el Agent–User Interaction Protocol. Claude Code, Codex y el backend local
+  protegido siguen disponibles.
+- **pi** ejecuta la CLI de [pi](https://github.com/earendil-works/pi), que alcanza
+  Anthropic, OpenAI, Google, GitHub Copilot y servidores locales compatibles con OpenAI a
+  través de un único agente. No tiene sandbox en los modos no interactivos que usa ccdb, así
+  que se niega a arrancar hasta que `CCDB_PI_ALLOW_UNSANDBOXED=1` declare que se confía en el
+  aislamiento del propio host.
+
+Empieza por la [guía de backends](../backends.md). Para Teams, sigue la
+[guía completa de configuración de Microsoft Teams](../teams-setup.md) y consulta después
+las referencias más detalladas de [comportamiento de la superficie](../teams.md) y
+[modelo de seguridad del relay](../teams-relay.md).
 
 **[English](../../README.md)** | **[日本語](../ja/README.md)** | **[简体中文](../zh-CN/README.md)** | **[한국어](../ko/README.md)** | **[Português](../pt-BR/README.md)** | **[Français](../fr/README.md)**
 
@@ -277,7 +366,7 @@ Si el bot se reinicia a mitad de una sesión, las sesiones de Claude interrumpid
 
 ccdb 3.0 introduce tres comandos slash que cambian qué IA maneja la siguiente sesión, sin reiniciar el bot:
 
-- `/backend [name] [scope]` — muestra o cambia el backend. `name` es `claude` o `codex`. `scope` es `thread` (solo este hilo) o `global` (predeterminado a nivel de servidor). Cuando omites `scope`, el comando se autorresuelve: dentro de un hilo lo aplica a ese hilo, de lo contrario establece el predeterminado global.
+- `/backend [name] [scope]` — muestra o cambia el backend. `name` es `claude`, `codex`, `local`, `agui`, `pi` o `antigravity`. `scope` es `thread` (solo este hilo) o `global` (predeterminado a nivel de servidor). Cuando omites `scope`, el comando se autorresuelve: dentro de un hilo lo aplica a ese hilo, de lo contrario establece el predeterminado global.
 - `/model [name] [scope]` — muestra o cambia el modelo usado por el backend **actual**. Cada backend recuerda su propia preferencia de modelo, así que alternar de un backend a otro mantiene intactos tus modelos favoritos. Deja sin definir el modelo de un backend para diferir al valor por defecto de ese CLI (p. ej. Codex usa el `model` de `~/.codex/config.toml`, así que ccdb rastrea el valor por defecto de la consola en lugar de fijar una versión).
 - `/effort [level] [scope]` — muestra o cambia el **esfuerzo de razonamiento** usado por el backend actual. Los niveles válidos son específicos del backend: Claude acepta `low/medium/high/max`; Codex acepta `low/medium/high/xhigh/max/ultra` (mapeado al `model_reasoning_effort` del CLI). Déjalo sin definir para diferir al valor por defecto del CLI.
 
@@ -332,7 +421,7 @@ Tras bambalinas:
 - **Sesiones concurrentes** — Múltiples sesiones en paralelo con límite configurable
 - **Detener sin borrar** — `/stop` detiene una sesión preservándola para reanudarla
 - **Interrupción de sesión** — Enviar un mensaje nuevo a un hilo activo envía SIGINT a la sesión en ejecución y comienza de cero con la nueva instrucción; no se necesita `/stop` manual
-- **Auto-renombrado de hilos** — Con `THREAD_AUTO_RENAME=true`, cada hilo nuevo se renombra automáticamente con un título generado por Claude a partir del primer mensaje (tarea en segundo plano, nunca retrasa el inicio de la sesión)
+- **Auto-renombrado de hilos** — Con `THREAD_AUTO_RENAME=true`, cada hilo nuevo se renombra automáticamente con un título generado por Claude a partir del primer mensaje (tarea en segundo plano, nunca retrasa el inicio de la sesión). El título se mantiene al día: cuando el trabajo cambia claramente de tema, el hilo se vuelve a titular (como máximo una vez cada 15 minutos, y solo en hilos creados por ccdb)
 
 #### 📡 Retroalimentación en Tiempo Real
 - **Estado en tiempo real** — Reacciones emoji: 🧠 pensando, 🛠️ leyendo archivos, 💻 editando, 🌐 búsqueda web
@@ -573,14 +662,13 @@ async def setup(bot, runner, components):
 
 Los archivos con prefijo `_` se omiten. Si un Cog falla al cargar, los demás se cargan normalmente.
 
-Ver [`examples/ebibot/`](examples/ebibot/) para un ejemplo completo del mundo real con recordatorios, watchdog de Todoist, auto-actualización y sincronización de documentación.
+Ver [`examples/ebibot/`](examples/ebibot/) para un ejemplo completo del mundo real con recordatorios, auto-actualización y sincronización de documentación.
 
 **Ejemplos integrados en `examples/ebibot/cogs/`:**
 
 | Cog | Propósito |
 |-----|-----------|
 | `ReminderCog` | Programación de recordatorios basada en Discord |
-| `WatchdogCog` | Watchdog de Todoist / servicios externos |
 | `AutoUpgradeCog` | Actualización de paquete disparada por webhook |
 | `DocsSyncCog` | Sincronización automática de documentación en cada push |
 | `AlertResponderCog` | Monitoreo genérico de alertas — reenvía alertas de sistemas de monitoreo a Discord y dispara una sesión de investigación de Claude Code |
@@ -763,7 +851,7 @@ En el modo solo-chat, las solicitudes de permisos y los prompts de `AskUserQuest
 | `CLAUDE_ALLOWED_TOOLS` | Lista separada por comas de herramientas permitidas para el CLI de Claude (heredado — prefiere `CCDB_ALLOWED_TOOLS`) | (opcional) |
 | `CLAUDE_CHANNEL_IDS` | IDs de canal adicionales (separados por comas) para configuración multi-canal (heredado — prefiere `CCDB_CHANNEL_IDS`) | (opcional) |
 | `THREAD_INBOX_ENABLED` | Habilitar la bandeja de entrada persistente de hilos (clasifica sesiones como `waiting`/`done`/`ambiguous` vía `claude -p`; se muestra en el panel de hilos) | `false` |
-| `THREAD_AUTO_RENAME` | Auto-renombrar los títulos de los hilos nuevos usando Claude AI — genera un título breve y descriptivo a partir del primer mensaje del usuario mediante una llamada en segundo plano a `claude -p` (nunca retrasa el inicio de la sesión) | `false` |
+| `THREAD_AUTO_RENAME` | Auto-renombrar los títulos de los hilos nuevos usando Claude AI — genera un título breve y descriptivo a partir del primer mensaje del usuario mediante una llamada en segundo plano a `claude -p` (nunca retrasa el inicio de la sesión) y vuelve a titular el hilo cuando su tema cambia claramente (un renombrado cada 15 minutos como máximo; se conservan las etiquetas de linaje) | `false` |
 | `CCDB_CLI_ENV_FILE` | Ruta a un archivo `KEY=VALUE` cuyas variables se fusionan en el entorno del subproceso CLI en cada invocación. Los cambios surten efecto inmediatamente sin reiniciar el bot. Útil para enrutamiento temporal de API (p. ej., Azure Foundry) | (opcional) |
 | `CCDB_LOG_FILE` | Ruta a un archivo de log. Cuando se define, se añade un manejador de archivo rotativo (10 MB × 5 copias) junto al manejador de stdout por defecto. Útil para monitoreo y alertas. | (opcional) |
 | `API_HOST` | Dirección de enlace del REST API | `127.0.0.1` |
@@ -1128,7 +1216,6 @@ examples/
   ebibot/                  # Real-world example: personal bot with custom Cogs
     cogs/
       reminder.py          # /remind slash command + scheduled notifications
-      watchdog.py          # Todoist overdue task monitor
       auto_upgrade.py      # Self-update via GitHub webhook
       docs_sync.py         # Auto-translate docs on push
 ```
@@ -1174,7 +1261,6 @@ El proyecto comenzó el 2026-02-18 y continúa evolucionando a través de conver
 **[`examples/ebibot/`](examples/ebibot/)** — Un bot personal de Discord construido sobre este framework, incluido directamente en este repositorio. Demuestra el cargador de Cogs personalizado con:
 
 - **ReminderCog** — Comando slash `/remind HH:MM "message"` + ciclo de envío de 30 segundos
-- **WatchdogCog** — Monitor de tareas vencidas de Todoist (verificación cada 30 minutos, deduplicación diaria, alertas basadas en severidad)
 - **AutoUpgradeCog** — Auto-actualización mediante webhook de GitHub + systemctl restart
 - **DocsSyncCog** — Auto-traducción de documentación en cada push mediante webhook
 - **AlertResponderCog** — Cog genérico de monitoreo de alertas; observa una fuente configurable y publica notificaciones anotadas por severidad en Discord

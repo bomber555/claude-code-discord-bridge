@@ -10,8 +10,10 @@ from discord import app_commands
 from discord.app_commands import Choice
 from discord.ext import commands
 
+from claude_code_core.antigravity_runner import VALID_AGY_EFFORTS
 from claude_code_core.codex_runner import VALID_CODEX_EFFORTS
 from claude_code_core.local_backend import pull_ollama_model, validate_ollama_model_name
+from claude_code_core.pi_runner import VALID_PI_THINKING
 
 from ..backend_settings import (
     ALL_BACKENDS,
@@ -20,7 +22,7 @@ from ..backend_settings import (
     BackendSettings,
 )
 from ..codex_config import CodexModelSelection, read_codex_model
-from ..model_catalog import claude_model_choices, codex_model_choices
+from ..model_catalog import claude_model_choices, codex_model_choices, pi_model_choices
 
 if TYPE_CHECKING:
     from ..backend_factory import BackendFactory
@@ -35,12 +37,17 @@ VALID_EFFORTS: dict[str, frozenset[str]] = {
     "claude": frozenset({"low", "medium", "high", "max"}),
     "codex": VALID_CODEX_EFFORTS,
     "local": VALID_CODEX_EFFORTS,
+    # pi calls this "thinking" and includes an explicit "off".
+    "pi": VALID_PI_THINKING,
+    "antigravity": VALID_AGY_EFFORTS,
 }
 
 EFFORT_ORDER: dict[str, list[str]] = {
     "claude": ["low", "medium", "high", "max"],
     "codex": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     "local": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    "pi": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "antigravity": ["low", "medium", "high", "xhigh", "max"],
 }
 
 # Suggestions only: the model fields remain free text.
@@ -62,6 +69,20 @@ SUGGESTED_MODELS: dict[str, list[tuple[str, str]]] = {
     "local": [
         ("gpt-oss:120b", "gpt-oss 120B (tool use, needs real VRAM)"),
         ("qwen3.5:35b", "Qwen3.5 35B"),
+    ],
+    # Fallback only — the live list comes from pi's own on-disk catalog
+    # (pi_model_choices), which is the only place the operator's hand-declared
+    # providers appear. Always fully qualified: pi's bare --model is a fuzzy
+    # pattern, so an unqualified id lets pi pick the provider.
+    "pi": [
+        ("anthropic/claude-opus-5", "Claude Opus 5"),
+        ("openai-codex/gpt-6-astra", "GPT-6-Astra"),
+    ],
+    # Suggestions only; `agy models` lists what the signed-in account can use.
+    "antigravity": [
+        ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+        ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)"),
+        ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
     ],
 }
 
@@ -86,11 +107,28 @@ class BackendCommandCog(commands.Cog):
         settings: BackendSettings,
         factory: BackendFactory,
         chat_cog: ClaudeChatCog,
+        allowed_user_ids: set[int] | None = None,
     ) -> None:
         self.bot = bot
+        # Who may change backends, models and effort: the same set as /skill.
+        self._allowed_user_ids = allowed_user_ids
         self._settings = settings
         self._factory = factory
         self._chat_cog = chat_cog
+
+    def _is_authorized(self, user_id: int) -> bool:
+        """Same rule as /skill: ``None`` means every user who can reach the bot."""
+        if self._allowed_user_ids is None:
+            return True
+        return user_id in self._allowed_user_ids
+
+    async def _refuse_unauthorized(self, interaction: discord.Interaction) -> bool:
+        if self._is_authorized(interaction.user.id):
+            return False
+        await interaction.response.send_message(
+            "You don't have permission to use this command.", ephemeral=True
+        )
+        return True
 
     def _thread_id_or_none(self, interaction: discord.Interaction) -> int | None:
         channel = interaction.channel
@@ -166,6 +204,8 @@ class BackendCommandCog(commands.Cog):
         name: str | None = None,
         scope: str | None = None,
     ) -> None:
+        if await self._refuse_unauthorized(interaction):
+            return
         thread_id_now = self._thread_id_or_none(interaction)
 
         if name is None:
@@ -217,7 +257,13 @@ class BackendCommandCog(commands.Cog):
             if resolved_scope == SCOPE_THREAD and target_thread_id is not None
             else "**globally**"
         )
-        emoji = {"codex": "🌀", "local": "🏠", "agui": "🔌"}.get(name, "🤖")
+        emoji = {
+            "codex": "🌀",
+            "local": "🏠",
+            "agui": "🔌",
+            "pi": "🥧",
+            "antigravity": "🪐",
+        }.get(name, "🤖")
         await interaction.response.send_message(
             f"{emoji} Backend set to `{name}` {scope_label}. Next session will use it.",
             ephemeral=False,
@@ -244,6 +290,8 @@ class BackendCommandCog(commands.Cog):
             suggestions = await claude_model_choices(fallback=SUGGESTED_MODELS["claude"])
         elif backend == "codex":
             suggestions = codex_model_choices(fallback=SUGGESTED_MODELS["codex"])
+        elif backend == "pi":
+            suggestions = pi_model_choices(fallback=SUGGESTED_MODELS["pi"])
         else:
             suggestions = SUGGESTED_MODELS.get(backend, [])
         current_lower = current.lower()
@@ -260,6 +308,8 @@ class BackendCommandCog(commands.Cog):
         description="Show the current model selection",
     )
     async def model_show_command(self, interaction: discord.Interaction) -> None:
+        if await self._refuse_unauthorized(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         thread_id = self._thread_id_or_none(interaction)
         # One command may show the same inherited config twice; probe it once.
@@ -334,6 +384,8 @@ class BackendCommandCog(commands.Cog):
         name: str,
         scope: str | None = None,
     ) -> None:
+        if await self._refuse_unauthorized(interaction):
+            return
         resolved_scope, target_thread_id = self._resolve_scope(interaction, scope)
         if resolved_scope == SCOPE_THREAD and target_thread_id is None:
             await interaction.response.send_message(
@@ -385,6 +437,8 @@ class BackendCommandCog(commands.Cog):
         name: str,
         scope: str | None = None,
     ) -> None:
+        if await self._refuse_unauthorized(interaction):
+            return
         resolved_scope, target_thread_id = self._resolve_scope(interaction, scope)
         if resolved_scope == SCOPE_THREAD and target_thread_id is None:
             await interaction.response.send_message(
@@ -488,6 +542,8 @@ class BackendCommandCog(commands.Cog):
         level: str | None = None,
         scope: str | None = None,
     ) -> None:
+        if await self._refuse_unauthorized(interaction):
+            return
         thread_id_now = self._thread_id_or_none(interaction)
 
         if level is None:
@@ -575,6 +631,8 @@ class BackendCommandCog(commands.Cog):
         mode: str | None = None,
         scope: str | None = None,
     ) -> None:
+        if await self._refuse_unauthorized(interaction):
+            return
         thread_id_now = self._thread_id_or_none(interaction)
 
         if mode is None:

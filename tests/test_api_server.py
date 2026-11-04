@@ -11,6 +11,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from claude_discord.database.notification_repo import NotificationRepository
 from claude_discord.ext.api_server import ApiServer
+from claude_discord.thread_marker import family_code
 from claude_discord.thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
 
 
@@ -621,6 +622,66 @@ class TestSpawn:
         assert mock_cog.spawn_session.await_args.kwargs["invite_user_id"] == 418192003549888523
 
     @pytest.mark.asyncio
+    async def test_spawn_marks_the_thread_as_agent_spawned(
+        self, spawn_client: TestClient, mock_cog: MagicMock
+    ) -> None:
+        """Every /api/spawn thread is agent-started; the title has to say so."""
+        await spawn_client.post("/api/spawn", json={"prompt": "Check the backlog"})
+        assert mock_cog.spawn_session.await_args.kwargs["agent_spawned"] is True
+
+    @pytest.mark.asyncio
+    async def test_spawn_forwards_parent_thread_id(
+        self, spawn_client: TestClient, mock_cog: MagicMock
+    ) -> None:
+        """The caller's thread is what makes the two titles match; dropping it is silent."""
+        resp = await spawn_client.post(
+            "/api/spawn",
+            json={"prompt": "Check the backlog", "parent_thread_id": 1550121254361768021},
+        )
+        assert resp.status == 201
+        assert mock_cog.spawn_session.await_args.kwargs["parent_thread_id"] == 1550121254361768021
+        body = await resp.json()
+        assert body["parent_thread_id"] == "1550121254361768021"
+        assert body["family"] == family_code(1550121254361768021)
+
+    @pytest.mark.asyncio
+    async def test_spawn_records_lineage(
+        self, repo: NotificationRepository, bot_with_text_channel: MagicMock, mock_cog: MagicMock
+    ) -> None:
+        """The titles are the visible half; /api/sessions needs the stored half."""
+        bot_with_text_channel.cogs = {"ClaudeChatCog": mock_cog}
+        lineage_repo = MagicMock()
+        lineage_repo.record = AsyncMock()
+        api = ApiServer(
+            repo=repo,
+            bot=bot_with_text_channel,
+            default_channel_id=12345,
+            lineage_repo=lineage_repo,
+        )
+        client = TestClient(TestServer(api.app))
+        await client.start_server()
+        try:
+            await client.post(
+                "/api/spawn",
+                json={"prompt": "Check the backlog", "parent_thread_id": 1550121254361768021},
+            )
+        finally:
+            await client.close()
+        lineage_repo.record.assert_awaited_once_with(
+            999888777, 1550121254361768021, family_code(1550121254361768021)
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_rejects_non_numeric_parent_thread_id(
+        self, spawn_client: TestClient, mock_cog: MagicMock
+    ) -> None:
+        resp = await spawn_client.post(
+            "/api/spawn", json={"prompt": "Hello", "parent_thread_id": "the other one"}
+        )
+        assert resp.status == 400
+        mock_cog.spawn_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_spawn_without_user_id_invites_nobody(
         self, spawn_client: TestClient, mock_cog: MagicMock
     ) -> None:
@@ -1013,6 +1074,78 @@ class TestIngest:
         assert data["thread_id"] == "111222333"
         assert data["attachments_saved"] == 0
 
+    @pytest.fixture
+    async def work_repo(self, tmp_path):
+        from claude_discord.console.work_repo import WorkItemRepository
+
+        r = WorkItemRepository(str(tmp_path / "work.db"))
+        await r.init_db()
+        return r
+
+    @pytest.mark.asyncio
+    async def test_teams_reply_draft_lands_on_the_board_at_p0(
+        self, ingest_client: TestClient, work_repo
+    ) -> None:
+        """Someone in Teams waits for a reply draft: it starts at P0, not the default."""
+        ingest_client._api._console = MagicMock(work_repo=work_repo)  # type: ignore[attr-defined]
+        body = (
+            "Microsoft Teams のスレッドが、サーバー上に1発言1ファイルで同期されています。\n\n"
+            "このスレッドへの返信ドラフトを作成してください。"
+        )
+        resp = await ingest_client.post("/api/ingest", json={"content": body}, headers=self.AUTH)
+        assert resp.status == 201
+        item = await work_repo.get("t111222333")
+        assert item is not None
+        assert item.priority == 0
+        assert item.tags == ("teams-exporter",)
+
+    @pytest.mark.asyncio
+    async def test_ingest_tags_label_the_thread(self, ingest_client: TestClient, work_repo) -> None:
+        """An integration names its threads so a saved view can select them."""
+        ingest_client._api._console = MagicMock(work_repo=work_repo)  # type: ignore[attr-defined]
+        resp = await ingest_client.post(
+            "/api/ingest",
+            json={"content": "Monthly sweep", "tags": ["Monthly-Report", "monthly-report"]},
+            headers=self.AUTH,
+        )
+        assert resp.status == 201
+        item = await work_repo.get("t111222333")
+        assert item is not None
+        assert item.tags == ("monthly-report",)
+        assert item.priority == 2
+
+    @pytest.mark.asyncio
+    async def test_bad_ingest_tags_are_400_before_spawning(
+        self, ingest_client: TestClient, mock_cog: MagicMock
+    ) -> None:
+        resp = await ingest_client.post(
+            "/api/ingest", json={"content": "x", "tags": ["two words"]}, headers=self.AUTH
+        )
+        assert resp.status == 400
+        mock_cog.spawn_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_other_ingest_keeps_the_default_priority(
+        self, ingest_client: TestClient, work_repo
+    ) -> None:
+        """A monthly report sweep is not a reply someone is waiting on."""
+        ingest_client._api._console = MagicMock(work_repo=work_repo)  # type: ignore[attr-defined]
+        body = "Microsoft Teams の全チャット・全チャネルを、1発言1ファイルで同期しました。"
+        resp = await ingest_client.post("/api/ingest", json={"content": body}, headers=self.AUTH)
+        assert resp.status == 201
+        assert await work_repo.get("t111222333") is None
+
+    @pytest.mark.asyncio
+    async def test_reply_draft_without_console_still_spawns(
+        self, ingest_client: TestClient
+    ) -> None:
+        resp = await ingest_client.post(
+            "/api/ingest",
+            json={"content": "[Teams Channel Exporter] reply please"},
+            headers=self.AUTH,
+        )
+        assert resp.status == 201
+
     @pytest.mark.asyncio
     async def test_ingest_missing_content_returns_400(self, ingest_client: TestClient) -> None:
         resp = await ingest_client.post("/api/ingest", json={}, headers=self.AUTH)
@@ -1265,7 +1398,7 @@ class TestIngest:
                 "attachments_manifest": [
                     {"name": "shot.png", "message": "返信 1"},
                     {
-                        "name": "MEHJdebug.log",
+                        "name": "ACMEdebug.log",
                         "status": "linked",
                         "message": "返信 2",
                         "reason": "SharePoint download failed",
@@ -1280,18 +1413,18 @@ class TestIngest:
         # The caller — the only party that can re-send — is told what is missing.
         assert data["attachments"]["verified"] is True
         assert data["attachments"]["complete"] is False
-        assert data["attachments"]["not_delivered"][0]["name"] == "MEHJdebug.log"
+        assert data["attachments"]["not_delivered"][0]["name"] == "ACMEdebug.log"
 
         # The session is told before it is asked to do anything.
         _channel, prompt = mock_cog.spawn_session.call_args.args
-        assert "MEHJdebug.log" in prompt
+        assert "ACMEdebug.log" in prompt
         assert "返信 2" in prompt
         assert prompt.index("⚠️") < prompt.index("See attached")
 
         # And the ledger is written next to the files.
         report = list(tmp_path.glob("ingest/*/ATTACHMENTS-REPORT.md"))
         assert len(report) == 1
-        assert "MEHJdebug.log" in report[0].read_text(encoding="utf-8")
+        assert "ACMEdebug.log" in report[0].read_text(encoding="utf-8")
 
     @pytest.mark.asyncio
     async def test_complete_manifest_adds_no_warning(
@@ -1581,7 +1714,7 @@ class TestIngestResult:
 
         thread = MagicMock()
         thread.id = 111222333
-        thread.name = "MEHJ thread"
+        thread.name = "ACME thread"
         thread.send = AsyncMock()
         thread.add_user = AsyncMock()
 
