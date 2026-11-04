@@ -7,6 +7,7 @@ upstream (`ebibibi/ebi-agent-chat-relay`) に無く、この fork だけが持�
 | Public スレッド一覧 | `GET /api/channels/{channel_id}/threads` (下記) |
 | スレッド名の変更 | `POST /api/threads/{id}/title` (人が改名したら 409、`override: true` で解除) |
 | ボタンで PR をマージ | `/merge <pr>` / `POST /api/threads/{id}/merge-request`。`CCDB_MERGE_REPO` `CCDB_MERGE_USER_IDS` `CCDB_MERGE_BASES` `CCDB_MERGE_IGNORE_CHECKS` `CCDB_MERGE_GH_BIN` |
+| hook の ask を Discord で承認 | `--permission-prompt-tool stdio` の `can_use_tool` を Allow/Deny ボタンへ中継。`CCDB_APPROVER_USER_IDS` `CCDB_PERMISSION_TIMEOUT_SECONDS`。確認は `scripts/check_permission_relay.py` |
 | 通知を絞る | `CCDB_SILENT_BY_DEFAULT` (既定 `true`。完了・エラー・@mention だけ通知) |
 | モデル呼び出し無しの受信箱 | `THREAD_INBOX_MODE=title` `THREAD_INBOX_TITLE_MARKERS` |
 | Session Status の時刻 | `CCDB_DISPLAY_TZ` |
