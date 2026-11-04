@@ -29,7 +29,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-import jwt
+try:
+    import jwt
+except ImportError:  # pyjwt ships in extras; a Discord-only install must still start
+    jwt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,12 @@ class EntraTokenVerifier:
                 bool(tenant),
                 bool(client),
                 len(oids),
+            )
+            return None
+        if jwt is None:
+            logger.error(
+                "Entra ID ingest auth needs pyjwt[crypto] — leaving it off. "
+                'Install "claude-code-discord-bridge[teams]".'
             )
             return None
         scope = (env.get("CCDB_INGEST_ENTRA_SCOPE") or "").strip() or DEFAULT_SCOPE
