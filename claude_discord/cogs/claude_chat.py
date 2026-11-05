@@ -59,6 +59,7 @@ from ..discord_ui.thread_renamer import suggest_retitle, suggest_title
 from ..discord_ui.thread_retitle import RetitleTracker
 from ..discord_ui.views import RewindSelectView, StopView
 from ..execution_settings import apply_thread_execution_mode, thread_execution_mode
+from ..message_edit import build_edit_prompt
 from ..restart_reservation import QUEUED_RESTART_REASON, persist_queued_runs
 from ..session_slots import get_session_slots
 from ..thread_marker import (
@@ -85,6 +86,9 @@ logger = logging.getLogger(__name__)
 
 # Reacted on a message that went into the turn already running (issue #1129).
 INJECTED_REACTION = "📥"
+# An unfurl update repeats the edit time, so an uncached message only counts as
+# edited just now. Gateway delivery takes seconds; a minute leaves room for a reconnect.
+UNCACHED_EDIT_MAX_AGE_SECONDS = 60
 
 # How many messages to scan when recovering an ``auto_start=false`` seed.
 # A seed is chunked at Discord's per-message limit, so this bounds the seed at
@@ -341,6 +345,69 @@ class ClaudeChatCog(commands.Cog):
         if self._is_summoned(message):
             await self._record_attention(message, opens_thread=False)
             await self._handle_mention(message)
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        """Pass a person's edit to the session of the thread it happened in.
+
+        Raw, because ``on_message_edit`` does not fire for a message outside the
+        cache, and the edit still has to reach the session then.
+        """
+        message = payload.message
+        if message.author.bot:
+            return
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return
+        if self._allowed_user_ids is not None and message.author.id not in self._allowed_user_ids:
+            return
+        if self._is_for_another_bot(message) or not self._is_real_edit(payload):
+            return
+
+        thread = self.bot.get_channel(payload.channel_id)
+        if not isinstance(thread, discord.Thread) or not self._is_no_mention_scope(thread):
+            return
+        record = await self.repo.get(thread.id)
+        if record is None:
+            return
+
+        cached = payload.cached_message
+        prompt = build_edit_prompt(
+            cached.content if cached is not None else None,
+            message.content,
+            message.jump_url,
+        )
+        if await self._inject_into_running_turn(thread.id, prompt):
+            with contextlib.suppress(discord.HTTPException):
+                await message.add_reaction(INJECTED_REACTION)
+            return
+
+        session_id = record.session_id
+        if session_id:
+            session_id = await self._session_id_for_current_backend(thread, record)
+        await self._run_claude(
+            message,
+            thread,
+            prompt,
+            session_id=session_id,
+            working_dir_override=record.working_dir,
+            chat_only=(thread.parent_id or 0) in self._chat_only_channel_ids,
+            interrupt_existing=True,
+        )
+
+    @staticmethod
+    def _is_real_edit(payload: discord.RawMessageUpdateEvent) -> bool:
+        """Tell a person's edit from the update Discord sends when it unfurls a link."""
+        message = payload.message
+        cached = payload.cached_message
+        if cached is not None:
+            return cached.content != message.content
+        # Without the old text, only the time is left: an unfurl of a message
+        # edited long ago repeats the old timestamp.
+        edited_at = message.edited_at
+        if edited_at is None:
+            return False
+        age = (discord.utils.utcnow() - edited_at).total_seconds()
+        return age <= UNCACHED_EDIT_MAX_AGE_SECONDS
 
     def _is_for_another_bot(self, message: discord.Message) -> bool:
         """Return whether *message* @mentions some other bot and not this one."""
