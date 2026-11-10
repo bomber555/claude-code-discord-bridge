@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import discord
 
-from .claude_usage import build_quota_window_lines, usage_footer_enabled
+from .claude_usage import build_quota_summary, usage_footer_enabled
 from .embeds import COLOR_ERROR, COLOR_INFO, COLOR_SUCCESS
 from .engine_status import get_codex_status_line
 
@@ -95,6 +96,44 @@ async def post_completion(
         logger.warning("Could not deliver Codex completion card", exc_info=True)
 
 
+_CLAUDE_MODEL_ID = re.compile(r"^claude-([a-z]+)-(\d+(?:-\d{1,2})?)(?:-\d{8})?(?:\[.*\])?$")
+
+
+def short_claude_model(model: str | None) -> str | None:
+    """``claude-opus-5-5`` → ``opus5.5``; anything else is returned as given."""
+    if not model:
+        return None
+    match = _CLAUDE_MODEL_ID.match(model.strip())
+    if match is None:
+        return model.strip()
+    family, version = match.groups()
+    return f"{family}{version.replace('-', '.')}"
+
+
+def plan_name(account_label: str | None) -> str | None:
+    """``Max subscription (a@b.c)`` → ``Max``; ``API key (metered)`` → ``API従量``."""
+    if not account_label:
+        return None
+    match = re.match(r"^(.+?) subscription\b", account_label)
+    if match:
+        return match.group(1)
+    if account_label.startswith("API key"):
+        return "API従量"
+    return re.sub(r"\s*\(.*\)$", "", account_label) or None
+
+
+def claude_completion_embed(
+    model: str | None, effort: str | None, summary: str | None
+) -> discord.Embed:
+    """``✅ 応答完了 by Claude opus5.5 medium`` with one plan/quota line."""
+    title = " ".join(part for part in ("✅ 応答完了 by Claude", model, effort) if part)
+    return discord.Embed(
+        title=_plain(title)[:256],
+        description=discord.utils.escape_markdown(summary) if summary else None,
+        color=COLOR_SUCCESS,
+    )
+
+
 async def post_claude_completion(
     thread: discord.Thread | discord.TextChannel,
     *,
@@ -107,6 +146,7 @@ async def post_claude_completion(
     api_label: str | None,
     account_label: str | None,
     quota_windows: Sequence[RateLimitInfo] | None = None,
+    effort: str | None = None,
     now: int | None = None,
 ) -> None:
     """Post one Claude card, with the stored quota windows when there are any."""
@@ -120,17 +160,22 @@ async def post_claude_completion(
         details.append(f"推定費用：${cost_usd:.4f}")
     if api_label:
         details.append(f"接続先：{api_label}")
+    if account_label:
+        details.append(f"アカウント：{account_label}")
 
     view = CompletionDetailsView("\n".join(details))
-    rows = [f"アカウント：{account_label}"] if account_label else []
+    parts: list[str] = []
+    plan = plan_name(account_label)
+    if plan:
+        parts.append(f"プラン{plan}")
     if quota_windows and usage_footer_enabled():
-        rows.extend(build_quota_window_lines(quota_windows, now=now))
+        quota = build_quota_summary(quota_windows, now=now)
+        if quota:
+            parts.append(quota)
     try:
         await thread.send(
-            embed=completion_embed(
-                model,
-                "\n".join(rows) or None,
-                backend="Claude",
+            embed=claude_completion_embed(
+                short_claude_model(model), effort, " / ".join(parts) or None
             ),
             view=view,
             silent=False,

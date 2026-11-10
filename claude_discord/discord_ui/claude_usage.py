@@ -173,32 +173,25 @@ def _format_reset_at(epoch: float) -> str:
     return f"{dt.month}/{dt.day}({_WEEKDAYS_JA[dt.weekday()]}) {dt:%H:%M}"
 
 
-def build_quota_window_lines(
+def pick_binding_window(
     windows: Iterable[RateLimitInfo], now: float | None = None
-) -> list[str]:
-    """Render the stored ``rate_limit_event`` windows (what ``/usage`` reads).
-
-    Pure formatting over the bridge's own database, so it never calls the
-    rate-limited ``/api/oauth/usage`` endpoint. A window is only refreshed when
-    Claude reports it on a turn, so a row whose reset time has passed is shown
-    as reset rather than with its stale percentage.
-    """
-    by_type = {w.rate_limit_type: w for w in windows}
+) -> RateLimitInfo | None:
+    """Return the 5-hour/weekly window with the least capacity left, ignoring stale rows."""
     current = time.time() if now is None else now
-    lines: list[str] = []
-    for key, label in _WINDOWS:
-        window = by_type.get(key)
-        if window is None:
-            continue
-        if window.resets_at <= current:
-            lines.append(f"{label}残量：—（リセット済み）")
-            continue
-        used = round(float(window.utilization) * 100)
-        remaining = max(0, min(100, 100 - used))
-        reset_at = _format_reset_at(window.resets_at)
-        countdown = _format_countdown(window.resets_at, now=int(current))
-        lines.append(f"{label}残量：{remaining}%（{reset_at} リセット・あと{countdown}）")
-    return lines
+    live = [w for w in windows if w.rate_limit_type in dict(_WINDOWS) and w.resets_at > current]
+    if not live:
+        return None
+    return max(live, key=lambda w: (w.utilization, -w.resets_at))
+
+
+def build_quota_summary(windows: Iterable[RateLimitInfo], now: float | None = None) -> str | None:
+    """Render ``残り93% / リセット11/12(木) 22:00`` for the binding window."""
+    window = pick_binding_window(windows, now=now)
+    if window is None:
+        return None
+    used = round(float(window.utilization) * 100)
+    remaining = max(0, min(100, 100 - used))
+    return f"残り{remaining}% / リセット{_format_reset_at(window.resets_at)}"
 
 
 def _read_access_token(path: Path) -> str | None:
