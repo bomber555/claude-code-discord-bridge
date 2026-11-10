@@ -209,6 +209,8 @@ class EventProcessor:
     def __init__(self, config: RunConfig) -> None:
         self._config = config
         self._compact_cli = config.thread is not None and _uses_compact_cli_card(config.runner)
+        # Concrete model the CLI resolved (``claude-opus-5-5``), from the init event.
+        self._cli_model: str | None = None
         self._state = SessionState(
             session_id=config.session_id,
             thread_id=config.surface.thread_key,
@@ -433,6 +435,9 @@ class EventProcessor:
         if not event.session_id:
             return
 
+        raw_model = event.raw.get("model") if isinstance(event.raw, dict) else None
+        if isinstance(raw_model, str) and raw_model:
+            self._cli_model = raw_model
         self._state.session_id = event.session_id
         self._session_opened = True
         if self._config.repo:
@@ -876,7 +881,7 @@ class EventProcessor:
             asyncio.create_task(
                 post_claude_completion(
                     self._config.thread,
-                    model=runner.model,
+                    model=self._cli_model or runner.model,
                     session_id=self._state.session_id,
                     input_tokens=event.input_tokens,
                     output_tokens=event.output_tokens,
@@ -885,6 +890,7 @@ class EventProcessor:
                     api_label=runner.describe_api(),
                     account_label=runner.describe_account(),
                     quota_windows=quota_windows,
+                    effort=getattr(runner, "effort", None),
                 ),
                 name=f"completion-{self._config.surface.thread_key}",
             )
