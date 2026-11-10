@@ -24,11 +24,15 @@ import logging
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from claude_code_core.types import RateLimitInfo
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,54 @@ def build_claude_usage_lines(payload: Mapping[str, Any], now: int | None = None)
     credits_line = _extra_usage_line(payload.get("extra_usage"))
     if credits_line:
         lines.append(credits_line)
+    return lines
+
+
+_WEEKDAYS_JA = "月火水木金土日"
+
+
+def _display_tz() -> Any:
+    """Return ``CCDB_DISPLAY_TZ`` as a tzinfo, or ``None`` for server local time."""
+    name = os.getenv("CCDB_DISPLAY_TZ", "").strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def _format_reset_at(epoch: float) -> str:
+    """Render a reset instant as ``11/12(木) 22:00`` in ``CCDB_DISPLAY_TZ``."""
+    dt = datetime.fromtimestamp(epoch, tz=_display_tz())
+    return f"{dt.month}/{dt.day}({_WEEKDAYS_JA[dt.weekday()]}) {dt:%H:%M}"
+
+
+def build_quota_window_lines(
+    windows: Iterable[RateLimitInfo], now: float | None = None
+) -> list[str]:
+    """Render the stored ``rate_limit_event`` windows (what ``/usage`` reads).
+
+    Pure formatting over the bridge's own database, so it never calls the
+    rate-limited ``/api/oauth/usage`` endpoint. A window is only refreshed when
+    Claude reports it on a turn, so a row whose reset time has passed is shown
+    as reset rather than with its stale percentage.
+    """
+    by_type = {w.rate_limit_type: w for w in windows}
+    current = time.time() if now is None else now
+    lines: list[str] = []
+    for key, label in _WINDOWS:
+        window = by_type.get(key)
+        if window is None:
+            continue
+        if window.resets_at <= current:
+            lines.append(f"{label}残量：—（リセット済み）")
+            continue
+        used = round(float(window.utilization) * 100)
+        remaining = max(0, min(100, 100 - used))
+        reset_at = _format_reset_at(window.resets_at)
+        countdown = _format_countdown(window.resets_at, now=int(current))
+        lines.append(f"{label}残量：{remaining}%（{reset_at} リセット・あと{countdown}）")
     return lines
 
 

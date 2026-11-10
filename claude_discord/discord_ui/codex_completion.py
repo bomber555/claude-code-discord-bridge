@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import discord
 
-from .claude_usage import build_claude_usage_lines, fetch_claude_usage, usage_footer_enabled
+from .claude_usage import build_quota_window_lines, usage_footer_enabled
 from .embeds import COLOR_ERROR, COLOR_INFO, COLOR_SUCCESS
 from .engine_status import get_codex_status_line
+
+if TYPE_CHECKING:
+    from claude_code_core.types import RateLimitInfo
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +106,10 @@ async def post_claude_completion(
     cost_usd: float | None,
     api_label: str | None,
     account_label: str | None,
+    quota_windows: Sequence[RateLimitInfo] | None = None,
     now: int | None = None,
 ) -> None:
-    """Post one Claude card and enrich that same message with account quota."""
+    """Post one Claude card, with the stored quota windows when there are any."""
     details = [f"セッションID：{session_id or '未取得'}"]
     if duration_ms is not None:
         details.append(f"実行時間：{duration_ms / 1000:.1f}秒")
@@ -117,8 +123,10 @@ async def post_claude_completion(
 
     view = CompletionDetailsView("\n".join(details))
     rows = [f"アカウント：{account_label}"] if account_label else []
+    if quota_windows and usage_footer_enabled():
+        rows.extend(build_quota_window_lines(quota_windows, now=now))
     try:
-        message = await thread.send(
+        await thread.send(
             embed=completion_embed(
                 model,
                 "\n".join(rows) or None,
@@ -126,21 +134,6 @@ async def post_claude_completion(
             ),
             view=view,
             silent=False,
-        )
-        if usage_footer_enabled():
-            try:
-                payload = await fetch_claude_usage()
-            except Exception:
-                logger.debug("Claude quota lookup failed", exc_info=True)
-                payload = None
-            if payload:
-                rows.extend(build_claude_usage_lines(payload, now=now))
-        await message.edit(
-            embed=completion_embed(
-                model,
-                "\n".join(rows) or None,
-                backend="Claude",
-            )
         )
     except discord.HTTPException:
         logger.warning("Could not deliver Claude completion card", exc_info=True)

@@ -40,7 +40,7 @@ from claude_code_core.frontend import (
     NoticeLevel,
     StatusKind,
 )
-from claude_code_core.types import ElicitationRequest, ToolCategory
+from claude_code_core.types import ElicitationRequest, RateLimitInfo, ToolCategory
 
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent, ToolUseEvent
 from ..collision import extract_written_path
@@ -846,6 +846,19 @@ class EventProcessor:
             self._assistant_text_sent = True
             await self._bump_stop()
 
+    async def _stored_quota_windows(self) -> list[RateLimitInfo]:
+        """Return this turn's account windows as last recorded in usage_stats (as /usage)."""
+        if self._config.usage_repo is None:
+            return []
+        account = getattr(self._config.runner, "account", None)
+        profile = account.profile if isinstance(account, AccountBinding) else DEFAULT_PROFILE
+        backend = account.backend if isinstance(account, AccountBinding) else "claude"
+        try:
+            return await self._config.usage_repo.get_latest(profile, backend=backend)
+        except Exception:
+            logger.debug("Stored quota lookup failed", exc_info=True)
+            return []
+
     async def _post_compact_completion(self, event: StreamEvent) -> None:
         from claude_code_core.codex_runner import CodexRunner
 
@@ -859,6 +872,7 @@ class EventProcessor:
         backend = _backend_name_from_runner(runner)
         if backend == "claude":
             assert self._config.thread is not None
+            quota_windows = await self._stored_quota_windows()
             asyncio.create_task(
                 post_claude_completion(
                     self._config.thread,
@@ -870,6 +884,7 @@ class EventProcessor:
                     cost_usd=event.cost_usd,
                     api_label=runner.describe_api(),
                     account_label=runner.describe_account(),
+                    quota_windows=quota_windows,
                 ),
                 name=f"completion-{self._config.surface.thread_key}",
             )
