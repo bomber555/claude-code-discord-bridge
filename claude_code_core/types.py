@@ -209,6 +209,8 @@ class StreamEvent:
     message_type: MessageType
     raw: dict = field(default_factory=dict)
     session_id: str | None = None
+    # Concrete model the CLI resolved (``claude-opus-5-5``); set on the init event.
+    model: str | None = None
     text: str | None = None
     tool_use: ToolUseEvent | None = None
     tool_result_id: str | None = None

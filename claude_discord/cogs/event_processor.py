@@ -435,9 +435,8 @@ class EventProcessor:
         if not event.session_id:
             return
 
-        raw_model = event.raw.get("model") if isinstance(event.raw, dict) else None
-        if isinstance(raw_model, str) and raw_model:
-            self._cli_model = raw_model
+        if event.model:
+            self._cli_model = event.model
         self._state.session_id = event.session_id
         self._session_opened = True
         if self._config.repo:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from claude_code_core.parser import parse_line
 from claude_code_core.runner import ClaudeRunner
 from claude_code_core.types import MessageType, RateLimitInfo, StreamEvent
 from claude_discord.cogs.event_processor import EventProcessor
@@ -46,7 +48,7 @@ async def test_claude_card_is_title_plus_one_plan_quota_line(monkeypatch) -> Non
 
     thread.send.assert_awaited_once()
     sent = thread.send.await_args.kwargs
-    assert sent["embed"].title == "✅ 応答完了 by Claude opus5.5 medium"
+    assert sent["embed"].title == "✅ 応答完了 by opus5.5 medium"
     # The 5-hour window has less left (91%) than the weekly one (93%).
     assert sent["embed"].description == "プランMax / 残り91% / リセット9/11(金) 03:09"
     thread.send.return_value.edit.assert_not_awaited()
@@ -83,7 +85,7 @@ async def test_unknown_effort_and_quota_degrade_to_what_is_known() -> None:
         **_card(model="opus", effort=None, quota_windows=None, account_label="API key (metered)"),
     )
     embed = thread.send.await_args.kwargs["embed"]
-    assert embed.title == "✅ 応答完了 by Claude opus"
+    assert embed.title == "✅ 応答完了 by opus"
     assert embed.description == "プランAPI従量"
 
 
@@ -93,7 +95,7 @@ async def test_nothing_known_leaves_only_the_title() -> None:
         thread, **_card(model=None, effort=None, quota_windows=None, account_label=None)
     )
     embed = thread.send.await_args.kwargs["embed"]
-    assert embed.title == "✅ 応答完了 by Claude"
+    assert embed.title == "✅ 応答完了"
     assert embed.description is None
 
 
@@ -128,10 +130,15 @@ async def test_claude_stream_emits_only_the_shared_completion_card() -> None:
     ):
         processor = EventProcessor(RunConfig(thread=thread, runner=runner, prompt="test"))
         await processor.process(
-            StreamEvent(
-                raw={"model": "claude-opus-5-5"},
-                message_type=MessageType.SYSTEM,
-                session_id=SID,
+            parse_line(
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": SID,
+                        "model": "claude-opus-5-5",
+                    }
+                )
             )
         )
         await processor.process(
@@ -151,4 +158,4 @@ async def test_claude_stream_emits_only_the_shared_completion_card() -> None:
     titles = [
         call.kwargs["embed"].title for call in thread.send.await_args_list if "embed" in call.kwargs
     ]
-    assert titles == ["✅ 応答完了 by Claude opus5.5"]
+    assert titles == ["✅ 応答完了 by opus5.5"]
