@@ -125,9 +125,13 @@ def plan_name(account_label: str | None) -> str | None:
 def claude_completion_embed(
     model: str | None, effort: str | None, summary: str | None
 ) -> discord.Embed:
-    """``✅ 応答完了 by opus5.5 medium`` with one plan/quota line."""
-    title = " ".join(p for p in (model, effort) if p)
-    title = f"✅ 応答完了 by {title}" if title else "✅ 応答完了"
+    """``✅ 応答完了 opus5.5 (medium)`` with one plan/quota line."""
+    parts = ["✅ 応答完了"]
+    if model:
+        parts.append(model)
+    if effort:
+        parts.append(f"({effort})")
+    title = " ".join(parts)
     return discord.Embed(
         title=_plain(title)[:256],
         description=discord.utils.escape_markdown(summary) if summary else None,

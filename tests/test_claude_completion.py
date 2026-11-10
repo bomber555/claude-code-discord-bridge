@@ -48,7 +48,7 @@ async def test_claude_card_is_title_plus_one_plan_quota_line(monkeypatch) -> Non
 
     thread.send.assert_awaited_once()
     sent = thread.send.await_args.kwargs
-    assert sent["embed"].title == "✅ 応答完了 by opus5.5 medium"
+    assert sent["embed"].title == "✅ 応答完了 opus5.5 (medium)"
     # The 5-hour window has less left (91%) than the weekly one (93%).
     assert sent["embed"].description == "プランMax / 残り91% / リセット9/11(金) 03:09"
     thread.send.return_value.edit.assert_not_awaited()
@@ -85,7 +85,7 @@ async def test_unknown_effort_and_quota_degrade_to_what_is_known() -> None:
         **_card(model="opus", effort=None, quota_windows=None, account_label="API key (metered)"),
     )
     embed = thread.send.await_args.kwargs["embed"]
-    assert embed.title == "✅ 応答完了 by opus"
+    assert embed.title == "✅ 応答完了 opus"
     assert embed.description == "プランAPI従量"
 
 
@@ -158,4 +158,4 @@ async def test_claude_stream_emits_only_the_shared_completion_card() -> None:
     titles = [
         call.kwargs["embed"].title for call in thread.send.await_args_list if "embed" in call.kwargs
     ]
-    assert titles == ["✅ 応答完了 by opus5.5"]
+    assert titles == ["✅ 応答完了 opus5.5"]
