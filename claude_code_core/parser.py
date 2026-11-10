@@ -95,6 +95,9 @@ def _parse_system(data: dict[str, Any], event: StreamEvent) -> None:
     subtype = data.get("subtype", "")
     if subtype == "init":
         logger.info("Session initialized: %s", event.session_id)
+        model = data.get("model")
+        if isinstance(model, str) and model:
+            event.model = model
     elif subtype == "compact_boundary":
         event.is_compact = True
         metadata = data.get("compactMetadata", {})
