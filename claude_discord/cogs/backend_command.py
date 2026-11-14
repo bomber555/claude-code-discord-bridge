@@ -34,7 +34,7 @@ SCOPE_THREAD = "thread"
 SCOPE_GLOBAL = "global"
 
 VALID_EFFORTS: dict[str, frozenset[str]] = {
-    "claude": frozenset({"low", "medium", "high", "max"}),
+    "claude": frozenset({"low", "medium", "high", "xhigh", "max"}),
     "codex": VALID_CODEX_EFFORTS,
     "local": VALID_CODEX_EFFORTS,
     # pi calls this "thinking" and includes an explicit "off".
@@ -43,7 +43,7 @@ VALID_EFFORTS: dict[str, frozenset[str]] = {
 }
 
 EFFORT_ORDER: dict[str, list[str]] = {
-    "claude": ["low", "medium", "high", "max"],
+    "claude": ["low", "medium", "high", "xhigh", "max"],
     "codex": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     "local": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     "pi": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
