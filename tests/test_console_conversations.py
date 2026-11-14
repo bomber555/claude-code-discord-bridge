@@ -606,7 +606,7 @@ async def test_slash_command_catalog_follows_the_backend(env) -> None:
     assert got["backend"] == "claude"
     assert [c["name"] for c in got["commands"]] == ["backend", "model", "effort", "connection"]
     assert [c["name"] for c in got["builtins"]] == ["compact", "context", "cost"]
-    assert got["efforts"] == ["low", "medium", "high", "max"]
+    assert got["efforts"] == ["low", "medium", "high", "xhigh", "max"]
     assert [s["name"] for s in got["skills"]] == ["kb-save"]
 
     switched = await env.client.post(
