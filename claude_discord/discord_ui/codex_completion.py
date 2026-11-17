@@ -197,6 +197,7 @@ class CommandActivity:
         self._command = command
         self._view = view
         self._finished = False
+        self._succeeded = False
 
     async def update(self, detail: str) -> None:
         if not self._finished:
@@ -206,6 +207,7 @@ class CommandActivity:
         if self._finished:
             return
         self._finished = True
+        self._succeeded = ok
         self._view.details = (
             f"コマンド：\n{self._command[:1800]}\n\n結果：\n{(result or '')[:1800]}"
         )
@@ -216,6 +218,19 @@ class CommandActivity:
             return
         self._finished = True
         await self._edit("⏹ コマンド終了", ok=False)
+
+    async def discard(self) -> None:
+        """Remove a successful card once the answer is done; keep anything else.
+
+        A failed or interrupted command stays so the thread still shows what
+        went wrong after the turn.
+        """
+        if not self._succeeded:
+            return
+        try:
+            await self._message.delete()
+        except discord.HTTPException:
+            logger.debug("Could not delete finished command card", exc_info=True)
 
     async def _edit(self, title: str, *, ok: bool) -> None:
         try:

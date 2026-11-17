@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from claude_code_core.codex_runner import CodexRunner
-from claude_code_core.types import MessageType, StreamEvent
+from claude_code_core.types import MessageType, StreamEvent, ToolCategory
 from claude_discord.cogs.event_processor import EventProcessor
 from claude_discord.cogs.run_config import RunConfig
 from claude_discord.discord_ui.codex_completion import (
@@ -215,3 +215,107 @@ async def test_model_lookup_does_not_read_unbounded_history(tmp_path, monkeypatc
         + "\n"
     )
     assert await CodexRunner().get_session_model(SID) is None
+
+
+def _command_event(tool_id: str) -> StreamEvent:
+    from claude_code_core.types import ToolUseEvent
+
+    return StreamEvent(
+        raw={},
+        message_type=MessageType.ASSISTANT,
+        tool_use=ToolUseEvent(
+            tool_id=tool_id,
+            tool_name="Bash",
+            tool_input={"command": "echo hi"},
+            category=ToolCategory.COMMAND,
+        ),
+    )
+
+
+def _result(*, error: str | None = None, turn_continues: bool = False) -> StreamEvent:
+    return StreamEvent(
+        raw={},
+        message_type=MessageType.RESULT,
+        is_complete=True,
+        text="OK",
+        error=error,
+        turn_continues=turn_continues,
+    )
+
+
+async def _run_commands(events: list[StreamEvent]) -> list[MagicMock]:
+    """Run two commands (one finished, one still running) then *events*."""
+    import asyncio
+
+    thread = MagicMock()
+    thread.id = 123
+    cards = [AsyncMock(), AsyncMock()]
+    queue = list(cards)
+
+    def _send(*_a, **kw):
+        embed = kw.get("embed")
+        if queue and embed is not None and embed.title == "🔧 コマンド実行中":
+            return queue.pop(0)
+        return AsyncMock()
+
+    thread.send = AsyncMock(side_effect=_send)
+    runner = CodexRunner()
+    runner.get_session_model = AsyncMock(return_value="gpt-6-astra")
+    processor = EventProcessor(RunConfig(thread=thread, runner=runner, prompt="test"))
+    await processor.process(StreamEvent(raw={}, message_type=MessageType.SYSTEM, session_id=SID))
+    await processor.process(_command_event("t1"))
+    await processor.process(_command_event("t2"))
+    await processor.process(
+        StreamEvent(
+            raw={},
+            message_type=MessageType.USER,
+            tool_result_id="t1",
+            tool_result_content="hi",
+        )
+    )
+    with patch(
+        "claude_discord.discord_ui.codex_completion.get_codex_status_line",
+        AsyncMock(return_value=None),
+    ):
+        for event in events:
+            await processor.process(event)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    return cards
+
+
+async def test_finished_answer_deletes_successful_command_cards_only():
+    done, running = await _run_commands([_result()])
+    done.delete.assert_awaited_once()
+    running.delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "event", [_result(error="API 500"), _result(turn_continues=True)], ids=["error", "continues"]
+)
+async def test_unfinished_answer_keeps_command_cards(event):
+    done, _ = await _run_commands([event])
+    done.delete.assert_not_awaited()
+
+
+async def test_continued_turn_deletes_cards_at_the_real_end():
+    done, _ = await _run_commands([_result(turn_continues=True), _result()])
+    done.delete.assert_awaited_once()
+
+
+async def test_cancelled_command_card_is_never_deleted():
+    thread = AsyncMock()
+    activity = await open_command_activity(thread, "sleep 100")
+    await activity.cancel()
+    await activity.discard()
+    thread.send.return_value.delete.assert_not_awaited()
+
+
+async def test_delete_failure_is_swallowed():
+    import discord
+
+    thread = AsyncMock()
+    activity = await open_command_activity(thread, "echo hi")
+    await activity.complete("hi")
+    thread.send.return_value.delete.side_effect = discord.NotFound(MagicMock(), "gone")
+    await activity.discard()

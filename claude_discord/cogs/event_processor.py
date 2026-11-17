@@ -18,6 +18,7 @@ import re
 import time
 from collections.abc import Callable, Coroutine
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from claude_code_core.account_pool import DEFAULT_PROFILE, AccountBinding
 from claude_code_core.approvals import (
@@ -45,6 +46,9 @@ from claude_code_core.types import ElicitationRequest, RateLimitInfo, ToolCatego
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent, ToolUseEvent
 from ..collision import extract_written_path
 from .run_config import RunConfig
+
+if TYPE_CHECKING:
+    from ..discord_ui.codex_completion import CommandActivity
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +232,13 @@ class EventProcessor:
         # Outstanding approval/input prompts. Held so the garbage collector
         # cannot drop a task that the CLI is waiting on.
         self._prompt_tasks: set[asyncio.Task[None]] = set()
+
+        # Compact "🔧 コマンド" cards opened this run. Successful ones are
+        # deleted once the answer is finished so the thread keeps only the
+        # conversation; the tasks doing that are held here for the same GC
+        # reason as _prompt_tasks.
+        self._command_cards: list[CommandActivity] = []
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
         # Set when AskUserQuestion is detected. Caller should drain the runner
         # (skip events) then handle the ask after the stream ends.
@@ -675,6 +686,9 @@ class EventProcessor:
                 self._config.surface.thread_key,
             )
 
+            if not event.turn_continues:
+                self._discard_finished_commands()
+
             # In chat_only mode, skip session_complete embed, statusline, and inbox.
             # Just set the done status emoji.
             if event.turn_continues:
@@ -863,6 +877,26 @@ class EventProcessor:
             logger.debug("Stored quota lookup failed", exc_info=True)
             return []
 
+    def _discard_finished_commands(self) -> None:
+        """Delete this run's successful command cards in the background.
+
+        Deleting is one API call per card, so it must not hold up the answer
+        or the completion card. Failed and interrupted cards stay.
+        """
+        cards, self._command_cards = self._command_cards, []
+        if not cards:
+            return
+
+        async def _discard_all() -> None:
+            for card in cards:
+                await card.discard()
+
+        task = asyncio.create_task(
+            _discard_all(), name=f"discard-commands-{self._config.surface.thread_key}"
+        )
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
     async def _post_compact_completion(self, event: StreamEvent) -> None:
         from claude_code_core.codex_runner import CodexRunner
 
@@ -949,6 +983,7 @@ class EventProcessor:
                 assert self._config.thread is not None
                 command = str(event.tool_use.tool_input.get("command", event.tool_use.display_name))
                 activity = await open_command_activity(self._config.thread, command)
+                self._command_cards.append(activity)
             else:
                 activity = await self._config.surface.open_activity(
                     ActivitySpec(
